@@ -3,7 +3,7 @@
 As cloud computing and container technologies grow, moving running applications (containers) between servers without stopping them has become essential. However, traditional methods often struggle because they have to repeatedly copy parts of memory that change frequently, which slows everything down.
 
 U2CMigration offers a new way to solve this problem by predicting which parts of memory will change during the move. It uses two clever approaches: one for stable applications and another for those that change a lot. By accurately predicting changes, U2CMigration can reduce the overall moving time and minimize downtime, ensuring a smoother, faster migration process. Tests show that this method cuts the migration time by nearly half compared to current best practices.
-
+![image](https://github.com/CycleOfStrife/UUCMigration/blob/main/figures/sys.png)
 # Getting Started
 ## Dependencies
 
