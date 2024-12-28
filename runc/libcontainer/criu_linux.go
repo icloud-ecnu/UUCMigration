@@ -331,7 +331,7 @@ func (c *Container) Checkpoint(criuOpts *CriuOpts) error {
 		OrphanPtsMaster: proto.Bool(true),
 		AutoDedup:       proto.Bool(criuOpts.AutoDedup),
 		LazyPages:       proto.Bool(criuOpts.LazyPages),
-		PageStateDir:    proto.String(criuOpts.PageStateDir),
+		//PageStateDir:    proto.String(criuOpts.PageStateDir),
 	}
 	//fmt.Println(criuOpts.PageStateDir)
 	// if criuOpts.WorkDirectory is not set, criu default is used.

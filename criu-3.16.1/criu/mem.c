@@ -181,13 +181,15 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
 typedef struct {
     unsigned long address; // Memory page address
     int status;            // Status of the page
+	int statusI;           // *
     bool isDirty;          // Whether the page is dirty
 } MemoryPage;
 
 MemoryPage* getDirtyMemoryPages(int *size) {
-    
+    MemoryPage *pages;
     *size = 10; // Example value; should be dynamically determined.
-    MemoryPage *pages = (MemoryPage*)malloc((*size) * sizeof(MemoryPage));
+	
+    pages = (MemoryPage*)malloc((*size) * sizeof(MemoryPage));
     
     // Dummy initialization
     for (int i = 0; i < *size; i++) {
@@ -250,7 +252,8 @@ int predictSSDP(MemoryPage *p, int L) {
 void statusTimeToIteration(MemoryPage *pages, int size) {
     for (int i = 0; i < size; i++) {
         // Dummy transformation logic, adjust based on actual needs
-        pages[i].status += 1; // Example: Increment status
+        //pages[i].status += 1; // Example: Increment status
+		pages[i].statusI = pages[i].status + 1; // Example: Increment status
     }
 }
 
@@ -266,10 +269,30 @@ double* spatialDirtyPageRatios(MemoryPage *pages, int size) {
     return ratios;
 }
 
+int predictDataShift(MemoryPage* p, int L){
+	return 1;
+}
+
+int minValueIndex(double* ratios, int P_size){
+	return 1;
+}
+
+void migratePages(MemoryPage* p, int P_size){
+	
+}
+
+int notAllZero(int* statusI, int end){
+	return 0;
+}
 
 // 页面生成函数，包含在线迁移逻辑
 static int generate_iovs2(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
                          bool has_parent) {
+	MemoryPage *P;
+	MemoryPage *S;
+	double *D_pred;
+	int I,i,L,L_Max;
+	int P_size,S_size;
     u64 *at = &map[PAGE_PFN(*off)];
     unsigned long pfn, nr_to_scan;
     unsigned long pages[3] = {};  // Pages counters: [0] - skipped, [1] - lazy, [2] - written
@@ -278,9 +301,14 @@ static int generate_iovs2(struct pstree_item *item, struct vma_area *vma, struct
     nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
 
     // 获取需要迁移的脏页
-    MemoryPage *P = NULL, *S = NULL;
-    int I = L_MAX, i = 0;
-    int P_size = 0, S_size = 0;
+    P = NULL;
+	S = NULL;
+	L=3; // *
+	L_Max=6; // *
+    i = 0;
+	I=L_Max;
+    P_size = 0;
+	S_size = 0;
 
     while (i <= I) {
         P = getDirtyMemoryPages(&P_size);
@@ -300,13 +328,13 @@ static int generate_iovs2(struct pstree_item *item, struct vma_area *vma, struct
 
             // 在线迁移预测逻辑
             if (isStablePage(&P[pfn])) {
-                P[pfn].statusT = predictDataShift(&P[pfn], L);
+                P[pfn].status = predictDataShift(&P[pfn], L);
             } else {
-                P[pfn].statusT = predictSSDP(&P[pfn], L);
+                P[pfn].status = predictSSDP(&P[pfn], L);
             }
 
-            statusTimeToIteration(P, P_size);
-            double *D_pred = spatialDirtyPageRatios(P, P_size);
+            statusTimeToIteration(P, P_size); // *
+            D_pred = spatialDirtyPageRatios(P, P_size);
             I = i + minValueIndex(D_pred, P_size);
             free(D_pred);
 
@@ -628,6 +656,7 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 
 again:
 	ret = generate_iovs(item, vma, pp, map, &off, has_parent);
+	ret = generate_iovs2(item, vma, pp, map, &off, has_parent);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 

@@ -130,7 +130,7 @@ int main(int argc, char *argv[], char *envp[])
 	if (opts.work_dir == NULL)
 		SET_CHAR_OPTS(work_dir, opts.imgs_dir);
 	if (opts.predict_mode != NULL)
-		SET_CHAR_OPTS(work_dir, opts.predict_mode)
+		SET_CHAR_OPTS(work_dir, opts.predict_mode);
 	has_sub_command = (argc - optind) > 1;
 
 	if (has_exec_cmd) {

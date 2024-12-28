@@ -21,11 +21,12 @@ require (
 	github.com/urfave/cli v1.22.12
 	github.com/vishvananda/netlink v1.1.0
 	golang.org/x/net v0.21.0
-	golang.org/x/sys v0.17.0
-	google.golang.org/protobuf v1.32.0
+	golang.org/x/sys v0.25.0
+	google.golang.org/protobuf v1.34.2
 )
 
 require (
+	github.com/checkpoint-restore/go-criu/v7 v7.2.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/vishvananda/netns v0.0.0-20191106174202-0a2b9b5464df // indirect
@@ -35,3 +36,5 @@ require (
 replace github.com/opencontainers/runc => /opt/runc
 
 replace github.com/checkpoint-restore/go-criu/v6 v6.3.0 => /opt/go-criu-6.3.0
+
+replace github.com/checkpoint-restore/go-criu/v7 v7.2.0 => /opt/go-criu-7.2.0 // 添加这一行

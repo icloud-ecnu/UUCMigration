@@ -88,7 +88,7 @@ endif
 # commit "S/390: Fix 64 bit sibcall".
 ifeq ($(ARCH),s390)
         ARCH		:= s390
-        DEFINES		:= -DCONFIG_S390
+        Dstats.pb-c.hEFINES		:= -DCONFIG_S390
         CFLAGS_PIE	:= -fno-optimize-sibling-calls
 endif
 

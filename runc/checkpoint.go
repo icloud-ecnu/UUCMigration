@@ -52,6 +52,7 @@ checkpointed.`,
 			logrus.Warn("runc checkpoint is untested with rootless containers")
 		}
 
+		// 通过 getContainer 获取指定的容器对象，并检查其状态。如果容器处于 Created 或 Stopped 状态，则不能执行检查点操作
 		container, err := getContainer(context)
 		if err != nil {
 			return err
@@ -60,16 +61,19 @@ checkpointed.`,
 		if err != nil {
 			return err
 		}
+
 		if status == libcontainer.Created || status == libcontainer.Stopped {
 			return fmt.Errorf("Container cannot be checkpointed in %s state", status.String())
 		}
+		//使用 criuOptions 函数获取 CRIU 配置选项，这些选项包含路径设置、是否保持运行状态、TCP连接等配置。
 		options, err := criuOptions(context)
 		if err != nil {
 			return err
 		}
-
+		// 执行检查点保存
 		err = container.Checkpoint(options)
 		fmt.Println("hello 2024")
+		// 成功并且 LeaveRunning 和 PreDump 未启用，则销毁容器
 		if err == nil && !(options.LeaveRunning || options.PreDump) {
 			// Destroy the container unless we tell CRIU to keep it.
 			if err := container.Destroy(); err != nil {
@@ -80,6 +84,7 @@ checkpointed.`,
 	},
 }
 
+// 负责准备 CRIU 镜像保存的路径。
 func prepareImagePaths(context *cli.Context) (string, string, error) {
 	imagePath := context.String("image-path")
 	if imagePath == "" {
@@ -112,6 +117,7 @@ func prepareImagePaths(context *cli.Context) (string, string, error) {
 	return imagePath, parentPath, nil
 }
 
+// 构建并返回 libcontainer.CriuOpts，用于指定执行 CRIU 检查点时的配置
 func criuOptions(context *cli.Context) (*libcontainer.CriuOpts, error) {
 	imagePath, parentPath, err := prepareImagePaths(context)
 	if err != nil {

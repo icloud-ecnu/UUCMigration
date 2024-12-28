@@ -1,0 +1,29 @@
+{
+    // "configurations": [
+    //     {
+    //         "name": "Linux",
+    //         "includePath": [
+    //             "${workspaceFolder}/**",
+    //             "/usr/include/python3.8"
+    //         ],
+    //         "defines": [],
+    //         "cStandard": "c17",
+    //         "cppStandard": "gnu++14",
+    //         "intelliSenseMode": "linux-gcc-x64"
+    //     }
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/wzqsd1/anaconda3/envs/tetris/include/python3.8" // 根据你的 Python 版本调整路径
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-arm"
+        }
+    ],
+    "version": 4
+}
