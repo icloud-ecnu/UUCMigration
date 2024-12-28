@@ -106,7 +106,7 @@ be restored with *mount(src, mountpoint, flags, options)*. When used,
 *dump* is expected to always succeed if a mountpoint is to be
 auto-detected, however *restore* may fail (or do something wrong)
 if the assumption for restore logic is incorrect. This option is
-not compatable with *--external* *dev*.
+not compatible with *--external* *dev*.
 
 *--action-script* 'script'::
     Add an external action script to be executed at certain stages.
@@ -154,6 +154,17 @@ not compatable with *--external* *dev*.
             hook can be used only in the RPC mode, and the
             notification message contains a file descriptor for
             the master pty
+
+        *query-ext-files*:::
+            called after the process tree is stopped and network is locked.
+            This hook is used only in the RPC mode. The notification reply
+            contains file ids to be added to external file list (may be empty).
+
+*--unprivileged*::
+    This option tells *criu* to accept the limitations when running
+    as non-root. Running as non-root requires *criu* at least to have
+    *CAP_SYS_ADMIN* or *CAP_CHECKPOINT_RESTORE*. For details about running
+    *criu* as non-root please consult the *NON-ROOT* section.
 
 *-V*, *--version*::
     Print program version and exit.
@@ -242,6 +253,12 @@ In other words, do not use it unless really needed.
     Tell *criu* that one end of a pair of UNIX sockets (created by
     *socketpair*(2)) with the given _id_ is OK to be disconnected.
 
+*--external* **net[**__inode__**]:**__name__::
+    Mark a network namespace as external and do not include it in the
+    checkpoint. The label 'name' can be used with *--inherit-fd* during
+    restore to specify a file descriptor to a preconfigured network
+    namespace.
+
 *--external* **pid[**__inode__**]:**__name__::
     Mark a PID namespace as external. This can be later used to restore
     a process into an existing PID namespace. The label 'name' can be
@@ -328,7 +345,8 @@ mount -t cgroup -o devices,freezer none devices,freezer
     Checkpoint established TCP connections.
 
 *--tcp-close*::
-    Don't dump the state of, or block, established tcp connections.
+    Don't dump the state of, or block, established tcp connections
+    (including the connection is once established but now closed).
     This is useful when tcp connections are not going to be restored.
 
 *--skip-in-flight*::
@@ -360,12 +378,23 @@ mount -t cgroup -o devices,freezer none devices,freezer
     Allows to link unlinked files back, if possible (modifies filesystem
     during *restore*).
 
+*--timeout* 'number'::
+    Set a time limit in seconds for collecting tasks during the
+    dump operation. The timeout is 10 seconds by default.
+
 *--ghost-limit* 'size'::
     Set the maximum size of deleted file to be carried inside image.
     By default, up to 1M file is allowed. Using this
     option allows to not put big deleted files inside images. Argument
     'size' may be postfixed with a *K*, *M* or *G*, which stands for kilo-,
     mega, and gigabytes, accordingly.
+
+*--ghost-fiemap*::
+    Enable an optimization based on fiemap ioctl that can reduce the
+    number of system calls used when checkpointing highly sparse ghost
+    files. This option is enabled by default, and it can be disabled
+    with *--no-ghost-fiemap*. An automatic fallback to SEEK_HOLE/SEEK_DATA
+    is used when fiemap is not supported.
 
 *-j*, *--shell-job*::
     Allow one to dump shell jobs. This implies the restored task will
@@ -408,7 +437,7 @@ By default the option is set to *fpu* and *ins*.
     Set the method to be used to validate open files. Validation is done
     to ensure that the version of the file being restored is the same
     version when it was dumped.
-
++
 The 'mode' may be one of the following:
 
     *filesize*:::
@@ -432,6 +461,9 @@ The 'mode' may be one of the following:
     This is the default if 'mode' is not specified.
 
     *nftables*::: Use nftables rules to drop the packets.
+
+    *skip*::: Don't lock the network. If *--tcp-close* is not used, the network
+    must be locked externally to allow CRIU to dump TCP connections.
 
 *restore*
 ~~~~~~~~~
@@ -521,7 +553,7 @@ usually need to be escaped from shell.
     Restore cgroups configuration associated with a task from the image.
     Controllers are always restored in an optimistic way -- if already present
     in system, *criu* reuses it, otherwise it will be created.
-
++
 The 'mode' may be one of the following:
 
     *none*:::   Do not restore cgroup properties but require cgroup to
@@ -645,7 +677,7 @@ are not adequate, but this can be suppressed by using *--cpu-cap=none*.
     Set the method to be used to validate open files. Validation is done
     to ensure that the version of the file being restored is the same
     version when it was dumped.
-
++
 The 'mode' may be one of the following:
 
     *filesize*:::
@@ -656,6 +688,9 @@ The 'mode' may be one of the following:
                 To validate ELF files with their build-ID. If the
                 build-ID cannot be obtained, 'chksm-first' method will be
                 used. This is the default if mode is unspecified.
+
+*--skip-file-rwx-check*::
+    Skip checking file permissions (r/w/x for u/g/o) on restore.
 
 *check*
 ~~~~~~~
@@ -862,6 +897,42 @@ via "req.opts.config_file = '/path/to/file'". The values from this
 configuration file will overwrite all other configuration file settings
 or RPC options. *This can lead to undesired behavior of criu and
 should only be used carefully.*
+
+NON-ROOT
+--------
+*criu* can be used as non-root with either the *CAP_SYS_ADMIN* capability
+or with the *CAP_CHECKPOINT_RESTORE* capability introduces in Linux kernel 5.9.
+*CAP_CHECKPOINT_RESTORE* is the minimum that is required.
+
+*criu* also needs either *CAP_SYS_PTRACE* or a value of 0 in
+*/proc/sys/kernel/yama/ptrace_scope* (see *ptrace*(2)) to be able to interrupt
+the process for dumping.
+
+Running *criu* as non-root has many limitations and depending on the process
+to checkpoint and restore it may not be possible.
+
+In addition to *CAP_CHECKPOINT_RESTORE* it is possible to give *criu* additional
+capabilities to enable additional features in non-root mode.
+
+Currently *criu* can benefit from the following additional capabilities:
+
+    - *CAP_NET_ADMIN*
+    - *CAP_SYS_CHROOT*
+    - *CAP_SETUID*
+    - *CAP_SYS_RESOURCE*
+
+Note that for some operations, having a capability in a namespace other than
+the init namespace (i.e. the default/root namespace) is not sufficient. For
+example, in order to read symlinks in proc/[pid]/map_files CRIU requires
+CAP_CHECKPOINT_RESTORE in the init namespace; having CAP_CHECKPOINT_RESTORE
+while running in another user namespace (e.g. in a container) does not allow
+CRIU to read symlinks in /proc/[pid]/map_files.
+
+Without access to /proc/[pid]/map_files checkpointing/restoring processes
+that have mapped deleted files may not be possible.
+
+Independent of the capabilities it is always necessary to use "*--unprivileged*" to
+accept *criu*'s limitation in non-root mode.
 
 EXAMPLES
 --------

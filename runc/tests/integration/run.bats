@@ -127,38 +127,15 @@ function teardown() {
 	[ "${lines[0]}" = "410" ]
 }
 
-@test "runc run [runc-dmz]" {
+@test "runc run [/proc/self/exe clone]" {
 	runc --debug run test_hello
-	[ "$status" -eq 0 ]
-	[[ "$output" = *"Hello World"* ]]
-	# We use runc-dmz if we can.
-	[[ "$output" = *"runc-dmz: using runc-dmz"* ]]
-}
-
-@test "runc run [cap_sys_ptrace -> /proc/self/exe clone]" {
-	# Add CAP_SYS_PTRACE to the bounding set, the minimum needed to indicate a
-	# container process _could_ get CAP_SYS_PTRACE.
-	update_config '.process.capabilities.bounding += ["CAP_SYS_PTRACE"]'
-
-	runc --debug run test_hello
-	[ "$status" -eq 0 ]
-	[[ "$output" = *"Hello World"* ]]
-	if [ "$EUID" -ne 0 ] && is_kernel_gte 4.10; then
-		# For Linux 4.10 and later, rootless containers will use runc-dmz
-		# because they are running in a user namespace. See isDmzBinarySafe().
-		[[ "$output" = *"runc-dmz: using runc-dmz"* ]]
-	else
-		# If the container has CAP_SYS_PTRACE and is not rootless, we use
-		# /proc/self/exe cloning.
-		[[ "$output" = *"runc-dmz: using /proc/self/exe clone"* ]]
-	fi
-}
-
-@test "RUNC_DMZ=legacy runc run [/proc/self/exe clone]" {
-	RUNC_DMZ=legacy runc --debug run test_hello
 	[ "$status" -eq 0 ]
 	[[ "$output" = *"Hello World"* ]]
 	[[ "$output" = *"runc-dmz: using /proc/self/exe clone"* ]]
+	# runc will use fsopen("overlay") if it can.
+	if can_fsopen overlay; then
+		[[ "$output" = *"runc-dmz: using overlayfs for sealed /proc/self/exe"* ]]
+	fi
 }
 
 @test "runc run [joining existing container namespaces]" {
@@ -231,7 +208,7 @@ function teardown() {
 	grep -E '^boottime\s+1337\s+3141519$' <<<"$output"
 }
 
-@test "runc run [exec error]" {
+@test "runc run [execve error]" {
 	cat <<EOF >rootfs/run.sh
 #!/mmnnttbb foo bar
 sh
@@ -239,23 +216,6 @@ EOF
 	chmod +x rootfs/run.sh
 	update_config '.process.args = [ "/run.sh" ]'
 	runc run test_hello
-
-	# Ensure that the output contains the right error message. For runc-dmz, both
-	# nolibc and libc have the same formatting string (but libc will print the
-	# errno description rather than just the number), and for runc_nodmz the error
-	# message from Go starts with the same string.
-	[ "$status" -ne 0 ]
-	[[ "$output" = *"exec /run.sh: "* ]]
-}
-
-@test "RUNC_DMZ=legacy runc run [execve error]" {
-	cat <<EOF >rootfs/run.sh
-#!/mmnnttbb foo bar
-sh
-EOF
-	chmod +x rootfs/run.sh
-	update_config '.process.args = [ "/run.sh" ]'
-	RUNC_DMZ=legacy runc run test_hello
 	[ "$status" -ne 0 ]
 
 	# After the sync socket closed, we should not send error to parent

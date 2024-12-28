@@ -59,7 +59,7 @@
 #define LAZY_PAGES_RESTORE_FINISHED 0x52535446 /* ReSTore Finished */
 
 /*
- * Backround transfer parameters.
+ * Background transfer parameters.
  * The default xfer length is arbitrary set to 64Kbytes
  * The limit of 4Mbytes matches the maximal chunk size we can have in
  * a pipe in the page-server
@@ -71,8 +71,8 @@ static mutex_t *lazy_sock_mutex;
 
 struct lazy_iov {
 	struct list_head l;
-	unsigned long start; /* run-time start address, tracks remaps */
-	unsigned long end; /* run-time end address, tracks remaps */
+	unsigned long start;	 /* run-time start address, tracks remaps */
+	unsigned long end;	 /* run-time end address, tracks remaps */
 	unsigned long img_start; /* start address at the dump time */
 };
 
@@ -281,7 +281,7 @@ int uffd_open(int flags, unsigned long *features, int *err)
 	}
 
 	if (uffdio_api.api != UFFD_API) {
-		pr_err("Incompatible uffd API: expected %Lu, got %Lu\n", UFFD_API, uffdio_api.api);
+		pr_err("Incompatible uffd API: expected %llu, got %llu\n", UFFD_API, uffdio_api.api);
 		goto close;
 	}
 
@@ -1468,7 +1468,7 @@ int cr_lazy_pages(bool daemon)
 
 	ret = handle_requests(epollfd, &events, nr_fds);
 
-	tls_terminate_session();
+	disconnect_from_page_server();
 
 	xfree(events);
 	return ret;

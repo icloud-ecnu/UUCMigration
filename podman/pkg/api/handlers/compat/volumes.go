@@ -1,3 +1,5 @@
+//go:build !remote
+
 package compat
 
 import (
@@ -9,16 +11,15 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/api/handlers"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/filters"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi/parse"
-	"github.com/containers/podman/v4/pkg/util"
-	docker_api_types "github.com/docker/docker/api/types"
-	docker_api_types_volume "github.com/docker/docker/api/types/volume"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/filters"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi/parse"
+	"github.com/containers/podman/v5/pkg/util"
+	"github.com/docker/docker/api/types/volume"
 )
 
 func ListVolumes(w http.ResponseWriter, r *http.Request) {
@@ -55,14 +56,17 @@ func ListVolumes(w http.ResponseWriter, r *http.Request) {
 		utils.InternalServerError(w, err)
 		return
 	}
-	volumeConfigs := make([]*docker_api_types_volume.Volume, 0, len(vols))
+	volumeConfigs := make([]*volume.Volume, 0, len(vols))
 	for _, v := range vols {
 		mp, err := v.MountPoint()
 		if err != nil {
+			if errors.Is(err, define.ErrNoSuchVolume) {
+				continue
+			}
 			utils.InternalServerError(w, err)
 			return
 		}
-		config := docker_api_types_volume.Volume{
+		config := volume.Volume{
 			Name:       v.Name(),
 			Driver:     v.Driver(),
 			Mountpoint: mp,
@@ -73,7 +77,7 @@ func ListVolumes(w http.ResponseWriter, r *http.Request) {
 		}
 		volumeConfigs = append(volumeConfigs, &config)
 	}
-	response := docker_api_types_volume.ListResponse{
+	response := volume.ListResponse{
 		Volumes:  volumeConfigs,
 		Warnings: []string{},
 	}
@@ -94,7 +98,7 @@ func CreateVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// decode params from body
-	input := docker_api_types_volume.CreateOptions{}
+	input := volume.CreateOptions{}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		utils.Error(w, http.StatusInternalServerError, fmt.Errorf("Decode(): %w", err))
 		return
@@ -121,7 +125,7 @@ func CreateVolume(w http.ResponseWriter, r *http.Request) {
 			utils.InternalServerError(w, err)
 			return
 		}
-		response := docker_api_types_volume.Volume{
+		response := volume.Volume{
 			CreatedAt:  existingVolume.CreatedTime().Format(time.RFC3339),
 			Driver:     existingVolume.Driver(),
 			Labels:     existingVolume.Labels(),
@@ -166,7 +170,7 @@ func CreateVolume(w http.ResponseWriter, r *http.Request) {
 		utils.InternalServerError(w, err)
 		return
 	}
-	volResponse := docker_api_types_volume.Volume{
+	volResponse := volume.Volume{
 		Name:       config.Name,
 		Driver:     config.Driver,
 		Mountpoint: mp,
@@ -196,7 +200,7 @@ func InspectVolume(w http.ResponseWriter, r *http.Request) {
 		utils.InternalServerError(w, err)
 		return
 	}
-	volResponse := docker_api_types_volume.Volume{
+	volResponse := volume.Volume{
 		Name:       vol.Name(),
 		Driver:     vol.Driver(),
 		Mountpoint: mp,
@@ -307,7 +311,7 @@ func PruneVolumes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := handlers.VolumesPruneReport{
-		VolumesPruneReport: docker_api_types.VolumesPruneReport{
+		VolumesPruneReport: volume.PruneReport{
 			VolumesDeleted: prunedIds,
 			SpaceReclaimed: reclaimedSpace,
 		},

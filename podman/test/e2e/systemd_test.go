@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -6,70 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gexec"
 )
 
 var _ = Describe("Podman systemd", func() {
-
-	var systemdUnitFile string
-
-	BeforeEach(func() {
-		podmanCmd := fmt.Sprintf("%s %s", podmanTest.PodmanBinary, strings.Join(podmanTest.MakeOptions(nil, false, false), " "))
-		systemdUnitFile = fmt.Sprintf(`[Unit]
-Description=redis container
-[Service]
-Restart=always
-ExecStart=%s start -a redis
-ExecStop=%s stop -t 10 redis
-KillMode=process
-[Install]
-WantedBy=default.target
-`, podmanCmd, podmanCmd)
-	})
-
-	It("podman start container by systemd", func() {
-		SkipIfRemote("cannot create unit file on remote host")
-		SkipIfContainerized("test does not have systemd as pid 1")
-
-		dashWhat := "--system"
-		unitDir := "/run/systemd/system"
-		if isRootless() {
-			dashWhat = "--user"
-			unitDir = fmt.Sprintf("%s/systemd/user", os.Getenv("XDG_RUNTIME_DIR"))
-		}
-		err := os.MkdirAll(unitDir, 0700)
-		Expect(err).ToNot(HaveOccurred())
-
-		serviceName := "redis-" + RandomString(10)
-		sysFilePath := filepath.Join(unitDir, serviceName+".service")
-		sysFile := os.WriteFile(sysFilePath, []byte(systemdUnitFile), 0644)
-		Expect(sysFile).ToNot(HaveOccurred())
-		defer func() {
-			stop := SystemExec("systemctl", []string{dashWhat, "stop", serviceName})
-			os.Remove(sysFilePath)
-			SystemExec("systemctl", []string{dashWhat, "daemon-reload"})
-			Expect(stop).Should(ExitCleanly())
-		}()
-
-		create := podmanTest.Podman([]string{"create", "--name", "redis", REDIS_IMAGE})
-		create.WaitWithDefaultTimeout()
-		Expect(create).Should(ExitCleanly())
-
-		enable := SystemExec("systemctl", []string{dashWhat, "daemon-reload"})
-		Expect(enable).Should(ExitCleanly())
-
-		start := SystemExec("systemctl", []string{dashWhat, "start", serviceName})
-		Expect(start).Should(ExitCleanly())
-
-		logs := SystemExec("journalctl", []string{dashWhat, "-n", "20", "-u", serviceName})
-		Expect(logs).Should(ExitCleanly())
-
-		status := SystemExec("systemctl", []string{dashWhat, "status", serviceName})
-		Expect(status.OutputToString()).To(ContainSubstring("active (running)"))
-	})
 
 	It("podman run container with systemd PID1", func() {
 		ctrName := "testSystemd"

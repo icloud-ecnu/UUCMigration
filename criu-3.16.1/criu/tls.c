@@ -8,7 +8,7 @@
 #include "cr_options.h"
 #include "xmalloc.h"
 
-/* Compatability with GnuTLS verson <3.5 */
+/* Compatibility with GnuTLS version < 3.5 */
 #ifndef GNUTLS_E_CERTIFICATE_VERIFICATION_ERROR
 #define GNUTLS_E_CERTIFICATE_VERIFICATION_ERROR GNUTLS_E_CERTIFICATE_ERROR
 #endif
@@ -31,7 +31,7 @@ static gnutls_certificate_credentials_t x509_cred;
 static int tls_sk = -1;
 static int tls_sk_flags = 0;
 
-void tls_terminate_session(void)
+void tls_terminate_session(bool async)
 {
 	int ret;
 
@@ -40,20 +40,26 @@ void tls_terminate_session(void)
 
 	if (session) {
 		do {
-			/* don't wait for peer to close connection */
-			ret = gnutls_bye(session, GNUTLS_SHUT_WR);
+			/*
+			 * Initiate a connection shutdown but don't
+			 * wait for peer to close connection.
+			 */
+			ret = gnutls_bye(session, async ? GNUTLS_SHUT_WR : GNUTLS_SHUT_RDWR);
 		} while (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED);
+		/* Free the session object */
 		gnutls_deinit(session);
 	}
 
 	tls_sk = -1;
+
+	/* Free the credentials object */
 	if (x509_cred)
 		gnutls_certificate_free_credentials(x509_cred);
 }
 
 ssize_t tls_send(const void *buf, size_t len, int flags)
 {
-	int ret;
+	ssize_t ret;
 
 	tls_sk_flags = flags;
 	ret = gnutls_record_send(session, buf, len);
@@ -95,7 +101,7 @@ int tls_send_data_from_fd(int fd, unsigned long len)
 		return -1;
 
 	while (len > 0) {
-		int ret, sent;
+		ssize_t ret, sent;
 
 		copied = read(fd, buf, min(len, buf_size));
 		if (copied <= 0) {
@@ -119,7 +125,7 @@ err:
 
 ssize_t tls_recv(void *buf, size_t len, int flags)
 {
-	int ret;
+	ssize_t ret;
 
 	tls_sk_flags = flags;
 	ret = gnutls_record_recv(session, buf, len);
@@ -163,7 +169,7 @@ int tls_recv_data_to_fd(int fd, unsigned long len)
 	gnutls_packet_t packet;
 
 	while (len > 0) {
-		int ret, w;
+		ssize_t ret, w;
 		gnutls_datum_t pdata;
 
 		ret = gnutls_record_recv_packet(session, &packet);
@@ -229,6 +235,7 @@ static int tls_handshake(void)
 {
 	int ret = -1;
 	while (ret != GNUTLS_E_SUCCESS) {
+		/* Establish TLS session */
 		ret = gnutls_handshake(session);
 		if (gnutls_error_is_fatal(ret)) {
 			tls_perror("TLS handshake failed", ret);
@@ -257,6 +264,7 @@ static int tls_x509_setup_creds(void)
 	if (opts.tls_key)
 		key = opts.tls_key;
 
+	/* Load the trusted CA certificates */
 	ret = gnutls_certificate_allocate_credentials(&x509_cred);
 	if (ret != GNUTLS_E_SUCCESS) {
 		tls_perror("Failed to allocate x509 credentials", ret);
@@ -298,10 +306,14 @@ static int tls_x509_setup_creds(void)
 	return 0;
 }
 
+/**
+ * A function used by gnutls to send data. It returns a positive
+ * number indicating the bytes sent, and -1 on error.
+ */
 static ssize_t _tls_push_cb(void *p, const void *data, size_t sz)
 {
 	int fd = *(int *)(p);
-	int ret = send(fd, data, sz, tls_sk_flags);
+	ssize_t ret = send(fd, data, sz, tls_sk_flags);
 	if (ret < 0 && errno != EAGAIN) {
 		int _errno = errno;
 		pr_perror("Push callback send failed");
@@ -310,10 +322,15 @@ static ssize_t _tls_push_cb(void *p, const void *data, size_t sz)
 	return ret;
 }
 
+/**
+ * A callback function used by gnutls to receive data.
+ * It returns 0 on connection termination, a positive number
+ * indicating the number of bytes received, and -1 on error.
+ */
 static ssize_t _tls_pull_cb(void *p, void *data, size_t sz)
 {
 	int fd = *(int *)(p);
-	int ret = recv(fd, data, sz, tls_sk_flags);
+	ssize_t ret = recv(fd, data, sz, tls_sk_flags);
 	if (ret < 0 && errno != EAGAIN) {
 		int _errno = errno;
 		pr_perror("Pull callback recv failed");
@@ -326,26 +343,33 @@ static int tls_x509_setup_session(unsigned int flags)
 {
 	int ret;
 
+	/* Create the session object */
 	ret = gnutls_init(&session, flags);
 	if (ret != GNUTLS_E_SUCCESS) {
 		tls_perror("Failed to initialize session", ret);
 		return -1;
 	}
 
+	/* Install the trusted certificates */
 	ret = gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, x509_cred);
 	if (ret != GNUTLS_E_SUCCESS) {
 		tls_perror("Failed to set session credentials", ret);
 		return -1;
 	}
 
+	/* Configure the cipher preferences */
 	ret = gnutls_set_default_priority(session);
 	if (ret != GNUTLS_E_SUCCESS) {
 		tls_perror("Failed to set priority", ret);
 		return -1;
 	}
 
+	/* Associate the socket with the session object */
 	gnutls_transport_set_ptr(session, &tls_sk);
+
+	/* Set a push function for gnutls to use to send data */
 	gnutls_transport_set_push_function(session, _tls_push_cb);
+	/* set a pull function for gnutls to use to receive data */
 	gnutls_transport_set_pull_function(session, _tls_pull_cb);
 
 	if (flags == GNUTLS_SERVER) {
@@ -375,6 +399,6 @@ int tls_x509_init(int sockfd, bool is_server)
 
 	return 0;
 err:
-	tls_terminate_session();
+	tls_terminate_session(true);
 	return -1;
 }

@@ -127,10 +127,11 @@ typedef struct {
 
 typedef struct xsave_struct user_fpregs_struct_t;
 
-#define REG_RES(regs)	     get_user_reg(&regs, ax)
-#define REG_IP(regs)	     get_user_reg(&regs, ip)
-#define REG_SP(regs)	     get_user_reg(&regs, sp)
-#define REG_SYSCALL_NR(regs) get_user_reg(&regs, orig_ax)
+#define REG_RES(regs)	      get_user_reg(&regs, ax)
+#define REG_IP(regs)	      get_user_reg(&regs, ip)
+#define SET_REG_IP(regs, val) set_user_reg(&regs, ip, val)
+#define REG_SP(regs)	      get_user_reg(&regs, sp)
+#define REG_SYSCALL_NR(regs)  get_user_reg(&regs, orig_ax)
 
 #define __NR(syscall, compat) ((compat) ? __NR32_##syscall : __NR_##syscall)
 
@@ -141,5 +142,12 @@ typedef struct xsave_struct user_fpregs_struct_t;
  * between 32 and 64 bits version.
  */
 #define __NR32_mmap __NR32_mmap2
+
+extern bool __compel_shstk_enabled(user_fpregs_struct_t *ext_regs);
+#define compel_shstk_enabled __compel_shstk_enabled
+
+extern int __parasite_setup_shstk(struct parasite_ctl *ctl,
+				user_fpregs_struct_t *ext_regs);
+#define parasite_setup_shstk __parasite_setup_shstk
 
 #endif /* UAPI_COMPEL_ASM_TYPES_H__ */

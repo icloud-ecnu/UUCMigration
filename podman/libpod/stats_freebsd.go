@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -8,8 +7,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/rctl"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/rctl"
 	"github.com/containers/storage/pkg/system"
 	"github.com/sirupsen/logrus"
 )
@@ -81,24 +80,10 @@ func (c *Container) getPlatformContainerStats(stats *define.ContainerStats, prev
 	stats.MemLimit = c.getMemLimit()
 	stats.SystemNano = now
 
-	netStats, err := getContainerNetIO(c)
-	if err != nil {
-		return err
-	}
-
-	// Handle case where the container is not in a network namespace
-	if netStats != nil {
-		stats.NetInput = netStats.RxBytes
-		stats.NetOutput = netStats.TxBytes
-	} else {
-		stats.NetInput = 0
-		stats.NetOutput = 0
-	}
-
 	return nil
 }
 
-// getMemory limit returns the memory limit for a container
+// getMemLimit returns the memory limit for a container
 func (c *Container) getMemLimit() uint64 {
 	memLimit := uint64(math.MaxUint64)
 

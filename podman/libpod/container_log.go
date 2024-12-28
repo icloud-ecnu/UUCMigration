@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -10,10 +9,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/libpod/logs"
-	systemdDefine "github.com/containers/podman/v4/pkg/systemd/define"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/logs"
+	systemdDefine "github.com/containers/podman/v5/pkg/systemd/define"
 	"github.com/nxadm/tail"
 	"github.com/nxadm/tail/watch"
 	"github.com/sirupsen/logrus"
@@ -140,20 +138,10 @@ func (c *Container) readFromLogFile(ctx context.Context, options *logs.LogOption
 
 		// The container is running, so we need to wait until the container exited
 		go func() {
-			eventChannel := make(chan *events.Event)
-			eventOptions := events.ReadOptions{
-				EventChannel: eventChannel,
-				Filters:      []string{"event=died", "container=" + c.ID()},
-				Stream:       true,
+			_, err = c.Wait(ctx)
+			if err != nil && !errors.Is(err, define.ErrNoSuchCtr) {
+				logrus.Errorf("Waiting for container to exit: %v", err)
 			}
-			go func() {
-				if err := c.runtime.Events(ctx, eventOptions); err != nil {
-					logrus.Errorf("Waiting for container to exit: %v", err)
-				}
-			}()
-			// Now wait for the died event and signal to finish
-			// reading the log until EOF.
-			<-eventChannel
 			// Make sure to wait at least for the poll duration
 			// before stopping the file logger (see #10675).
 			time.Sleep(watch.POLL_DURATION)

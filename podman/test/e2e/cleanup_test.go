@@ -1,10 +1,11 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "github.com/onsi/gomega/gexec"
 )
 
 var _ = Describe("Podman container cleanup", func() {
@@ -13,11 +14,10 @@ var _ = Describe("Podman container cleanup", func() {
 		SkipIfRemote("podman container cleanup is not supported in remote")
 	})
 
-	It("podman cleanup bogus container", func() {
+	It("podman cleanup bogus container should not error", func() {
 		session := podmanTest.Podman([]string{"container", "cleanup", "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(125))
-		Expect(session.ErrorToString()).To(ContainSubstring("no such container"))
+		Expect(session).Should(ExitCleanly())
 	})
 
 	It("podman cleanup container by id", func() {
@@ -88,8 +88,13 @@ var _ = Describe("Podman container cleanup", func() {
 		Expect(session).Should(ExitCleanly())
 		session = podmanTest.Podman([]string{"container", "cleanup", "running"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(125))
-		Expect(session.ErrorToString()).To(ContainSubstring("container state improper"))
+		Expect(session).Should(ExitCleanly())
+
+		// cleanup should be a NOP here, ctr must still be running
+		session = podmanTest.Podman([]string{"container", "inspect", "--format={{.State.Status}}", "running"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToString()).To(Equal("running"))
 	})
 
 	It("podman cleanup paused container", func() {
@@ -102,8 +107,13 @@ var _ = Describe("Podman container cleanup", func() {
 		Expect(session).Should(ExitCleanly())
 		session = podmanTest.Podman([]string{"container", "cleanup", "paused"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(125))
-		Expect(session.ErrorToString()).To(ContainSubstring("container state improper"))
+		Expect(session).Should(ExitCleanly())
+
+		// cleanup should be a NOP here, ctr must still be paused
+		session = podmanTest.Podman([]string{"container", "inspect", "--format={{.State.Status}}", "paused"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToString()).To(Equal("paused"))
 
 		// unpause so that the cleanup can stop the container,
 		// otherwise it fails with container state improper

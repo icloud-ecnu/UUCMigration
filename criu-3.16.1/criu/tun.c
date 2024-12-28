@@ -121,7 +121,7 @@ static int list_tun_link(NetDeviceEntry *nde, unsigned ns_id)
 	if (!tl)
 		return -1;
 
-	strlcpy(tl->name, nde->name, sizeof(tl->name));
+	__strlcpy(tl->name, nde->name, sizeof(tl->name));
 	/*
 	 * Keep tun-flags not only for persistency fixup (see
 	 * comment below), but also for TUNSETIFF -- we must
@@ -153,8 +153,9 @@ static struct tun_link *__dump_tun_link_fd(int fd, char *name, unsigned ns_id, u
 	tl = xmalloc(sizeof(*tl));
 	if (!tl)
 		goto err;
-	strlcpy(tl->name, name, sizeof(tl->name));
+	__strlcpy(tl->name, name, sizeof(tl->name));
 	tl->ns_id = ns_id;
+	INIT_LIST_HEAD(&tl->l);
 
 	if (ioctl(fd, TUNGETVNETHDRSZ, &tl->dmp.vnethdr) < 0) {
 		pr_perror("Can't dump vnethdr size for %s", name);
@@ -240,7 +241,7 @@ static int open_tun_dev(char *name, unsigned int idx, unsigned flags)
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+	__strlcpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
 	ifr.ifr_flags = flags;
 
 	if (ioctl(fd, TUNSETIFF, &ifr)) {
@@ -271,7 +272,7 @@ static struct tun_link *get_tun_link_fd(char *name, unsigned ns_id, unsigned fla
 	 */
 
 	if (!(flags & IFF_PERSIST)) {
-		pr_err("No fd infor for non persistent tun device %s\n", name);
+		pr_err("No fd info for non persistent tun device %s\n", name);
 		return NULL;
 	}
 
@@ -392,7 +393,7 @@ static int tunfile_open(struct file_desc *d, int *new_fd)
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	strlcpy(ifr.ifr_name, tl->name, sizeof(ifr.ifr_name));
+	__strlcpy(ifr.ifr_name, tl->name, sizeof(ifr.ifr_name));
 	ifr.ifr_flags = tl->rst.flags;
 
 	if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
@@ -454,30 +455,37 @@ int dump_tun_link(NetDeviceEntry *nde, struct cr_imgset *fds, struct nlattr **in
 	TunLinkEntry tle = TUN_LINK_ENTRY__INIT;
 	char spath[64];
 	char buf[64];
-	int ret = 0;
 	struct tun_link *tl;
 
 	sprintf(spath, "class/net/%s/tun_flags", nde->name);
-	ret |= read_ns_sys_file(spath, buf, sizeof(buf));
+	if (read_ns_sys_file(spath, buf, sizeof(buf)) < 0)
+		return -1;
 	tle.flags = strtol(buf, NULL, 0);
 
 	sprintf(spath, "class/net/%s/owner", nde->name);
-	ret |= read_ns_sys_file(spath, buf, sizeof(buf));
+	if (read_ns_sys_file(spath, buf, sizeof(buf)) < 0)
+		return -1;
 	tle.owner = strtol(buf, NULL, 10);
 
 	sprintf(spath, "class/net/%s/group", nde->name);
-	ret |= read_ns_sys_file(spath, buf, sizeof(buf));
+	if (read_ns_sys_file(spath, buf, sizeof(buf)) < 0)
+		return -1;
 	tle.group = strtol(buf, NULL, 10);
-
-	if (ret < 0)
-		return ret;
 
 	tl = get_tun_link_fd(nde->name, nde->peer_nsid, tle.flags);
 	if (!tl)
-		return ret;
+		return -1;
 
 	tle.vnethdr = tl->dmp.vnethdr;
 	tle.sndbuf = tl->dmp.sndbuf;
+
+	/*
+	 * Function get_tun_link_fd() can return either entry
+	 * from tun_links list or a newly allocated one, need to
+	 * free it only if not in list.
+	 */
+	if (list_empty(&tl->l))
+		xfree(tl);
 
 	nde->tun = &tle;
 	return write_netdev_img(nde, fds, info);

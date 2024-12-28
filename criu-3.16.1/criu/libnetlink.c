@@ -45,7 +45,7 @@ static int nlmsg_receive(char *buf, int len, int (*cb)(struct nlmsghdr *, struct
 }
 
 /*
- * Default errror handler: just point our an error
+ * Default error handler: just point our an error
  * and pass up to caller.
  */
 static int rtnl_return_err(int err, struct ns_id *ns, void *arg)
@@ -213,9 +213,4 @@ int __wrap_nlmsg_parse(struct nlmsghdr *nlh, int hdrlen, struct nlattr *tb[], in
 		return -NLE_MSG_TOOSHORT;
 
 	return nla_parse(tb, maxtype, nlmsg_attrdata(nlh, hdrlen), nlmsg_attrlen(nlh, hdrlen), policy);
-}
-
-int32_t nla_get_s32(const struct nlattr *nla)
-{
-	return *(const int32_t *)nla_data(nla);
 }

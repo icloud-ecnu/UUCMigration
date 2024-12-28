@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -11,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,14 +18,13 @@ import (
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/cgroups"
 	"github.com/containers/common/pkg/config"
-	cutil "github.com/containers/common/pkg/util"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/libpod/shutdown"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/specgen"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/libpod/shutdown"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage"
 	"github.com/containers/storage/pkg/stringid"
 	"github.com/docker/go-units"
@@ -257,7 +256,7 @@ func (r *Runtime) setupContainer(ctx context.Context, ctr *Container) (_ *Contai
 		for _, opts := range ctr.config.Networks {
 			if opts.InterfaceName != "" {
 				// check that no name is assigned to more than network
-				if cutil.StringInSlice(opts.InterfaceName, usedIfNames) {
+				if slices.Contains(usedIfNames, opts.InterfaceName) {
 					return nil, fmt.Errorf("network interface name %q is already assigned to another network", opts.InterfaceName)
 				}
 				usedIfNames = append(usedIfNames, opts.InterfaceName)
@@ -265,15 +264,22 @@ func (r *Runtime) setupContainer(ctx context.Context, ctr *Container) (_ *Contai
 		}
 		i := 0
 		for nameOrID, opts := range ctr.config.Networks {
-			netName, err := r.normalizeNetworkName(nameOrID)
+			netName, nicName, err := r.normalizeNetworkName(nameOrID)
 			if err != nil {
 				return nil, err
 			}
-			// assign interface name if empty
+
+			// check whether interface is to be named as the network_interface
+			// when name left unspecified
+			if opts.InterfaceName == "" {
+				opts.InterfaceName = nicName
+			}
+
+			// assign default interface name if empty
 			if opts.InterfaceName == "" {
 				for i < 100000 {
 					ifName := fmt.Sprintf("eth%d", i)
-					if !cutil.StringInSlice(ifName, usedIfNames) {
+					if !slices.Contains(usedIfNames, ifName) {
 						opts.InterfaceName = ifName
 						usedIfNames = append(usedIfNames, ifName)
 						break
@@ -507,16 +513,11 @@ func (r *Runtime) setupContainer(ctx context.Context, ctr *Container) (_ *Contai
 			volOptions = append(volOptions, withSetAnon())
 		}
 
-		needsChown := true
-
 		// If volume-opts are set, parse and add driver opts.
 		if len(vol.Options) > 0 {
 			isDriverOpts := false
 			driverOpts := make(map[string]string)
 			for _, opts := range vol.Options {
-				if opts == "idmap" {
-					needsChown = false
-				}
 				if strings.HasPrefix(opts, "volume-opt") {
 					isDriverOpts = true
 					driverOptKey, driverOptValue, err := util.ParseDriverOpts(opts)
@@ -532,11 +533,7 @@ func (r *Runtime) setupContainer(ctx context.Context, ctr *Container) (_ *Contai
 			}
 		}
 
-		if needsChown {
-			volOptions = append(volOptions, WithVolumeUID(ctr.RootUID()), WithVolumeGID(ctr.RootGID()))
-		} else {
-			volOptions = append(volOptions, WithVolumeNoChown())
-		}
+		volOptions = append(volOptions, WithVolumeUID(ctr.RootUID()), WithVolumeGID(ctr.RootGID()))
 
 		_, err = r.newVolume(ctx, false, volOptions...)
 		if err != nil {
@@ -579,7 +576,7 @@ func (r *Runtime) setupContainer(ctx context.Context, ctr *Container) (_ *Contai
 	}
 
 	if ctr.runtime.config.Engine.EventsContainerCreateInspectData {
-		if err := ctr.newContainerEventWithInspectData(events.Create, true); err != nil {
+		if err := ctr.newContainerEventWithInspectData(events.Create, define.HealthCheckResults{}, true); err != nil {
 			return nil, err
 		}
 	} else {
@@ -985,12 +982,6 @@ func (r *Runtime) removeContainer(ctx context.Context, c *Container, opts ctrRmO
 		reportErrorf("cleaning up storage: %w", err)
 	}
 
-	// Remove the container's CID file on container removal.
-	if cidFile, ok := c.config.Spec.Annotations[define.InspectAnnotationCIDFile]; ok {
-		if err := os.Remove(cidFile); err != nil && !errors.Is(err, os.ErrNotExist) {
-			reportErrorf("cleaning up CID file: %w", err)
-		}
-	}
 	// Remove the container from the state
 	if c.config.Pod != "" {
 		// If we're removing the pod, the container will be evicted
@@ -1004,6 +995,13 @@ func (r *Runtime) removeContainer(ctx context.Context, c *Container, opts ctrRmO
 		}
 	}
 	removedCtrs[c.ID()] = nil
+
+	// Remove the container's CID file on container removal.
+	if cidFile, ok := c.config.Spec.Annotations[define.InspectAnnotationCIDFile]; ok {
+		if err := os.Remove(cidFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			reportErrorf("cleaning up CID file: %w", err)
+		}
+	}
 
 	// Deallocate the container's lock
 	if err := c.lock.Free(); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -1414,13 +1412,13 @@ func (r *Runtime) IsStorageContainerMounted(id string) (bool, string, error) {
 
 	mountCnt, err := r.storageService.MountedContainerImage(id)
 	if err != nil {
-		return false, "", err
+		return false, "", fmt.Errorf("get mount count of container: %w", err)
 	}
 	mounted := mountCnt > 0
 	if mounted {
 		path, err = r.storageService.GetMountpoint(id)
 		if err != nil {
-			return false, "", err
+			return false, "", fmt.Errorf("get container mount point: %w", err)
 		}
 	}
 	return mounted, path, nil

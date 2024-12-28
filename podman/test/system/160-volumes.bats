@@ -155,7 +155,7 @@ Labels.l       | $mylabel
     cid=$output
     run_podman 2 volume rm myvol
     is "$output" "Error: volume myvol is being used by the following container(s): $cid: volume is being used" "should error since container is running"
-    run_podman volume rm myvol --force
+    run_podman volume rm myvol --force -t0
 }
 
 # Running scripts (executables) from a volume
@@ -419,7 +419,7 @@ EOF
 
     myvolume=myvol$(random_string)
     run_podman 125 volume create -o type=bind -o device=/bogus $myvolume
-    is "$output" "Error: invalid volume option device for driver 'local': stat /bogus: no such file or directory" "should fail with bogus directory not existing"
+    is "$output" "Error: invalid volume option device for driver 'local': faccessat /bogus: no such file or directory" "should fail with bogus directory not existing"
 
     run_podman volume create -o type=bind -o device=/$myvoldir $myvolume
     is "$output" "$myvolume" "should successfully create myvolume"
@@ -467,11 +467,13 @@ NeedsChown    | true
     run_podman volume inspect --format '{{ .NeedsCopyUp }}' $myvolume
     is "${output}" "true" "If content in dest '/vol' empty NeedsCopyUP should still be true"
     run_podman volume inspect --format '{{ .NeedsChown }}' $myvolume
-    is "${output}" "false" "After first use within a container NeedsChown should still be false"
+    is "${output}" "true" "No copy up occurred so the NeedsChown will still be true"
 
     run_podman run --rm --volume $myvolume:/etc $IMAGE ls /etc/passwd
     run_podman volume inspect --format '{{ .NeedsCopyUp }}' $myvolume
     is "${output}" "false" "If content in dest '/etc' non-empty NeedsCopyUP should still have happened and be false"
+    run_podman volume inspect --format '{{ .NeedsChown }}' $myvolume
+    is "${output}" "false" "Content has been copied up into volume, needschown will be false"
 
     run_podman volume inspect --format '{{.Mountpoint}}' $myvolume
     mountpoint="$output"
@@ -514,7 +516,6 @@ NeedsChown    | true
 FROM $IMAGE
 VOLUME /data
 EOF
-    fs=$(stat -f -c %T .)
     run_podman build -t volume_image $tmpdir
 
     containersconf=$tmpdir/containers.conf
@@ -532,8 +533,16 @@ EOF
     CONTAINERS_CONF_OVERRIDE="$containersconf" run_podman run --rm volume_image stat -f -c %T /data
     is "$output" "tmpfs" "Should be tmpfs"
 
-    CONTAINERS_CONF_OVERRIDE="$containersconf" run_podman run --image-volume bind --rm volume_image stat -f -c %T /data
-    assert "$output" != "tmpfs" "Should match hosts $fs"
+    # Get the hostfs first so we can match it below. The important check is
+    # the HEX filesystem type (%t); readable one (%T) is for ease of debugging.
+    # We can't compare %T because our alpine-based testimage doesn't grok btrfs.
+    run_podman info --format {{.Store.GraphRoot}}
+    hostfs=$(stat -f -c '%t %T' $output)
+    echo "# for debug: stat( $output ) = '$hostfs'"
+
+    # "${foo%% *}" strips everything after the first space: "9123683e btrfs" -> "9123683e"
+    CONTAINERS_CONF_OVERRIDE="$containersconf" run_podman run --image-volume anonymous --rm volume_image stat -f -c '%t %T' /data
+    assert "${output%% *}" == "${hostfs%% *}" "/data fs type should match hosts graphroot"
 
     CONTAINERS_CONF_OVERRIDE="$containersconf" run_podman run --image-volume tmpfs --rm volume_image stat -f -c %T /data
     is "$output" "tmpfs" "Should be tmpfs"
@@ -550,6 +559,13 @@ EOF
     is "$output" "Error: no volume with name \"bogus\" found: no such volume" "Should print error"
     run_podman volume rm --force bogus
     is "$output" "" "Should print no output"
+
+    run_podman volume create testvol
+    run_podman volume rm --force bogus testvol
+    assert "$output" = "testvol" "removed volume"
+
+    run_podman volume ls -q
+    assert "$output" = "" "no volumes"
 }
 
 @test "podman ps -f" {

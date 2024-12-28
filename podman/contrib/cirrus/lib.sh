@@ -71,36 +71,30 @@ export CI="${CI:-false}"
 CIRRUS_CI="${CIRRUS_CI:-false}"
 CONTINUOUS_INTEGRATION="${CONTINUOUS_INTEGRATION:-false}"
 CIRRUS_REPO_NAME=${CIRRUS_REPO_NAME:-podman}
-# Cirrus only sets $CIRRUS_BASE_SHA properly for PRs, but $EPOCH_TEST_COMMIT
-# needs to be set from this value in order for `make validate` to run properly.
-# When running get_ci_vm.sh, most $CIRRUS_xyz variables are empty. Attempt
-# to accommodate both branch and get_ci_vm.sh testing by discovering the base
-# branch SHA value.
-# shellcheck disable=SC2154
-if [[ -z "$CIRRUS_BASE_SHA" ]] && [[ -z "$CIRRUS_TAG" ]]
-then  # Operating on a branch, or under `get_ci_vm.sh`
-    showrun echo "branch or get_ci_vm (CIRRUS_BASE_SHA and CIRRUS_TAG are unset)"
-    CIRRUS_BASE_SHA=$(git rev-parse ${UPSTREAM_REMOTE:-origin}/$DEST_BRANCH)
-elif [[ -z "$CIRRUS_BASE_SHA" ]]
-then  # Operating on a tag
-    showrun echo "operating on tag"
-    CIRRUS_BASE_SHA=$(git rev-parse HEAD)
-fi
-# The starting place for linting and code validation
-EPOCH_TEST_COMMIT="$CIRRUS_BASE_SHA"
 
-# Regex defining all CI-related env. vars. necessary for all possible
-# testing operations on all platforms and versions.  This is necessary
-# to avoid needlessly passing through global/system values across
-# contexts, such as host->container or root->rootless user
+# All CI jobs use a local registry
+export CI_USE_REGISTRY_CACHE=true
+
+# shellcheck disable=SC2154
+if [[ -n "$CIRRUS_PR" ]] && [[ -z "$PR_BASE_SHA" ]]; then
+    # shellcheck disable=SC2154
+    PR_BASE_SHA=$(git merge-base ${DEST_BRANCH:-main} HEAD)
+    export PR_BASE_SHA
+fi
+
+# The next three values define regular expressions matching env. vars. necessary
+# for all possible testing contexts (rootless, container, etc.).  These values
+# are consumed by the passthrough_envars() automation library function.
 #
 # List of envariables which must be EXACT matches
-PASSTHROUGH_ENV_EXACT='CGROUP_MANAGER|DEST_BRANCH|DISTRO_NV|GOCACHE|GOPATH|GOSRC|NETWORK_BACKEND|OCI_RUNTIME|ROOTLESS_USER|SCRIPT_BASE|SKIP_USERNS|EC2_INST_TYPE|PODMAN_DB|STORAGE_FS'
+PASSTHROUGH_ENV_EXACT='CGROUP_MANAGER|DEST_BRANCH|DISTRO_NV|GOCACHE|GOPATH|GOSRC|NETWORK_BACKEND|OCI_RUNTIME|PR_BASE_SHA|ROOTLESS_USER|SCRIPT_BASE|SKIP_USERNS|EC2_INST_TYPE|PODMAN_DB|STORAGE_FS|PODMAN_BATS_LEAK_CHECK'
 
 # List of envariable patterns which must match AT THE BEGINNING of the name.
-PASSTHROUGH_ENV_ATSTART='CI|LANG|LC_|TEST'
+# Consumed by the passthrough_envars() automation library function.
+PASSTHROUGH_ENV_ATSTART='CI|LANG|LC_|STORAGE_OPTIONS_|TEST'
 
-# List of envariable patterns which can match ANYWHERE in the name
+# List of envariable patterns which can match ANYWHERE in the name.
+# Consumed by the passthrough_envars() automation library function.
 PASSTHROUGH_ENV_ANYWHERE='_NAME|_FQIN'
 
 # Unsafe env. vars for display
@@ -159,6 +153,9 @@ setup_rootless() {
     showrun groupadd -g $rootless_gid $ROOTLESS_USER
     showrun useradd -g $rootless_gid -u $rootless_uid --no-user-group --create-home $ROOTLESS_USER
 
+    # use tmpfs to speed up IO
+    mount -t tmpfs -o size=75%,mode=0700,uid=$rootless_uid,gid=$rootless_gid none /home/$ROOTLESS_USER
+
     echo "$ROOTLESS_USER ALL=(root) NOPASSWD: ALL" > /etc/sudoers.d/ci-rootless
 
     mkdir -p "$HOME/.ssh" "/home/$ROOTLESS_USER/.ssh"
@@ -198,63 +195,20 @@ setup_rootless() {
 }
 
 install_test_configs() {
-    msg "Installing ./test/registries.conf system-wide."
-    install -v -D -m 644 ./test/registries.conf /etc/containers/
-}
-
-use_cni() {
-    req_env_vars OS_RELEASE_ID PACKAGE_DOWNLOAD_DIR SCRIPT_BASE
-    # Defined by common automation library
-    # shellcheck disable=SC2154
-    if [[ "$OS_RELEASE_ID" =~ "debian" ]]; then
-        # Supporting it involves swapping the rpm & dnf commands below
-        die "Testing debian w/ CNI networking currently not supported"
+    # Which registries.conf to use. By default we always want the cached one...
+    cached="-cached"
+    # ...except for podman-machine, where it's antihelpful
+    if [[ -n "$1" ]]; then
+        if [[ "$1" = "nocache" ]]; then
+            cached=""
+        else
+            die "Internal error: install_test_configs(): unknown arg '$*'"
+        fi
     fi
 
-    msg "Forcing NETWORK_BACKEND=cni for all subsequent environments."
-    echo "NETWORK_BACKEND=cni" >> /etc/ci_environment
-    export NETWORK_BACKEND=cni
-    # While it's possible a user may want both installed, for CNI CI testing
-    # purposes we only care about backward-compatibility, not forward.
-    # If both CNI & netavark are present, in some situations where --root
-    # is used it's possible for podman to pick the "wrong" networking stack.
-    msg "Force-removing netavark and aardvark-dns"
-    # Other packages depend on nv/av, but we're testing with podman
-    # binaries built from source, so it's safe to ignore these deps.
-    #
-    # Do not fail when netavark and aardvark-dns are not installed.
-    for pkg in aardvark-dns netavark
-    do
-        [ -z "$(rpm -qa | grep $pkg)" ] && echo "$pkg not installed" || rpm -e --nodeps $pkg
-    done
-    msg "Installing default CNI configuration"
-    showrun dnf install -y $PACKAGE_DOWNLOAD_DIR/podman-plugins*
-    cd $GOSRC || exit 1
-    rm -rvf /etc/cni/net.d
-    mkdir -p /etc/cni/net.d
-    showrun install -v -D -m 644 ./cni/87-podman-bridge.conflist \
-        /etc/cni/net.d/
-    # This config must always sort last in the list of networks (podman picks
-    # first one as the default).  This config prevents allocation of network
-    # address space used by default in google cloud.
-    # https://cloud.google.com/vpc/docs/vpc#ip-ranges
-    showrun install -v -D -m 644 $SCRIPT_BASE/99-do-not-use-google-subnets.conflist \
-        /etc/cni/net.d/
-}
-
-use_netavark() {
-    req_env_vars OS_RELEASE_ID PRIOR_FEDORA_NAME DISTRO_NV
-    local magickind repokind
-    msg "Unsetting NETWORK_BACKEND for all subsequent environments."
-    echo "export -n NETWORK_BACKEND" >> /etc/ci_environment
-    echo "unset NETWORK_BACKEND" >> /etc/ci_environment
-    export -n NETWORK_BACKEND
-    unset NETWORK_BACKEND
-    msg "Removing any/all CNI configuration"
-    showrun rm -rvf /etc/cni/net.d/*
-    # N/B: The CNI packages are still installed and available. This is
-    # on purpose, since CI needs to verify the selection mechanisms are
-    # functional when both are available.
+    msg "Installing ./test/registries$cached.conf system-wide."
+    # All CI VMs run with a local registry
+    install -v -D -m 644 ./test/registries$cached.conf /etc/containers/registries.conf
 }
 
 # Remove all files provided by the distro version of podman.
@@ -293,8 +247,6 @@ remove_packaged_podman_files() {
     # delete the podman socket in case it has been created previously.
     # Do so without running podman, lest that invocation initialize unwanted state.
     rm -f /run/podman/podman.sock  /run/user/$(id -u)/podman/podman.sock || true
-
-    rm -f $(podman info --format "{{.Host.RemoteSocket.Path}}")
 
     # yum/dnf/dpkg may list system directories, only remove files
     $LISTING_CMD | while read fullpath

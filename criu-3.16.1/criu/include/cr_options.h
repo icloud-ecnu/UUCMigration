@@ -1,10 +1,12 @@
 #ifndef __CR_OPTIONS_H__
 #define __CR_OPTIONS_H__
 
-#include <sys/types.h>
 #include <stdbool.h>
+#include <sys/capability.h>
 #include "common/config.h"
 #include "common/list.h"
+#include "int.h"
+#include "image.h"
 
 /* Configuration and CLI parsing order defines */
 #define PARSING_GLOBAL_CONF  1
@@ -65,6 +67,7 @@ struct cg_root_opt {
 enum NETWORK_LOCK_METHOD {
 	NETWORK_LOCK_IPTABLES,
 	NETWORK_LOCK_NFTABLES,
+	NETWORK_LOCK_SKIP,
 };
 
 #define NETWORK_LOCK_DEFAULT NETWORK_LOCK_IPTABLES
@@ -93,11 +96,31 @@ enum FILE_VALIDATION_OPTIONS {
 /* This constant dictates which file validation method should be tried by default. */
 #define FILE_VALIDATION_DEFAULT FILE_VALIDATION_BUILD_ID
 
+/* This constant dictates that criu use fiemap to copy ghost file by default.*/
+#define FIEMAP_DEFAULT 1
+
 struct irmap;
 
 struct irmap_path_opt {
 	struct list_head node;
 	struct irmap *ir;
+};
+
+enum criu_mode {
+	CR_UNSET = 0,
+	CR_DUMP,
+	CR_PRE_DUMP,
+	CR_RESTORE,
+	CR_LAZY_PAGES,
+	CR_CHECK,
+	CR_PAGE_SERVER,
+	CR_SERVICE,
+	CR_SWRK,
+	CR_DEDUP,
+	CR_CPUINFO,
+	CR_EXEC_DEPRECATED,
+	CR_SHOW_DEPRECATED,
+	CR_ITERATIVE_DUMP,
 };
 
 struct cr_options {
@@ -108,6 +131,8 @@ struct cr_options {
 		int restore_detach;
 		bool daemon_mode;
 	};
+	bool is_iterative_dump;
+	bool last_dump;
 	int restore_sibling;
 	bool ext_unix_sk;
 	int shell_job;
@@ -118,7 +143,6 @@ struct cr_options {
 	int link_remap_ok;
 	int log_file_per_pid;
 	int pre_dump_mode;
-	
 	bool swrk_restore;
 	char *output;
 	char *root;
@@ -134,8 +158,7 @@ struct cr_options {
 	char *addr;
 	int ps_socket;
 	int track_mem;
-	char *img_parent;// 这里
-	char * predict_mode;
+	char *img_parent;
 	int auto_dedup;
 	unsigned int cpu_cap;
 	int force_irmap;
@@ -151,6 +174,7 @@ struct cr_options {
 	int enable_external_masters;
 	bool aufs; /* auto-detected, not via cli */
 	bool overlayfs;
+	int ghost_fiemap;
 #ifdef CONFIG_BINFMT_MISC_VIRTUALIZED
 	bool has_binfmt_misc; /* auto-detected */
 #endif
@@ -165,6 +189,7 @@ struct cr_options {
 	bool lazy_pages;
 	char *work_dir;
 	int network_lock_method;
+	int skip_file_rwx_check;
 
 	/*
 	 * When we scheduler for removal some functionality we first
@@ -181,11 +206,6 @@ struct cr_options {
 	pid_t tree_id;
 	int log_level;
 	char *imgs_dir;
-	char * pageState_dir;
-	int live_migration;
-	char * pageState_file;
-	char * pageCategory_file;
-	char * systemState_file;
 	char *tls_cacert;
 	char *tls_cacrl;
 	char *tls_cert;
@@ -195,6 +215,31 @@ struct cr_options {
 
 	/* This stores which method to use for file validation. */
 	int file_validation_method;
+
+	/* Shows the mode criu is running at the moment: dump/pre-dump/restore/... */
+	enum criu_mode mode;
+
+	int mntns_compat_mode;
+
+	/* Remember the program name passed to main() so we can use it in
+	 * error messages elsewhere.
+	 */
+	char *argv_0;
+	/*
+	 * This contains the eUID of the current CRIU user. It
+	 * will only be set to a non-zero value if CRIU has
+	 * the necessary capabilities to run as non root.
+	 * CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN
+	 */
+	uid_t uid;
+	/* This contains the value from capget()->effective */
+	u32 cap_eff[_LINUX_CAPABILITY_U32S_3];
+	/*
+	 * If CRIU should be running as non-root with the help of
+	 * CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN the user should
+	 * explicitly request it as it comes with many limitations.
+	 */
+	int unprivileged;
 };
 
 extern struct cr_options opts;

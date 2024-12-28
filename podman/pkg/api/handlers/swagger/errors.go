@@ -1,8 +1,10 @@
+//go:build !remote
+
 //nolint:unused // these types are used to wire generated swagger to API code
 package swagger
 
 import (
-	"github.com/containers/podman/v4/pkg/errorhandling"
+	"github.com/containers/podman/v5/pkg/errorhandling"
 )
 
 // Error model embedded in swagger:response to aid in documentation generation

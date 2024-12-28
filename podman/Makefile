@@ -57,10 +57,12 @@ BUILDTAGS ?= \
 	$(shell hack/libsubid_tag.sh) \
 	exclude_graphdriver_devicemapper \
 	seccomp
+# allow downstreams to easily add build tags while keeping our defaults
+BUILDTAGS += ${EXTRA_BUILDTAGS}
 # N/B: This value is managed by Renovate, manual changes are
 # possible, as long as they don't disturb the formatting
 # (i.e. DO NOT ADD A 'v' prefix!)
-GOLANGCI_LINT_VERSION := 1.55.2
+GOLANGCI_LINT_VERSION := 1.62.2
 PYTHON ?= $(shell command -v python3 python|head -n1)
 PKG_MANAGER ?= $(shell command -v dnf yum|head -n1)
 # ~/.local/bin is not in PATH on all systems
@@ -69,6 +71,8 @@ ifeq ($(shell uname -s),FreeBSD)
 SED=gsed
 GREP=ggrep
 MAN_L=	mandoc
+# FreeBSD needs CNI until netavark is supported
+BUILDTAGS += cni
 else
 SED=sed
 GREP=grep
@@ -91,7 +95,7 @@ OCI_RUNTIME ?= ""
 MANPAGES_SOURCE_DIR = docs/source/markdown
 MANPAGES_MD_IN ?= $(wildcard $(MANPAGES_SOURCE_DIR)/*.md.in)
 MANPAGES_MD_GENERATED ?= $(MANPAGES_MD_IN:%.md.in=%.md)
-MANPAGES_MD ?= $(sort $(wildcard $(MANPAGES_SOURCE_DIR)/*.md) $(MANPAGES_MD_GENERATED))
+MANPAGES_MD ?= $(sort $(wildcard $(MANPAGES_SOURCE_DIR)/*.md) $(MANPAGES_MD_GENERATED) $(MANPAGES_SOURCE_DIR)/podman-troubleshooting.7.md $(MANPAGES_SOURCE_DIR)/podman-rootless.7.md)
 MANPAGES ?= $(MANPAGES_MD:%.md=%)
 MANPAGES_DEST ?= $(subst markdown,man, $(subst source,build,$(MANPAGES)))
 
@@ -101,6 +105,7 @@ FISHINSTALLDIR=${PREFIX}/share/fish/vendor_completions.d
 
 SELINUXOPT ?= $(shell test -x /usr/sbin/selinuxenabled && selinuxenabled && echo -Z)
 
+
 COMMIT_NO ?= $(shell git rev-parse HEAD 2> /dev/null || true)
 GIT_COMMIT ?= $(if $(shell git status --porcelain --untracked-files=no),$(call err_if_empty,COMMIT_NO)-dirty,$(COMMIT_NO))
 DATE_FMT = %s
@@ -109,14 +114,14 @@ ifdef SOURCE_DATE_EPOCH
 else
 	BUILD_INFO ?= $(shell date "+$(DATE_FMT)")
 endif
-LIBPOD := ${PROJECT}/v4/libpod
+LIBPOD := ${PROJECT}/v5/libpod
 GOFLAGS ?= -trimpath
 LDFLAGS_PODMAN ?= \
 	$(if $(GIT_COMMIT),-X $(LIBPOD)/define.gitCommit=$(GIT_COMMIT),) \
 	$(if $(BUILD_INFO),-X $(LIBPOD)/define.buildInfo=$(BUILD_INFO),) \
 	-X $(LIBPOD)/config._installPrefix=$(PREFIX) \
 	-X $(LIBPOD)/config._etcDir=$(ETCDIR) \
-	-X $(PROJECT)/v4/pkg/systemd/quadlet._binDir=$(BINDIR) \
+	-X $(PROJECT)/v5/pkg/systemd/quadlet._binDir=$(BINDIR) \
 	-X github.com/containers/common/pkg/config.additionalHelperBinariesDir=$(HELPER_BINARIES_DIR)\
 	$(EXTRA_LDFLAGS)
 LDFLAGS_PODMAN_STATIC ?= \
@@ -131,11 +136,9 @@ GINKGOTIMEOUT ?= -timeout=90m
 GINKGOWHAT ?= test/e2e/.
 GINKGO_PARALLEL=y
 GINKGO ?= ./test/tools/build/ginkgo
-# ginkgo json output is only useful in CI, not on developer runs
-GINKGO_JSON ?= $(if $(CI),--json-report ginkgo-e2e.json,)
 
 # Allow control over some Ginkgo parameters
-GINKGO_FLAKE_ATTEMPTS ?= 3
+GINKGO_FLAKE_ATTEMPTS ?= 0
 GINKGO_NO_COLOR ?= y
 
 # Conditional required to produce empty-output if binary not built yet.
@@ -164,6 +167,7 @@ CROSS_BUILD_TARGETS := \
 	bin/podman.cross.linux.arm64 \
 	bin/podman.cross.linux.386 \
 	bin/podman.cross.linux.s390x \
+	bin/podman.cross.linux.loong64 \
 	bin/podman.cross.linux.mips \
 	bin/podman.cross.linux.mipsle \
 	bin/podman.cross.linux.mips64 \
@@ -214,7 +218,7 @@ endif
 
 # gvisor-tap-vsock version for gvproxy.exe and win-sshproxy.exe downloads
 # the upstream project ships pre-built binaries since version 0.7.1
-GV_VERSION=v0.7.2
+GV_VERSION=v0.8.1
 
 ###
 ### Primary entry-point targets
@@ -232,11 +236,11 @@ binaries: podman podman-remote ## Build podman and podman-remote binaries
 else ifneq (, $(findstring $(GOOS),darwin windows))
 binaries: podman-remote ## Build podman-remote (client) only binaries
 else
-binaries: podman podman-remote podmansh rootlessport quadlet ## Build podman, podman-remote and rootlessport binaries quadlet
+binaries: podman podman-remote podman-testing podmansh rootlessport quadlet ## Build podman, podman-remote and rootlessport binaries quadlet
 endif
 
 # Extract text following double-# for targets, as their description for
-# the `help` target.  Otherwise These simple-substitutions are resolved
+# the `help` target.  Otherwise these simple-substitutions are resolved
 # at reference-time (due to `=` and not `=:`).
 _HLP_TGTS_RX = '^[[:print:]]+:.*?\#\# .*$$'
 _HLP_TGTS_CMD = $(GREP) -E $(_HLP_TGTS_RX) $(MAKEFILE_LIST)
@@ -264,13 +268,12 @@ help: ## (Default) Print listing of key targets with their descriptions
 ###
 
 .PHONY: .gitvalidation
-.gitvalidation:
+.gitvalidation: .install.gitvalidation
 	@echo "Validating vs commit '$(call err_if_empty,EPOCH_TEST_COMMIT)'"
 	GIT_CHECK_EXCLUDE="./vendor:./test/tools/vendor:docs/make.bat:test/buildah-bud/buildah-tests.diff:test/e2e/quadlet/remap-keep-id2.container" ./test/tools/build/git-validation -run short-subject -range $(EPOCH_TEST_COMMIT)..$(HEAD)
 
 .PHONY: lint
 lint: golangci-lint
-	@echo "Linting vs commit '$(call err_if_empty,EPOCH_TEST_COMMIT)'"
 ifeq ($(PRE_COMMIT),)
 	@echo "FATAL: pre-commit was not found, make .install.pre-commit to installing it." >&2
 	@exit 2
@@ -304,10 +307,36 @@ test/version/version: version/version.go
 
 .PHONY: codespell
 codespell:
-	codespell -S bin,vendor,.git,go.sum,.cirrus.yml,"*.fish,RELEASE_NOTES.md,*.xz,*.gz,*.ps1,*.tar,swagger.yaml,*.tgz,bin2img,*ico,*.png,*.1,*.5,copyimg,*.orig,apidoc.go" -L passt,bu,hastable,te,clos,ans,pullrequest,uint,iff,od,seeked,splitted,marge,erro,hist,ether,specif -w
+	# Configuration for codespell is in .codespellrc
+	codespell -w
+
+# Code validation target that **DOES NOT** require building podman binaries
+.PHONY: validate-source
+validate-source: lint .gitvalidation swagger-check tests-expect-exit pr-removes-fixed-skips
+
+# Code validation target that **DOES** require building podman binaries
+.PHONY: validate-binaries
+validate-binaries: man-page-check validate.completions
 
 .PHONY: validate
-validate: lint .gitvalidation validate.completions man-page-check swagger-check tests-included tests-expect-exit pr-removes-fixed-skips
+validate: validate-source validate-binaries
+
+# The image used below is generated manually from contrib/validatepr/Containerfile in this podman repo.  The builds are
+# not automated right now.  The hope is that eventually the quay.io/libpod/fedora_podman is multiarch and can replace this
+# image in the future.
+.PHONY: validatepr
+validatepr:
+	$(PODMANCMD) run --rm \
+		-v $(CURDIR):/go/src/github.com/containers/podman \
+		--security-opt label=disable \
+		-it \
+		-w /go/src/github.com/containers/podman \
+		quay.io/libpod/validatepr:latest  \
+		make .validatepr
+
+.PHONY: .validatepr
+.validatepr:
+	env BUILDTAGS="$(BUILDTAGS)" REMOTETAGS="$(REMOTETAGS)" contrib/validatepr/validatepr.sh
 
 .PHONY: build-all-new-commits
 build-all-new-commits:
@@ -319,6 +348,7 @@ vendor:
 	$(GO) mod tidy
 	$(GO) mod vendor
 	$(GO) mod verify
+	$(GO) mod edit -toolchain none
 
 
 # We define *-in-container targets for the following make targets. This allow the targets to be run in a container.
@@ -332,7 +362,7 @@ $(IN_CONTAINER): %-in-container:
 	$(PODMANCMD) run --rm --env HOME=/root \
 		-v $(CURDIR):/src -w /src \
 		--security-opt label=disable \
-		docker.io/library/golang:1.18 \
+		docker.io/library/golang:1.22 \
 		make $(*)
 
 
@@ -352,6 +382,7 @@ endif
 		$(GO_LDFLAGS) '$(LDFLAGS_PODMAN)' \
 		-tags "$(BUILDTAGS)" \
 		-o $@ ./cmd/podman
+	test -z "${SELINUXOPT}" || chcon -t container_runtime_exec_t $@
 
 # Disambiguate Linux vs Darwin/Windows platform binaries under distinct "bin" dirs
 $(SRCBINDIR):
@@ -365,10 +396,10 @@ $(SRCBINDIR)/podman$(BINSFX): $(SOURCES) go.mod go.sum | $(SRCBINDIR)
 		-tags "${REMOTETAGS}" \
 		-o $@ ./cmd/podman
 
-$(SRCBINDIR)/podman-remote-static-linux_amd64 $(SRCBINDIR)/podman-remote-static-linux_arm64: $(SRCBINDIR)/podman-remote-static-linux_%: $(SRCBINDIR) $(SOURCES) go.mod go.sum
+$(SRCBINDIR)/podman-remote-static-linux_%: GOARCH = $(patsubst $(SRCBINDIR)/podman-remote-static-linux_%,%,$@)
+$(SRCBINDIR)/podman-remote-static-linux_%: GOOS = linux
+$(SRCBINDIR)/podman-remote-static $(SRCBINDIR)/podman-remote-static-linux_amd64 $(SRCBINDIR)/podman-remote-static-linux_arm64: $(SRCBINDIR) $(SOURCES) go.mod go.sum
 	CGO_ENABLED=0 \
-	GOOS=linux \
-	GOARCH=$* \
 	$(GO) build \
 		$(BUILDFLAGS) \
 		$(GO_LDFLAGS) '$(LDFLAGS_PODMAN_STATIC)' \
@@ -392,7 +423,8 @@ $(SRCBINDIR)/quadlet: $(SOURCES) go.mod go.sum
 .PHONY: quadlet
 quadlet: bin/quadlet
 
-PHONY: podman-remote-static-linux_amd64 podman-remote-static-linux_arm64
+.PHONY: podman-remote-static podman-remote-static-linux_amd64 podman-remote-static-linux_arm64
+podman-remote-static: $(SRCBINDIR)/podman-remote-static
 podman-remote-static-linux_amd64: $(SRCBINDIR)/podman-remote-static-linux_amd64
 podman-remote-static-linux_arm64: $(SRCBINDIR)/podman-remote-static-linux_arm64
 
@@ -431,6 +463,16 @@ rootlessport: bin/rootlessport
 podmansh: bin/podman
 	if [ ! -f bin/podmansh ]; then ln -s podman bin/podmansh; fi
 
+$(SRCBINDIR)/podman-testing: $(SOURCES) go.mod go.sum
+	$(GOCMD) build \
+		$(BUILDFLAGS) \
+		$(GO_LDFLAGS) '$(LDFLAGS_PODMAN)' \
+		-tags "${BUILDTAGS}" \
+		-o $@ ./cmd/podman-testing
+
+.PHONY: podman-testing
+podman-testing: bin/podman-testing
+
 ###
 ### Secondary binary-build targets
 ###
@@ -459,6 +501,14 @@ local-cross: $(CROSS_BUILD_TARGETS) ## Cross compile podman binary for multiple 
 .PHONY: cross
 cross: local-cross
 
+# Simple target to check that we can build all binaries for another arch,
+# the resulting binaries are not meant to be usable this is just for
+# testing if it builds, it depends on the caller to set GOOS/GOARCH.
+.PHONY: cross-binaries
+cross-binaries:
+	$(MAKE) CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) \
+		BUILDTAGS="$(BUILDTAGS_CROSS)" clean-binaries binaries
+
 .PHONY: completions
 completions: podman podman-remote
 	# key = shell, value = completion filename
@@ -475,20 +525,29 @@ completions: podman podman-remote
 ### Documentation targets
 ###
 
-pkg/api/swagger.yaml:
+pkg/api/swagger.yaml: .install.swagger
 	make -C pkg/api
 
 $(MANPAGES_MD_GENERATED): %.md: %.md.in $(MANPAGES_SOURCE_DIR)/options/*.md
 	hack/markdown-preprocess
 
+$(MANPAGES_SOURCE_DIR)/podman-troubleshooting.7.md: troubleshooting.md
+	( echo "% podman-troubleshooting 7"; echo; sed -e '/logo.*\.png/d' <$< ) >$@.tmp.$$ && \
+		mv $@.tmp.$$ $@
+
+$(MANPAGES_SOURCE_DIR)/podman-rootless.7.md: rootless.md
+	( echo "% podman-rootless 7"; echo; sed -e '/logo.*\.png/d' <$< ) >$@.tmp.$$ && \
+		mv $@.tmp.$$ $@
+
+$(MANPAGES): OUTFILE=$(subst source/markdown,build/man,$@)
 $(MANPAGES): %: %.md .install.md2man docdir
 
 # This does a bunch of filtering needed for man pages:
-#  1. Strip markdown link targets like '[podman(1)](podman.1.md)'
+#  1. Convert all markdown site links to plain text:
+#           [foo](https://www.....)   ->   foo
+#  2. Strip man-page targets like '[podman(1)](podman.1.md)'
 #     to just '[podman(1)]', because man pages have no link mechanism;
-#  2. Then remove the brackets: '[podman(1)]' -> 'podman(1)';
-#  3. Then do the same for all other markdown links,
-#     like '[cgroups(7)](https://.....)'  -> just 'cgroups(7)';
+#  3. Then remove the brackets: '[podman(1)]' -> 'podman(1)';
 #  4. Remove HTML-ish stuff like '<sup>..</sup>' and '<a>..</a>'
 #  5. Replace "\" (backslash) at EOL with two spaces (no idea why)
 # Then two sanity checks:
@@ -502,17 +561,17 @@ $(MANPAGES): %: %.md .install.md2man docdir
 #     ASCII art. I (esm) believe the cost of releasing corrupt man pages
 #     is higher than the cost of carrying this kludge.
 #
-	@$(SED) -e 's/\((podman[^)]*\.md\(#.*\)\?)\)//g'    \
-	       -e 's/\[\(podman[^]]*\)\]/\1/g'              \
-	       -e 's/\[\([^]]*\)](http[^)]\+)/\1/g'         \
-	       -e 's;<\(/\)\?\(a\|a\s\+[^>]*\|sup\)>;;g'    \
-	       -e 's/\\$$/  /g' $<                         |\
-	$(GOMD2MAN) -out $(subst source/markdown,build/man,$@)
-	@if grep 'included file options/' docs/build/man/*; then \
-		echo "FATAL: man pages must not contain ^^^^"; exit 1; \
+	@$(SED) -e 's/\[\([^]]*\)](http[^)]\+)/\1/g'         \
+	        -e 's/\((podman[^)]*\.md\(#.*\)\?)\)//g'     \
+	        -e 's/\[\(podman[^]]*\)\]/\1/g'              \
+	        -e 's;<\(/\)\?\(a\|a\s\+[^>]*\|sup\)>;;g'    \
+	        -e 's/\\$$/  /g' $<                         |\
+	$(GOMD2MAN) -out $(OUTFILE)
+	@if grep 'included file options/' $(OUTFILE); then \
+		echo "FATAL: man pages must not contain ^^^^ in $(OUTFILE)"; exit 1; \
 	fi
-	@if $(MAN_L) $(subst source/markdown,build/man,$@) | $(GREP) -Pazoq '│\s+│\n\s+├─+┼─+┤\n\s+│\s+│'; then  \
-		echo "FATAL: $< has a too-long table column; use 'man -l $(subst source/markdown,build/man,$@)' and look for empty table cells."; exit 1; \
+	@if $(MAN_L) $(OUTFILE)| $(GREP) -Pazoq '│\s+│\n\s+├─+┼─+┤\n\s+│\s+│'; then  \
+		echo "FATAL: $< has a too-long table column; use 'man -l $(OUTFILE)' and look for empty table cells."; exit 1; \
 	fi
 
 .PHONY: docdir
@@ -540,10 +599,19 @@ podman-remote-%-docs: podman-remote
 		$(if $(findstring windows,$*),docs/source/markdown,docs/build/man)
 
 .PHONY: man-page-check
-man-page-check: bin/podman
+man-page-check: man-page-checker xref-helpmsgs-manpages xref-quadlet-docs xref-quadlet-docs
+
+man-page-checker: bin/podman docs
 	hack/man-page-checker
+
+xref-helpmsgs-manpages: bin/podman docs
 	hack/xref-helpmsgs-manpages
+
+man-page-table-check: docs
 	hack/man-page-table-check
+
+xref-quadlet-docs: docs
+	hack/xref-quadlet-docs
 
 .PHONY: swagger-check
 swagger-check:
@@ -564,7 +632,7 @@ docker-docs: docs
 
 .PHONY: validate.completions
 validate.completions: SHELL:=/usr/bin/env bash # Set shell to bash for this target
-validate.completions:
+validate.completions: completions
 	# Check if the files can be loaded by the shell
 	. completions/bash/podman
 	if [ -x /bin/zsh ]; then /bin/zsh completions/zsh/_podman; fi
@@ -598,22 +666,27 @@ localunit: test/goecho/goecho test/version/version
 test: localunit localintegration remoteintegration localsystem remotesystem  ## Run unit, integration, and system tests.
 
 .PHONY: ginkgo-run
+# e2e tests need access to podman-registry
+ginkgo-run: PATH := $(PATH):$(CURDIR)/hack
 ginkgo-run: .install.ginkgo
 	$(GINKGO) version
 	$(GINKGO) -vv $(TESTFLAGS) --tags "$(TAGS) remote" $(GINKGOTIMEOUT) --flake-attempts $(GINKGO_FLAKE_ATTEMPTS) \
 		--trace $(if $(findstring y,$(GINKGO_NO_COLOR)),--no-color,) \
-		$(GINKGO_JSON) $(if $(findstring y,$(GINKGO_PARALLEL)),-p,) $(if $(FOCUS),--focus "$(FOCUS)",) \
-		$(if $(FOCUS_FILE),--focus-file "$(FOCUS_FILE)",) $(GINKGOWHAT) $(HACK)
+		$(if $(findstring y,$(GINKGO_PARALLEL)),-p,) \
+		$(if $(FOCUS),--focus "$(FOCUS)" --silence-skips,) \
+		$(if $(FOCUS_FILE),--focus-file "$(FOCUS_FILE)" --silence-skips,) $(GINKGOWHAT)
 
 .PHONY: ginkgo
 ginkgo:
-	$(MAKE) ginkgo-run TAGS="$(BUILDTAGS)" HACK=hack/.
+	$(MAKE) ginkgo-run TAGS="$(BUILDTAGS)"
 
 .PHONY: ginkgo-remote
 ginkgo-remote:
-	$(MAKE) ginkgo-run TAGS="$(REMOTETAGS) remote_testing" HACK=
+	$(MAKE) ginkgo-run TAGS="$(REMOTETAGS) remote_testing"
 
 .PHONY: testbindings
+# bindings tests need access to podman-registry
+testbindings: PATH := $(PATH):$(CURDIR)/hack
 testbindings: .install.ginkgo
 	$(GINKGO) -v $(TESTFLAGS) --tags "$(TAGS) remote" $(GINKGOTIMEOUT) --trace --no-color --timeout 30m  -v -r ./pkg/bindings/test
 
@@ -624,42 +697,52 @@ localintegration: test-binaries ginkgo
 remoteintegration: test-binaries ginkgo-remote
 
 .PHONY: localmachine
-localmachine: test-binaries .install.ginkgo
-	$(MAKE) ginkgo-run GINKGO_PARALLEL=n GINKGOWHAT=pkg/machine/e2e/. HACK=
+localmachine:
+	# gitCommit needed by logformatter, to link to sources
+	@echo /define.gitCommit=$(GIT_COMMIT)
+	$(MAKE) ginkgo-run GINKGO_PARALLEL=n TAGS="$(REMOTETAGS)" GINKGO_FLAKE_ATTEMPTS=0 FOCUS_FILE=$(FOCUS_FILE) GINKGOWHAT=pkg/machine/e2e/.
 
 .PHONY: localsystem
 localsystem:
 	# Wipe existing config, database, and cache: start with clean slate.
 	$(RM) -rf ${HOME}/.local/share/containers ${HOME}/.config/containers
-	if timeout -v 1 true; then PODMAN=$(CURDIR)/bin/podman QUADLET=$(CURDIR)/bin/quadlet bats test/system/; else echo "Skipping $@: 'timeout -v' unavailable'"; fi
+	PODMAN=$(CURDIR)/bin/podman QUADLET=$(CURDIR)/bin/quadlet bats -T --filter-tags '!ci:parallel' test/system/
+	PODMAN=$(CURDIR)/bin/podman QUADLET=$(CURDIR)/bin/quadlet bats -T --filter-tags ci:parallel -j $$(nproc) test/system/
 
 .PHONY: remotesystem
 remotesystem:
 	# Wipe existing config, database, and cache: start with clean slate.
 	$(RM) -rf ${HOME}/.local/share/containers ${HOME}/.config/containers
-	# Start podman server using tmp socket; loop-wait for it;
-	# test podman-remote; kill server, clean up tmp socket file.
-	# podman server spews copious unhelpful output; ignore it.
+	# . Make sure there's no active podman server - if there is,
+	#   it's not us, and we have no way to know what it is.
+	# . Start server. Wait to make sure it comes up.
+	# . Run tests, pretty much the same as localsystem.
+	# . Stop server.
 	rc=0;\
 	if timeout -v 1 true; then \
-		SOCK_FILE=$(shell mktemp --dry-run --tmpdir podman_tmp_XXXX);\
-		export PODMAN_SOCKET=unix://$$SOCK_FILE; \
-		./bin/podman system service --timeout=0 $$PODMAN_SOCKET > $(if $(PODMAN_SERVER_LOG),$(PODMAN_SERVER_LOG),/dev/null) 2>&1 & \
+		if ./bin/podman-remote info; then \
+			echo "Error: podman system service (not ours) is already running" >&2;\
+			exit 1;\
+		fi;\
+		./bin/podman system service --timeout=0 > $(if $(PODMAN_SERVER_LOG),$(PODMAN_SERVER_LOG),/dev/null) 2>&1 & \
 		retry=5;\
 		while [ $$retry -ge 0 ]; do\
 			echo Waiting for server...;\
 			sleep 1;\
-			./bin/podman-remote --url $$PODMAN_SOCKET info >/dev/null 2>&1 && break;\
+			./bin/podman-remote info >/dev/null 2>&1 && break;\
 			retry=$$(expr $$retry - 1);\
 		done;\
 		if [ $$retry -lt 0 ]; then\
-			echo "Error: ./bin/podman system service did not come up on $$SOCK_FILE" >&2;\
+			echo "Error: ./bin/podman system service did not come up" >&2;\
 			exit 1;\
 		fi;\
-		env PODMAN="$(CURDIR)/bin/podman-remote --url $$PODMAN_SOCKET" bats test/system/ ;\
-		rc=$$?;\
+		env PODMAN="$(CURDIR)/bin/podman-remote" bats -T --filter-tags '!ci:parallel' test/system/ ;\
+		rc=$$?; \
+		if [ $$rc -eq 0 ]; then \
+		   env PODMAN="$(CURDIR)/bin/podman-remote" bats -T --filter-tags ci:parallel -j $$(nproc) test/system/ ;\
+		   rc=$$?;\
+		fi; \
 		kill %1;\
-		rm -f $$SOCK_FILE;\
 	else \
 		echo "Skipping $@: 'timeout -v' unavailable'";\
 	fi;\
@@ -673,10 +756,6 @@ localapiv2-bash:
 localapiv2-python:
 	env CONTAINERS_CONF=$(CURDIR)/test/apiv2/containers.conf PODMAN=./bin/podman \
 		pytest --verbose --disable-warnings ./test/apiv2/python
-	touch test/__init__.py
-	env CONTAINERS_CONF=$(CURDIR)/test/apiv2/containers.conf PODMAN=./bin/podman \
-		pytest --verbose --disable-warnings ./test/python/docker
-	rm -f test/__init__.py
 
 # Order is important running python tests first causes the bash tests
 # to fail, see 12-imagesMore.  FIXME order of tests should not matter
@@ -698,6 +777,10 @@ test-binaries: test/checkseccomp/checkseccomp test/goecho/goecho install.cataton
 .PHONY: tests-included
 tests-included:
 	contrib/cirrus/pr-should-include-tests
+
+.PHONY: test-jira-links-included
+test-jira-links-included:
+	contrib/cirrus/pr-should-link-jira
 
 .PHONY: tests-expect-exit
 tests-expect-exit:
@@ -778,7 +861,7 @@ podman-remote-release-%.zip: test/version/version ## Build podman-remote for %=$
 	if [[ "$(GOARCH)" != "$(NATIVE_GOARCH)" ]]; then $(MAKE) clean-binaries; fi
 	-rm -rf "$(tmpsubdir)"
 
-# Checks out and builds win-sshproxy helper. See comment on GV_GITURL declaration
+# Downloads pre-built gvproxy and win-sshproxy helpers. See comment on GV_VERSION declaration
 .PHONY: win-gvproxy
 win-gvproxy: test/version/version
 	mkdir -p bin/windows/
@@ -839,47 +922,57 @@ ifneq ($(shell uname -s),FreeBSD)
 	ln -sfr $(DESTDIR)$(LIBEXECPODMAN)/quadlet $(DESTDIR)$(SYSTEMDGENERATORSDIR)/podman-system-generator
 	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(USERSYSTEMDGENERATORSDIR)
 	ln -sfr $(DESTDIR)$(LIBEXECPODMAN)/quadlet $(DESTDIR)$(USERSYSTEMDGENERATORSDIR)/podman-user-generator
-	install ${SELINUXOPT} -m 755 -d ${DESTDIR}${TMPFILESDIR}
-	install ${SELINUXOPT} -m 644 contrib/tmpfile/podman.conf ${DESTDIR}${TMPFILESDIR}/podman.conf
+	install ${SELINUXOPT} -m 755 -d $(DESTDIR)${TMPFILESDIR}
+	install ${SELINUXOPT} -m 644 contrib/tmpfile/podman.conf $(DESTDIR)${TMPFILESDIR}/podman.conf
 endif
+
+.PHONY: install.testing
+install.testing:
+	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(BINDIR)
+	install ${SELINUXOPT} -m 755 bin/podman-testing $(DESTDIR)$(BINDIR)/podman-testing
 
 .PHONY: install.modules-load
 install.modules-load: # This should only be used by distros which might use iptables-legacy, this is not needed on RHEL
-	install ${SELINUXOPT} -m 755 -d ${DESTDIR}${MODULESLOADDIR}
-	install ${SELINUXOPT} -m 644 contrib/modules-load.d/podman-iptables.conf ${DESTDIR}${MODULESLOADDIR}/podman-iptables.conf
+	install ${SELINUXOPT} -m 755 -d $(DESTDIR)${MODULESLOADDIR}
+	install ${SELINUXOPT} -m 644 contrib/modules-load.d/podman-iptables.conf $(DESTDIR)${MODULESLOADDIR}/podman-iptables.conf
 
 .PHONY: install.man
 install.man:
 	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(MANDIR)/man1
 	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(MANDIR)/man5
+	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(MANDIR)/man7
 	install ${SELINUXOPT} -m 644 $(filter %.1,$(MANPAGES_DEST)) $(DESTDIR)$(MANDIR)/man1
 	install ${SELINUXOPT} -m 644 docs/source/markdown/links/*1 $(DESTDIR)$(MANDIR)/man1
 	install ${SELINUXOPT} -m 644 $(filter %.5,$(MANPAGES_DEST)) $(DESTDIR)$(MANDIR)/man5
 	install ${SELINUXOPT} -m 644 docs/source/markdown/links/*5 $(DESTDIR)$(MANDIR)/man5
+	install ${SELINUXOPT} -m 644 $(filter %.7,$(MANPAGES_DEST)) $(DESTDIR)$(MANDIR)/man7
 
 .PHONY: install.completions
 install.completions:
-	install ${SELINUXOPT} -d -m 755 ${DESTDIR}${BASHINSTALLDIR}
-	install ${SELINUXOPT} -m 644 completions/bash/podman ${DESTDIR}${BASHINSTALLDIR}
-	install ${SELINUXOPT} -m 644 completions/bash/podman-remote ${DESTDIR}${BASHINSTALLDIR}
-	install ${SELINUXOPT} -d -m 755 ${DESTDIR}${ZSHINSTALLDIR}
-	install ${SELINUXOPT} -m 644 completions/zsh/_podman ${DESTDIR}${ZSHINSTALLDIR}
-	install ${SELINUXOPT} -m 644 completions/zsh/_podman-remote ${DESTDIR}${ZSHINSTALLDIR}
-	install ${SELINUXOPT} -d -m 755 ${DESTDIR}${FISHINSTALLDIR}
-	install ${SELINUXOPT} -m 644 completions/fish/podman.fish ${DESTDIR}${FISHINSTALLDIR}
-	install ${SELINUXOPT} -m 644 completions/fish/podman-remote.fish ${DESTDIR}${FISHINSTALLDIR}
+	install ${SELINUXOPT} -d -m 755 $(DESTDIR)${BASHINSTALLDIR}
+	install ${SELINUXOPT} -m 644 completions/bash/podman $(DESTDIR)${BASHINSTALLDIR}
+	install ${SELINUXOPT} -m 644 completions/bash/podman-remote $(DESTDIR)${BASHINSTALLDIR}
+	install ${SELINUXOPT} -d -m 755 $(DESTDIR)${ZSHINSTALLDIR}
+	install ${SELINUXOPT} -m 644 completions/zsh/_podman $(DESTDIR)${ZSHINSTALLDIR}
+	install ${SELINUXOPT} -m 644 completions/zsh/_podman-remote $(DESTDIR)${ZSHINSTALLDIR}
+	install ${SELINUXOPT} -d -m 755 $(DESTDIR)${FISHINSTALLDIR}
+	install ${SELINUXOPT} -m 644 completions/fish/podman.fish $(DESTDIR)${FISHINSTALLDIR}
+	install ${SELINUXOPT} -m 644 completions/fish/podman-remote.fish $(DESTDIR)${FISHINSTALLDIR}
 	# There is no common location for powershell files so do not install them. Users have to source the file from their powershell profile.
 
 .PHONY: install.docker
 install.docker:
 	install ${SELINUXOPT} -d -m 755 $(DESTDIR)$(BINDIR)
 	$(eval INTERPOLATED_DOCKER_SCRIPT := $(shell mktemp))
-	env BINDIR=${BINDIR} ETCDIR=${ETCDIR} envsubst < docker.in > ${INTERPOLATED_DOCKER_SCRIPT}
+	env BINDIR=${BINDIR} ETCDIR=${ETCDIR} envsubst '$$BINDIR;$$ETCDIR' < docker/docker.in > ${INTERPOLATED_DOCKER_SCRIPT}
 	install ${SELINUXOPT} -m 755 ${INTERPOLATED_DOCKER_SCRIPT} $(DESTDIR)$(BINDIR)/docker
 	rm ${INTERPOLATED_DOCKER_SCRIPT}
-	install ${SELINUXOPT} -m 755 -d ${DESTDIR}${SYSTEMDDIR}  ${DESTDIR}${USERSYSTEMDDIR} ${DESTDIR}${TMPFILESDIR} ${DESTDIR}${USERTMPFILESDIR}
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-docker.conf -t ${DESTDIR}${TMPFILESDIR}
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-docker.conf -t ${DESTDIR}${USERTMPFILESDIR}
+	install ${SELINUXOPT} -m 755 -d $(DESTDIR)${SYSTEMDDIR}  $(DESTDIR)${USERSYSTEMDDIR} $(DESTDIR)${TMPFILESDIR} $(DESTDIR)${USERTMPFILESDIR}
+	install ${SELINUXOPT} -d -m 755 $(DESTDIR)${ETCDIR}/profile.d
+	install ${SELINUXOPT} -m 644 docker/podman-docker.sh $(DESTDIR)${ETCDIR}/profile.d/podman-docker.sh
+	install ${SELINUXOPT} -m 644 docker/podman-docker.csh $(DESTDIR)${ETCDIR}/profile.d/podman-docker.csh
+	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-docker.conf -t $(DESTDIR)${TMPFILESDIR}
+	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-docker.conf -t $(DESTDIR)${USERTMPFILESDIR}
 
 .PHONY: install.docker-docs
 install.docker-docs:
@@ -893,7 +986,7 @@ install.docker-full: install.docker install.docker-docs
 
 .PHONY: install.systemd
 ifneq (,$(findstring systemd,$(BUILDTAGS)))
-PODMAN_UNIT_FILES = contrib/systemd/auto-update/podman-auto-update.service \
+PODMAN_GENERATED_UNIT_FILES = contrib/systemd/system/podman-auto-update.service \
 		    contrib/systemd/system/podman.service \
 		    contrib/systemd/system/podman-restart.service \
 		    contrib/systemd/system/podman-kube@.service \
@@ -903,24 +996,25 @@ PODMAN_UNIT_FILES = contrib/systemd/auto-update/podman-auto-update.service \
 	sed -e 's;@@PODMAN@@;$(BINDIR)/podman;g' $< >$@.tmp.$$ \
 		&& mv -f $@.tmp.$$ $@
 
-install.systemd: $(PODMAN_UNIT_FILES)
-	install ${SELINUXOPT} -m 755 -d ${DESTDIR}${SYSTEMDDIR}  ${DESTDIR}${USERSYSTEMDDIR}
-	# User services
-	install ${SELINUXOPT} -m 644 contrib/systemd/auto-update/podman-auto-update.service ${DESTDIR}${USERSYSTEMDDIR}/podman-auto-update.service
-	install ${SELINUXOPT} -m 644 contrib/systemd/auto-update/podman-auto-update.timer ${DESTDIR}${USERSYSTEMDDIR}/podman-auto-update.timer
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman.socket ${DESTDIR}${USERSYSTEMDDIR}/podman.socket
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman.service ${DESTDIR}${USERSYSTEMDDIR}/podman.service
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-restart.service ${DESTDIR}${USERSYSTEMDDIR}/podman-restart.service
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-kube@.service ${DESTDIR}${USERSYSTEMDDIR}/podman-kube@.service
-	# System services
-	install ${SELINUXOPT} -m 644 contrib/systemd/auto-update/podman-auto-update.service ${DESTDIR}${SYSTEMDDIR}/podman-auto-update.service
-	install ${SELINUXOPT} -m 644 contrib/systemd/auto-update/podman-auto-update.timer ${DESTDIR}${SYSTEMDDIR}/podman-auto-update.timer
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman.socket ${DESTDIR}${SYSTEMDDIR}/podman.socket
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman.service ${DESTDIR}${SYSTEMDDIR}/podman.service
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-restart.service ${DESTDIR}${SYSTEMDDIR}/podman-restart.service
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-kube@.service ${DESTDIR}${SYSTEMDDIR}/podman-kube@.service
-	install ${SELINUXOPT} -m 644 contrib/systemd/system/podman-clean-transient.service ${DESTDIR}${SYSTEMDDIR}/podman-clean-transient.service
-	rm -f $(PODMAN_UNIT_FILES)
+install.systemd: $(PODMAN_GENERATED_UNIT_FILES)
+	install ${SELINUXOPT} -m 755 -d $(DESTDIR)${SYSTEMDDIR}  $(DESTDIR)${USERSYSTEMDDIR}
+	for unit in $^ \
+				contrib/systemd/system/podman-auto-update.timer \
+				contrib/systemd/system/podman.socket; do \
+		install ${SELINUXOPT} -m 644 $$unit $(DESTDIR)${USERSYSTEMDDIR}/$$(basename $$unit); \
+		install ${SELINUXOPT} -m 644 $$unit $(DESTDIR)${SYSTEMDDIR}/$$(basename $$unit); \
+	done
+	# HACK; as rootless this unit will not work due the requires on a non existing target
+	# as the user session does not see system units. We could define two different units
+	# but this seems much more complicated then this small fixup here.
+	# https://github.com/containers/podman/issues/23790
+	sed -i '/Requires=/d' $(DESTDIR)${USERSYSTEMDDIR}/podman-clean-transient.service
+	sed -i '/After=/d' $(DESTDIR)${USERSYSTEMDDIR}/podman-clean-transient.service
+
+	# Important this unit should only be installed for the user session and is thus not added to the loop above.
+	install ${SELINUXOPT} -m 644 contrib/systemd/user/podman-user-wait-network-online.service \
+		$(DESTDIR)${USERSYSTEMDDIR}/podman-user-wait-network-online.service
+	rm -f $^
 else
 install.systemd:
 endif
@@ -947,11 +1041,7 @@ install.tools: .install.golangci-lint ## Install needed tools
 
 .PHONY: .install.swagger
 .install.swagger:
-	env VERSION=0.30.3 \
-		BINDIR=$(BINDIR) \
-		GOOS=$(GOOS) \
-		GOARCH=$(GOARCH) \
-		./hack/install_swagger.sh
+	$(MAKE) -C test/tools build/swagger
 
 .PHONY: .install.md2man
 .install.md2man:
@@ -993,15 +1083,15 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/podman
 	rm -f $(DESTDIR)$(BINDIR)/podman-remote
 	# Remove related config files
-	rm -f ${DESTDIR}${ETCDIR}/cni/net.d/87-podman-bridge.conflist
-	rm -f ${DESTDIR}${TMPFILESDIR}/podman.conf
-	rm -f ${DESTDIR}${SYSTEMDDIR}/io.podman.socket
-	rm -f ${DESTDIR}${USERSYSTEMDDIR}/io.podman.socket
-	rm -f ${DESTDIR}${SYSTEMDDIR}/io.podman.service
-	rm -f ${DESTDIR}${SYSTEMDDIR}/podman.service
-	rm -f ${DESTDIR}${SYSTEMDDIR}/podman.socket
-	rm -f ${DESTDIR}${USERSYSTEMDDIR}/podman.socket
-	rm -f ${DESTDIR}${USERSYSTEMDDIR}/podman.service
+	rm -f $(DESTDIR)${ETCDIR}/cni/net.d/87-podman-bridge.conflist
+	rm -f $(DESTDIR)${TMPFILESDIR}/podman.conf
+	rm -f $(DESTDIR)${SYSTEMDDIR}/io.podman.socket
+	rm -f $(DESTDIR)${USERSYSTEMDDIR}/io.podman.socket
+	rm -f $(DESTDIR)${SYSTEMDDIR}/io.podman.service
+	rm -f $(DESTDIR)${SYSTEMDDIR}/podman.service
+	rm -f $(DESTDIR)${SYSTEMDDIR}/podman.socket
+	rm -f $(DESTDIR)${USERSYSTEMDDIR}/podman.socket
+	rm -f $(DESTDIR)${USERSYSTEMDDIR}/podman.service
 
 .PHONY: clean-binaries
 clean-binaries: ## Remove platform/architecture specific binary files

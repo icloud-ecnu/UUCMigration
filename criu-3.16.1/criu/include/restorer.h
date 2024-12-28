@@ -44,11 +44,21 @@ struct rst_sched_param {
 	int prio;
 };
 
+struct rst_rseq_param {
+	u64 rseq_abi_pointer;
+	u32 rseq_abi_size;
+	u32 signature;
+};
+
 struct restore_posix_timer {
 	struct str_posix_timer spt;
 	struct itimerspec val;
 	int overrun;
 };
+
+#ifndef rst_shstk_info
+struct rst_shstk_info {};
+#endif
 
 /*
  * We should be able to construct fpu sigframe in sigreturn_prep_fpu_frame,
@@ -66,7 +76,6 @@ struct thread_creds_args {
 	u32 cap_eff[CR_CAP_SIZE];
 	u32 cap_bnd[CR_CAP_SIZE];
 
-	unsigned int secbits;
 	char *lsm_profile;
 	unsigned int *groups;
 	char *lsm_sockcreate;
@@ -98,6 +107,7 @@ struct thread_restore_args {
 	struct task_restore_args *ta;
 
 	tls_t tls;
+	struct rst_rseq_param rseq;
 
 	siginfo_t *siginfo;
 	unsigned int siginfo_n;
@@ -113,7 +123,11 @@ struct thread_restore_args {
 	unsigned int seccomp_filters_n;
 	bool seccomp_force_tsync;
 
+	struct rst_shstk_info shstk;
+
 	char comm[TASK_COMM_LEN];
+	int cg_set;
+	int cgroupd_sk;
 } __aligned(64);
 
 typedef long (*thread_restore_fcall_t)(struct thread_restore_args *args);
@@ -135,10 +149,10 @@ struct task_restore_args {
 	struct timeval logstart;
 
 	int uffd;
-	bool has_thp_enabled;
+	bool thp_disabled;
 
 	/* threads restoration */
-	int nr_threads; /* number of threads */
+	int nr_threads;				 /* number of threads */
 	thread_restore_fcall_t clone_restore_fn; /* helper address for clone() call */
 	struct thread_restore_args *thread_args; /* array of thread arguments */
 	struct task_entries *task_entries;
@@ -211,7 +225,7 @@ struct task_restore_args {
 	bool can_map_vdso;
 	bool auto_dedup;
 	unsigned long vdso_rt_size;
-	struct vdso_maps vdso_maps_rt; /* runtime vdso symbols */
+	struct vdso_maps vdso_maps_rt;	 /* runtime vdso symbols */
 	unsigned long vdso_rt_parked_at; /* safe place to keep vdso */
 	void **breakpoint;
 
@@ -221,7 +235,19 @@ struct task_restore_args {
 #endif
 	int lsm_type;
 	int child_subreaper;
+	int membarrier_registration_mask;
 	bool has_clone3_set_tid;
+
+	/*
+	 * info about rseq from libc used to
+	 * unregister it before memory restoration procedure
+	 */
+	struct rst_rseq_param libc_rseq;
+
+	uid_t uid;
+	u32 cap_eff[CR_CAP_SIZE];
+
+	struct rst_shstk_info shstk;
 } __aligned(64);
 
 /*
@@ -312,5 +338,21 @@ enum {
 
 #define __r_sym(name)		  restorer_sym##name
 #define restorer_sym(rblob, name) (void *)(rblob + __r_sym(name))
+
+#ifndef arch_shstk_switch_to_restorer
+static inline int arch_shstk_switch_to_restorer(struct rst_shstk_info *shstk)
+{
+	return 0;
+}
+#define arch_shstk_switch_to_restorer arch_shstk_switch_to_restorer
+#endif
+
+#ifndef arch_shstk_restore
+static inline int arch_shstk_restore(struct rst_shstk_info *shstk)
+{
+	return 0;
+}
+#define arch_shstk_restore arch_shstk_restore
+#endif
 
 #endif /* __CR_RESTORER_H__ */

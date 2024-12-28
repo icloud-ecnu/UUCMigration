@@ -29,7 +29,7 @@ type PodmanConfig struct {
 	ContainersConf           *config.Config
 	ContainersConfDefaultsRO *config.Config // The read-only! defaults from containers.conf.
 	DBBackend                string         // Hidden: change the database backend
-	DockerConfig             string         // Used for Docker compatibility
+	DockerConfig             string         // Location of authentication config file
 	CgroupUsage              string         // rootless code determines Usage message
 	ConmonPath               string         // --conmon flag will set Engine.ConmonPath
 	CPUProfile               string         // Hidden: Should CPU profile be taken
@@ -48,6 +48,7 @@ type PodmanConfig struct {
 	Trace                    bool     // Hidden: Trace execution
 	URI                      string   // URI to RESTful API Service
 	FarmNodeName             string   // Name of farm node
+	ConnectionError          error    // Error when looking up the connection in setupRemoteConnection()
 
 	Runroot        string
 	ImageStore     string
@@ -57,4 +58,5 @@ type PodmanConfig struct {
 	MachineMode    bool
 	TransientStore bool
 	GraphRoot      string
+	PullOptions    []string
 }

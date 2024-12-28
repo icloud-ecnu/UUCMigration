@@ -1,9 +1,11 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"fmt"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -71,7 +73,7 @@ USER 1000`, ALPINE)
 	It("podman run non-numeric group not specified in container", func() {
 		session := podmanTest.Podman([]string{"run", "--read-only", "-u", "root:doesnotexist", BB, "mount"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(126, "unable to find group doesnotexist: no matching entries in group file"))
 	})
 
 	It("podman run numeric group specified in container", func() {

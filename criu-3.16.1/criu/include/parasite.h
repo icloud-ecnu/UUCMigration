@@ -10,6 +10,8 @@
 #include <time.h>
 #include <signal.h>
 
+#include "linux/rseq.h"
+
 #include "image.h"
 #include "util-pie.h"
 #include "common/lock.h"
@@ -116,6 +118,8 @@ static inline int posix_timers_dump_size(int timer_n)
  */
 
 struct parasite_dump_misc {
+	bool has_membarrier_get_registrations; /* this is sent from criu to parasite. */
+
 	unsigned long brk;
 
 	u32 pid;
@@ -126,6 +130,7 @@ struct parasite_dump_misc {
 	int dumpable;
 	int thp_disabled;
 	int child_subreaper;
+	int membarrier_registration_mask;
 };
 
 /*
@@ -146,6 +151,7 @@ struct parasite_dump_creds {
 
 	int uids[4];
 	int gids[4];
+	int no_new_privs;
 	unsigned int secbits;
 	unsigned int ngroups;
 	/*
@@ -164,10 +170,17 @@ struct parasite_dump_creds {
 	unsigned int groups[0];
 };
 
+struct parasite_check_rseq {
+	bool has_rseq;
+	bool has_ptrace_get_rseq_conf; /* no need to check if supported */
+	bool rseq_inited;
+};
+
 struct parasite_dump_thread {
 	unsigned int *tid_addr;
 	pid_t tid;
 	tls_t tls;
+	struct parasite_check_rseq rseq;
 	stack_t sas;
 	int pdeath_sig;
 	char comm[TASK_COMM_LEN];
@@ -232,7 +245,12 @@ struct parasite_dump_cgroup_args {
 	 *
 	 * The string is null terminated.
 	 */
-	char contents[1 << 12];
+	char contents[(1 << 12) - 32];
+	/*
+	 * Contains the path to thread cgroup procfs.
+	 * "self/task/<tid>/cgroup"
+	 */
+	char thread_cgrp[32];
 };
 
 #endif /* !__ASSEMBLY__ */

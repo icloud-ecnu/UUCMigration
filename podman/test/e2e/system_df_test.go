@@ -1,10 +1,12 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"strconv"
 	"strings"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -95,8 +97,7 @@ var _ = Describe("podman system df", func() {
 	It("podman system df --format with --verbose", func() {
 		session := podmanTest.Podman([]string{"system", "df", "--format", "json", "--verbose"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
-		Expect(session.ErrorToString()).To(Equal("Error: cannot combine --format and --verbose flags"))
+		Expect(session).To(ExitWithError(125, "Error: cannot combine --format and --verbose flags"))
 	})
 
 	It("podman system df --format json", func() {

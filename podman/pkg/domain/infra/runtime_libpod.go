@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package infra
 
@@ -10,15 +9,16 @@ import (
 	"io/fs"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/containers/common/pkg/cgroups"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/namespaces"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/namespaces"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/types"
 	"github.com/sirupsen/logrus"
@@ -34,7 +34,6 @@ var (
 )
 
 type engineOpts struct {
-	noStore  bool
 	withFDS  bool
 	reset    bool
 	renumber bool
@@ -45,7 +44,6 @@ type engineOpts struct {
 func GetRuntime(ctx context.Context, flags *flag.FlagSet, cfg *entities.PodmanConfig) (*libpod.Runtime, error) {
 	runtimeSync.Do(func() {
 		runtimeLib, runtimeErr = getRuntime(ctx, flags, &engineOpts{
-			noStore:  false,
 			withFDS:  true,
 			reset:    cfg.IsReset,
 			renumber: cfg.IsRenumber,
@@ -53,16 +51,6 @@ func GetRuntime(ctx context.Context, flags *flag.FlagSet, cfg *entities.PodmanCo
 		})
 	})
 	return runtimeLib, runtimeErr
-}
-
-// GetRuntimeNoStore generates a new libpod runtime configured by command line options
-func GetRuntimeNoStore(ctx context.Context, fs *flag.FlagSet, cfg *entities.PodmanConfig) (*libpod.Runtime, error) {
-	return getRuntime(ctx, fs, &engineOpts{
-		noStore: true,
-		withFDS: true,
-		reset:   false,
-		config:  cfg,
-	})
 }
 
 func getRuntime(ctx context.Context, fs *flag.FlagSet, opts *engineOpts) (*libpod.Runtime, error) {
@@ -103,11 +91,23 @@ func getRuntime(ctx context.Context, fs *flag.FlagSet, opts *engineOpts) (*libpo
 		storageOpts.RunRoot = cfg.Runroot
 	}
 	if fs.Changed("imagestore") {
+		storageSet = true
 		storageOpts.ImageStore = cfg.ImageStore
 		options = append(options, libpod.WithImageStore(cfg.ImageStore))
 	}
-	if len(storageOpts.RunRoot) > 50 {
-		return nil, errors.New("the specified runroot is longer than 50 characters")
+	if fs.Changed("pull-option") {
+		storageSet = true
+		storageOpts.PullOptions = make(map[string]string)
+		for _, v := range cfg.PullOptions {
+			if v == "" {
+				continue
+			}
+			val := strings.SplitN(v, "=", 2)
+			if len(val) != 2 {
+				return nil, fmt.Errorf("invalid pull option: %s", v)
+			}
+			storageOpts.PullOptions[val[0]] = val[1]
+		}
 	}
 	if fs.Changed("storage-driver") {
 		storageSet = true
@@ -148,9 +148,6 @@ func getRuntime(ctx context.Context, fs *flag.FlagSet, opts *engineOpts) (*libpo
 		options = append(options, libpod.WithStorageConfig(storageOpts))
 	}
 
-	if !storageSet && opts.noStore {
-		options = append(options, libpod.WithNoStore())
-	}
 	// TODO CLI flags for image config?
 	// TODO CLI flag for signature policy?
 
@@ -243,7 +240,7 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		options.HostUIDMapping = false
 		options.HostGIDMapping = false
 		options.AutoUserNs = true
-		opts, err := mode.GetAutoOptions()
+		opts, err := util.GetAutoOptions(mode)
 		if err != nil {
 			return nil, err
 		}

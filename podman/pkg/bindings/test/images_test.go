@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"time"
 
-	podmanRegistry "github.com/containers/podman/v4/hack/podman-registry-go"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/bindings"
-	"github.com/containers/podman/v4/pkg/bindings/containers"
-	"github.com/containers/podman/v4/pkg/bindings/images"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	podmanRegistry "github.com/containers/podman/v5/hack/podman-registry-go"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/bindings/containers"
+	"github.com/containers/podman/v5/pkg/bindings/images"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gexec"
@@ -177,7 +177,7 @@ var _ = Describe("Podman images", func() {
 
 		// Adding one more image. There Should be no errors in the response.
 		// And the count should be three now.
-		bt.Pull("testimage:20200929")
+		bt.Pull("testimage:20221018")
 		imageSummary, err = images.List(bt.conn, nil)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(len(imageSummary)).To(BeNumerically(">=", 2))

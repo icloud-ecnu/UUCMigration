@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package generate
 
@@ -12,11 +11,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/specgen"
-	"github.com/containers/podman/v4/pkg/specgenutil"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/specgenutil"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
@@ -86,6 +85,12 @@ func MakePod(p *entities.PodSpec, rt *libpod.Runtime) (_ *libpod.Pod, finalErr e
 		// make sure of that here.
 		p.PodSpecGen.InfraContainerSpec.ResourceLimits = nil
 		p.PodSpecGen.InfraContainerSpec.WeightDevice = nil
+
+		// Set default for HealthCheck
+		p.PodSpecGen.InfraContainerSpec.HealthLogDestination = define.DefaultHealthCheckLocalDestination
+		p.PodSpecGen.InfraContainerSpec.HealthMaxLogCount = define.DefaultHealthMaxLogCount
+		p.PodSpecGen.InfraContainerSpec.HealthMaxLogSize = define.DefaultHealthMaxLogSize
+
 		rtSpec, spec, opts, err := MakeContainer(context.Background(), rt, p.PodSpecGen.InfraContainerSpec, false, nil)
 		if err != nil {
 			return nil, err
@@ -238,6 +243,9 @@ func MapSpec(p *specgen.PodSpecGenerator) (*specgen.SpecGenerator, error) {
 	if len(p.HostAdd) > 0 {
 		spec.HostAdd = p.HostAdd
 	}
+	if len(p.HostsFile) > 0 {
+		spec.BaseHostsFile = p.HostsFile
+	}
 	if len(p.DNSServer) > 0 {
 		var dnsServers []net.IP
 		dnsServers = append(dnsServers, p.DNSServer...)
@@ -251,7 +259,8 @@ func MapSpec(p *specgen.PodSpecGenerator) (*specgen.SpecGenerator, error) {
 		spec.DNSSearch = p.DNSSearch
 	}
 	if p.NoManageResolvConf {
-		spec.UseImageResolvConf = true
+		localTrue := true
+		spec.UseImageResolvConf = &localTrue
 	}
 	if len(p.Networks) > 0 {
 		spec.Networks = p.Networks
@@ -261,14 +270,14 @@ func MapSpec(p *specgen.PodSpecGenerator) (*specgen.SpecGenerator, error) {
 		spec.CNINetworks = p.CNINetworks
 	}
 	if p.NoManageHosts {
-		spec.UseImageHosts = p.NoManageHosts
+		spec.UseImageHosts = &p.NoManageHosts
 	}
 
 	if len(p.InfraConmonPidFile) > 0 {
 		spec.ConmonPidFile = p.InfraConmonPidFile
 	}
 
-	if p.Sysctl != nil && len(p.Sysctl) > 0 {
+	if len(p.Sysctl) > 0 {
 		spec.Sysctl = p.Sysctl
 	}
 

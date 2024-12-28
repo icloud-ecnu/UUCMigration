@@ -5,7 +5,11 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <math.h>
 
+#include "predict.h"
 #include "types.h"
 #include "cr_options.h"
 #include "servicefd.h"
@@ -31,13 +35,67 @@
 #include "prctl.h"
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
-
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
-#include <python3.10/Python.h>
- 
- static FILE * pageState_file = NULL; 
-static	FILE * systemState_file = NULL; 
+
+extern FILE *dirty_file;
+extern int page_num,thread_times,*mypredict[10000];
+extern const int wind_length, predict_length;
+extern bool ignore_page[10000];
+extern char *acc_file[50], *dty_file[50];
+extern float *sys_fts[50];
+/*
+dirty_predict:页面脏/不脏预测结果数组
+length:预测长度
+判断该页面在后续预测中是否都是非脏
+*/
+
+bool not_all_zero(int *dirty_predict, const int length)
+{
+	for (int i = 0; i < length; i++) {
+		if (dirty_predict[i]==1)
+			return true;
+	}
+	return false;
+}
+
+/* 
+ k:窗口大小
+ p:阈值率
+ 根据页面前k次的dirty信息的sigma值与p比较来判断是否为稳定页面，若sigma<p,稳定，否则不稳定
+*/
+bool is_stable_page(int k, double p)
+{
+	double mean = 0, std_dev = 0, sum = 0, sigma;
+	for (int i = 1; i <= k; i++) {
+		sum +=(double) (dty_file[wind_length - i][page_num] - '0');
+	}
+	mean = sum / k;
+	sum = 0;
+	for (int i = 1; i <= k; i++) {
+		sum += pow((double)(dty_file[wind_length - i][page_num] - '0') - mean, 2.0);
+	}
+	std_dev = sqrt(sum / k);
+	if(abs(mean)<0.00001)return true;
+	sigma = std_dev / mean;
+	if (sigma < p)return true;
+	return false;
+}
+/*
+ dirty_predict:经过SSDP预测得到的dirty数组
+ length:预测长度
+ 将flaot数组转化成int数组
+*/
+void float2int(float *dirty_predict, int* dirty,int length)
+{
+	for (int i = 0; i < predict_length; i++) {
+		if (dirty_predict[i] < 0.5)
+			dirty[i]=0;
+		else
+			dirty[i]=1;
+	}
+	return;
+}
 static int task_reset_dirty_track(int pid)
 {
 	int ret;
@@ -63,6 +121,8 @@ int do_task_reset_dirty_track(int pid)
 	if (fd < 0)
 		return errno == EACCES ? 1 : -1;
 
+	ret = write(fd, cmd, sizeof(cmd));
+	cmd[0] = '1'; //刷新访问信息
 	ret = write(fd, cmd, sizeof(cmd));
 	if (ret < 0) {
 		if (errno == EINVAL) /* No clear-soft-dirty in kernel */
@@ -102,7 +162,7 @@ static inline bool __page_in_parent(bool dirty)
 	return opts.track_mem && opts.img_parent && !dirty;
 }
 
-bool should_dump_page(VmaEntry *vmae, u64 pme)
+bool should_dump_entire_vma(VmaEntry *vmae)
 {
 	/*
 	 * vDSO area must be always dumped because on restore
@@ -110,28 +170,51 @@ bool should_dump_page(VmaEntry *vmae, u64 pme)
 	 */
 	if (vma_entry_is(vmae, VMA_AREA_VDSO))
 		return true;
-	/*
-	 * In turn VVAR area is special and referenced from
-	 * vDSO area by IP addressing (at least on x86) thus
-	 * never ever dump its content but always use one provided
-	 * by the kernel on restore, ie runtime VVAR area must
-	 * be remapped into proper place..
-	 */
-	if (vma_entry_is(vmae, VMA_AREA_VVAR))
-		return false;
-
-	/*
-	 * Optimisation for private mapping pages, that haven't
-	 * yet being COW-ed
-	 */
-	if (vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE))
-		return false;
 	if (vma_entry_is(vmae, VMA_AREA_AIORING))
-		return true;
-	if ((pme & (PME_PRESENT | PME_SWAP)) && !__page_is_zero(pme))
 		return true;
 
 	return false;
+}
+
+/*
+ * should_dump_page returns vaddr if an addressed page has to be dumped.
+ * Otherwise, it returns an address that has to be inspected next.
+ */
+u64 should_dump_page(pmc_t *pmc, VmaEntry *vmae, u64 vaddr, bool *softdirty)
+{
+	if (vaddr >= pmc->end && pmc_fill(pmc, vaddr, vmae->end))
+		return -1;
+
+	if (pmc->regs) {
+		while (1) {
+			if (pmc->regs_idx == pmc->regs_len)
+				return pmc->end;
+			if (vaddr < pmc->regs[pmc->regs_idx].end)
+				break;
+			pmc->regs_idx++;
+		}
+		if (vaddr < pmc->regs[pmc->regs_idx].start)
+			return pmc->regs[pmc->regs_idx].start;
+		if (softdirty)
+			*softdirty = pmc->regs[pmc->regs_idx].categories & PAGE_IS_SOFT_DIRTY;
+		return vaddr;
+	} else {
+		u64 pme = pmc->map[PAGE_PFN(vaddr - pmc->start)];
+
+		/*
+		 * Optimisation for private mapping pages, that haven't
+		 * yet being COW-ed
+		 */
+		if (vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE))
+			return vaddr + PAGE_SIZE;
+		if ((pme & (PME_PRESENT | PME_SWAP)) && !__page_is_zero(pme)) {
+			if (softdirty)
+				*softdirty = pme & PME_SOFT_DIRTY;
+			return vaddr;
+		}
+
+		return vaddr + PAGE_SIZE;
+	}
 }
 
 bool page_is_zero(u64 pme)
@@ -157,12 +240,6 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
 
 	return false;
 }
-/*
- * get System state
-*/
-
-
- 
 
 /*
  * This routine finds out what memory regions to grab from the
@@ -170,254 +247,43 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * put the memory into the page-pipe's pipe.
  *
  * "Holes" in page-pipe are regions, that should be dumped, but
- * the memory contents is present in the pagent image set.
+ * the memory contents is present in the parent image set.
  */
 
-
-
-
-
-
-typedef struct {
-    unsigned long address; // Memory page address
-    int status;            // Status of the page
-	int statusI;           // *
-    bool isDirty;          // Whether the page is dirty
-} MemoryPage;
-
-MemoryPage* getDirtyMemoryPages(int *size) {
-    MemoryPage *pages;
-    *size = 10; // Example value; should be dynamically determined.
-	
-    pages = (MemoryPage*)malloc((*size) * sizeof(MemoryPage));
-    
-    // Dummy initialization
-    for (int i = 0; i < *size; i++) {
-        pages[i].address = i * 0x1000; 
-        pages[i].status = 0;           
-        pages[i].isDirty = true;      
-    }
-
-    return pages;
-}
-
-bool isStablePage(MemoryPage *p) {
-    
-    return p->isDirty && p->status == 0; // Stable if dirty but status suggests no recent changes
-}
-
-
-// Mock structure for SSDP prediction results.
-typedef struct {
-    int statusCode;     // Status code from the external service
-    int predictedSSDP;  // Predicted SSDP value
-} SSDPResult;
-
-// Mock function to simulate external API call for SSDP prediction.
-SSDPResult callExternalSSDPAPI(MemoryPage *p, int L) {
- SSDPResult result;
-
- // Simulated API behavior: statusCode 0 means success.
- result.statusCode = 0;
- result.predictedSSDP = L * 3;  // Replace with real logic or API interaction.
-
- // Example error scenario.
- if (L <= 0) {
-     result.statusCode = -1;  // Error status.
-     result.predictedSSDP = 0;
- }
-
- return result;
-}
-
-// Enterprise-level predictSSDP function with error handling and logging.
-int predictSSDP(MemoryPage *p, int L) {
- SSDPResult result = callExternalSSDPAPI(p, L);
-
- // Check API call status.
- if (result.statusCode != 0) {
-     // Log error details
-     fprintf(stderr, "Error: Failed to predict SSDP for page at address %lx. Error code: %d\n", 
-             p->address, result.statusCode);
-     return -1;  // Return error code.
- }
-
- // Log successful prediction
- printf("Predicted SSDP for page at address %lx: %d\n", 
-        p->address, result.predictedSSDP);
-
- return result.predictedSSDP;
-}
-
-void statusTimeToIteration(MemoryPage *pages, int size) {
-    for (int i = 0; i < size; i++) {
-        // Dummy transformation logic, adjust based on actual needs
-        //pages[i].status += 1; // Example: Increment status
-		pages[i].statusI = pages[i].status + 1; // Example: Increment status
-    }
-}
-
-
-double* spatialDirtyPageRatios(MemoryPage *pages, int size) {
-    double *ratios = (double*)malloc(size * sizeof(double));
-    
-    // Example calculation: simple ratio based on some property
-    for (int i = 0; i < size; i++) {
-        ratios[i] = fabs((double)pages[i].status / (i + 1)); // Adjust this logic as needed
-    }
-
-    return ratios;
-}
-
-int predictDataShift(MemoryPage* p, int L){
-	return 1;
-}
-
-int minValueIndex(double* ratios, int P_size){
-	return 1;
-}
-
-void migratePages(MemoryPage* p, int P_size){
-	
-}
-
-int notAllZero(int* statusI, int end){
-	return 0;
-}
-
-// 页面生成函数，包含在线迁移逻辑
-static int generate_iovs2(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
-                         bool has_parent) {
-	MemoryPage *P;
-	MemoryPage *S;
-	double *D_pred;
-	int I,i,L,L_Max;
-	int P_size,S_size;
-    u64 *at = &map[PAGE_PFN(*off)];
-    unsigned long pfn, nr_to_scan;
-    unsigned long pages[3] = {};  // Pages counters: [0] - skipped, [1] - lazy, [2] - written
-    int ret = 0;
-
-    nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
-
-    // 获取需要迁移的脏页
-    P = NULL;
-	S = NULL;
-	L=3; // *
-	L_Max=6; // *
-    i = 0;
-	I=L_Max;
-    P_size = 0;
-	S_size = 0;
-
-    while (i <= I) {
-        P = getDirtyMemoryPages(&P_size);
-
-        for (pfn = 0; pfn < nr_to_scan; pfn++) {
-            unsigned long vaddr;
-            unsigned int ppb_flags = 0;
-            int st;
-
-            if (!should_dump_page(vma->e, at[pfn]))
-                continue;
-
-            vaddr = vma->e->start + *off + pfn * PAGE_SIZE;
-
-            if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
-                ppb_flags |= PPB_LAZY;
-
-            // 在线迁移预测逻辑
-            if (isStablePage(&P[pfn])) {
-                P[pfn].status = predictDataShift(&P[pfn], L);
-            } else {
-                P[pfn].status = predictSSDP(&P[pfn], L);
-            }
-
-            statusTimeToIteration(P, P_size); // *
-            D_pred = spatialDirtyPageRatios(P, P_size);
-            I = i + minValueIndex(D_pred, P_size);
-            free(D_pred);
-
-            if (i == I) {
-                migratePages(P, P_size);
-                break;
-            } else {
-                S_size = 0;
-                S = malloc(P_size * sizeof(MemoryPage));
-                for (int j = 0; j < P_size; j++) {
-                    if (!notAllZero(&(P[j].statusI), I - i)) {
-                        S[S_size++] = P[j];
-                    }
-                }
-                migratePages(S, S_size);
-                free(S);
-            }
-
-            // 页面管道操作
-            if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
-                ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-                st = 0;
-            } else {
-                ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-                if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-                    st = 1;
-                else
-                    st = 2;
-            }
-
-            if (ret) {
-                pr_debug("Pagemap full\n");
-                break;
-            }
-
-            // 在线迁移日志
-            if (opts.live_migration) {
-                fprintf(pageState_file, "%u,%lx,%u,%u\n",
-                        item->pid->real,
-                        vaddr,
-                        (at[pfn] & PME_SOFT_DIRTY) > 0 ? 1 : 0,
-                        (at[pfn] & (1ULL << 6)) > 0 ? 1 : 0);
-            }
-            pages[st]++;
-        }
-
-        i++;
-        free(P);
-    }
-
-    *off += pfn * PAGE_SIZE;
-
-    // 更新统计数据
-    cnt_add(CNT_PAGES_SCANNED, nr_to_scan);
-    cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
-    cnt_add(CNT_PAGES_LAZY, pages[1]);
-    cnt_add(CNT_PAGES_WRITTEN, pages[2]);
-
-    pr_info("Pagemap generated: %lu pages (%lu lazy) %lu holes\n", pages[2] + pages[1], pages[1], pages[0]);
-    return ret;
-}
-
-static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
+static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
 			 bool has_parent)
 {
-	u64 *at = &map[PAGE_PFN(*off)];
-	unsigned long pfn, nr_to_scan;
+	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
+	unsigned long vaddr;
+	bool dump_all_pages;
+	char kpageflags_path[256] = "/proc/kpageflags"; // kpageflags 路径固定
 	int ret = 0;
+	int kpageflags_fd;
 
-	nr_to_scan = (vma_area_len(vma) - *off) / PAGE_SIZE;
+	u64 mypfn;
+	int stable_wind = 3;
+	double stable_p = 0.5;
+	unsigned long flags=0;
+	int dirty_list[3] = { 0 }, len = predict_length;
+	float predict_dirty2[3]={0}, dirty_list2[50] = { 0 }, access_list2[50] = { 0 };
+	kpageflags_fd = open(kpageflags_path, 0);
+	
+	dump_all_pages = should_dump_entire_vma(vma->e);
 
-	for (pfn = 0; pfn < nr_to_scan; pfn++) {
-		unsigned long vaddr;
+	nr_scanned = 0;
+	for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
 		unsigned int ppb_flags = 0;
+		bool softdirty = false;
+		u64 next;
 		int st;
-		
-		
-		if (!should_dump_page(vma->e, at[pfn]))
-			continue;
 
-		vaddr = vma->e->start + *off + pfn * PAGE_SIZE;
-		
+		/* If dump_all_pages is true, should_dump_page is called to get pme. */
+		next = should_dump_page(pmc, vma->e, vaddr, &softdirty);
+		if (!dump_all_pages && next != vaddr) {
+			vaddr = next - PAGE_SIZE;
+			continue;
+		}
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
 
@@ -427,35 +293,83 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * hole and expect the parent images to contain this
 		 * page. The latter would be checked in page-xfer.
 		 */
-
-		if (has_parent && page_in_parent(at[pfn] & PME_SOFT_DIRTY)) {
-			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
-			st = 0;
-		} else {
-			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
-				st = 1;
+		if (opts.is_iterative_dump) {	
+			
+			//更新dirty、access信息
+			if(0){
+			if (softdirty)
+				dty_file[wind_length - 1][page_num] = '1';
 			else
-				st = 2;
-		}
+				dty_file[wind_length - 1][page_num] = '0';
 
+			vaddr_to_pfn(pmc->fd, vaddr, &mypfn);
+			// 使用 pread 读取 kpageflags
+			if (pread(kpageflags_fd, &flags, sizeof(flags), mypfn * sizeof(flags)) != sizeof(flags));
+			//pr_info("%lu\n",flags);
+			// 检查访问标志
+			if (flags & (1 << 2)) {
+				acc_file[wind_length - 1][page_num] = '1';
+			} else {
+				acc_file[wind_length - 1][page_num] = '0';
+			}
+			}
+			//预测页面
+			if (is_stable_page(stable_wind, stable_p)) //稳定
+			{
+				//获取dirty_list,窗口大小
+				for (int i = 0; i < 3; i++)dirty_list[i] = dty_file[wind_length - 3 + i][page_num] - '0';
+				mypredict[page_num][0] = dataShiftPredict(dirty_list, 3, 0.5, 3, len);
+				for(int i=1;i<len;i++)mypredict[page_num][i]=mypredict[page_num][0];
+			} else {
+				//获取dirty_list2,access_list2,system_list2
+				for (int i = 0; i < 50; i++)dirty_list2[i] = (dty_file[i][page_num] - '0'), access_list2[i] = (acc_file[i][page_num] - '0');
+				SSDP_predict(predict_dirty2,dirty_list2, access_list2, sys_fts, wind_length);
+				float2int(predict_dirty2,mypredict[page_num],predict_length);
+			}
+			if(1){
+			softdirty=false;
+			for(int i=0;i<thread_times;i++){
+				if(dty_file[wind_length-1-i][page_num]=='1'){
+					softdirty=true;
+					break;
+				}
+			}}
+			//(dirty or ignore) and (predict is not dirty or last dump),then dump
+			//(!has_parent || ((softdirty || ignore_page[page_num]) && (!not_all_zero(predict_dirty, predict_length)|| opts.last_dump)))
+			if ((!has_parent || ((softdirty || ignore_page[page_num]) && (!not_all_zero(mypredict[page_num], predict_length)|| opts.last_dump)))) {
+				ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+				st = 2;
+				ignore_page[page_num] = false;
+			} else{
+				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+				st = 0;
+				if (softdirty)ignore_page[page_num] = true;
+			}
+		} else {
+			if (has_parent && page_in_parent(softdirty)) {
+				ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
+				st = 0;
+			} else {
+				ret = page_pipe_add_page(pp, vaddr, ppb_flags);
+				if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+					st = 1;
+				else
+					st = 2;
+			}
+		}
 		if (ret) {
 			/* Do not do pfn++, just bail out */
 			pr_debug("Pagemap full\n");
 			break;
 		}
-		//开启了在线迁移
-		if(opts.live_migration){
-			
-			fprintf(pageState_file,"%u,%lx,%u,%u\n",item->pid->real,vaddr,(at[pfn] & PME_SOFT_DIRTY)>0?1:0,(at[pfn] & (1ULL << 6))>0?1:0); 
-			
-		}
+
 		pages[st]++;
+		page_num++;
 	}
-
-	*off += pfn * PAGE_SIZE;
-
-	cnt_add(CNT_PAGES_SCANNED, nr_to_scan);
+	close(kpageflags_fd);
+	pr_debug("page_num:%d\n",page_num);
+	*pvaddr = vaddr;
+	cnt_add(CNT_PAGES_SCANNED, nr_scanned);
 	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
 	cnt_add(CNT_PAGES_LAZY, pages[1]);
 	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
@@ -484,6 +398,12 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 		 * so we ignore them at pre-dump.
 		 */
 		if (vma_entry_is(vma->e, VMA_AREA_AIORING) && skip_non_trackable)
+			continue;
+		/*
+		 * We totally ignore MAP_HUGETLB on pre-dump.
+		 * See also generate_vma_iovs() comment.
+		 */
+		if ((vma->e->flags & MAP_HUGETLB) && skip_non_trackable)
 			continue;
 		if (vma->e->prot & PROT_READ)
 			continue;
@@ -589,11 +509,19 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
 {
-	u64 off = 0;
-	u64 *map;
+	u64 vaddr;
 	int ret;
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
+		return 0;
+	/*
+	 * In turn VVAR area is special and referenced from
+	 * vDSO area by IP addressing (at least on x86) thus
+	 * never ever dump its content but always use one provided
+	 * by the kernel on restore, ie runtime VVAR area must
+	 * be remapped into proper place..
+	 */
+	if (vma_entry_is(vma->e, VMA_AREA_VVAR))
 		return 0;
 
 	/*
@@ -641,22 +569,27 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 			has_parent = false;
 	}
 
-	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
+	/*
+	 * We want to completely ignore these VMA types on the pre-dump:
+	 * 1. VMA_AREA_AIORING because it is not soft-dirty trackable (kernel writes)
+	 * 2. MAP_HUGETLB mappings because they are not premapped and we can't use
+	 * parent images from pre-dump stages. Instead, the content is restored from
+	 * the parasite context using full memory image.
+	 */
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma->e->flags & MAP_HUGETLB) {
 		if (pre_dump)
 			return 0;
 		has_parent = false;
 	}
 
-	map = pmc_get_map(pmc, vma);
-	if (!map)
+	if (pmc_get_map(pmc, vma))
 		return -1;
 
 	if (vma_area_is(vma, VMA_ANON_SHARED))
-		return add_shmem_area(item->pid->real, vma->e, map);
-
+		return add_shmem_area(item->pid->real, vma->e, pmc);
+	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, map, &off, has_parent);
-	ret = generate_iovs2(item, vma, pp, map, &off, has_parent);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -670,186 +603,6 @@ again:
 	}
 
 	return ret;
-}
-/*
-* monitor
-*/
-static unsigned long lsh_read_proc_pid_stat(int pid) {
-    char filename[256];
-	char buffer[1024];
-	 FILE *file;
-	 unsigned long minflt, majflt;
-    sprintf(filename, "/proc/%d/stat", pid);
-    file = fopen(filename, "r");
-    if (file == NULL) {
-        perror("Error opening file");
-        return -1;
-    }
-    if (fgets(buffer, sizeof(buffer), file) == NULL) {
-        perror("Error reading file");
-        fclose(file);
-        return -1;
-    }
-    // 格式中的 %*d 和 %*s 用于跳过不需要的字段
-    
-    sscanf(buffer, "%*d %*s %*c %*d %*d %*d %*d %*d %*u %*u %*u %lu %lu", &minflt, &majflt);
-
-    // printf("Minor page faults: %lu\n", minflt);
-    // printf("Major page faults: %lu\n", majflt);
-	
-    fclose(file);
-	return minflt+majflt;
-}
-typedef struct {
-    unsigned long long pgfaults;
-    unsigned long long pgpgin;
-    unsigned long long pgpgout;
-    unsigned long long ctxt;
-    unsigned long long softirq;
-} _SystemStats;
-typedef struct {
-    unsigned long long mem_total;
-    unsigned long long mem_free;
-    unsigned long long swap_total;
-    unsigned long long swap_free;
-} _MemoryInfo;
-
-
-typedef struct{
-    unsigned long long read_bytes;
-    unsigned long long write_bytes;
-}_Io;
-
-// 函数来读取页面错误次数,缓存的写入与写回，软中断次数
-static void get_system_stats(_SystemStats *stats) {
-	 char buffer[1024];
-	 char line[256];
-	 FILE *fp;
-    //_SystemStats stats = {-1,0, 0,0,0};
-	
-    FILE *file = fopen("/proc/vmstat", "r");
-    if (file == NULL) {
-        perror("Error opening /proc/vmstat");
-        return ;
-    }
-    while (fgets(line, sizeof(line), file)) {
-        if ( strncmp(line, "pgfault", 7) == 0) {
-            sscanf(line, "pgfault %llu", &stats->pgfaults);
-            //printf("%s\n",line);
-        }
-        if (strncmp(line, "pgpgin", 6) == 0) {
-            sscanf(line, "pgpgin %llu", &stats->pgpgin);
-            //printf("%s\n",line);
-        } else if (strncmp(line, "pgpgout", 7) == 0) {
-            sscanf(line, "pgpgout %llu", &stats->pgpgout);
-            //printf("%s\n",line);
-        }
-        
-    }
-    fp = fopen("/proc/stat", "r");
-    if (fp == NULL) {
-        perror("Error opening file");
-        return ;
-    }
-   
-    while (fgets(buffer, sizeof(buffer), fp)) {
-        if (strncmp(buffer, "ctxt", 4) == 0) {
-            sscanf(buffer, "ctxt %llu",  &stats->ctxt);
-        }
-        if (strncmp(buffer, "softirq", 7) == 0) {
-            sscanf(buffer, "softirq %llu", &stats->softirq);
-        }
-    }
-
-    fclose(fp);
-    fclose(file);
-    
-}
-
-
-//内存空间和交换空间
-static void get_memory_swap_usage(_MemoryInfo * mem_info) {
-	char line[256];
-	 
-    FILE *file = fopen("/proc/meminfo", "r");
-    if (file == NULL) {
-        perror("Error opening /proc/meminfo");
-        return ;
-    }
-
-    while (fgets(line, sizeof(line), file)) {
-        if (strncmp(line, "MemTotal", 8) == 0) {
-            sscanf(line, "MemTotal: %llu", &mem_info->mem_total);
-        } else if (strncmp(line, "MemFree", 7) == 0) {
-            sscanf(line, "MemFree: %llu", &mem_info->mem_free);
-        } else if (strncmp(line, "SwapTotal", 9) == 0) {
-            sscanf(line, "SwapTotal: %llu", &mem_info->swap_total);
-        } else if (strncmp(line, "SwapFree", 8) == 0) {
-            sscanf(line, "SwapFree: %llu", &mem_info->swap_free);
-        }
-    }
-    fclose(file);
-  
-}
-static  void get_io_counts(unsigned long long *read_bytes, unsigned long long *write_bytes) {
-    char path[1024];
-	char buffer[4096];
-	char *read_chars;
-	char *write_chars;
-	int fd;
-	ssize_t bytes_read;
-    sprintf(path, "/proc/%d/io", getpid());
-    fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        perror("Failed to open io file");
-        return;
-    }
-
-    
-     bytes_read = read(fd, buffer, sizeof(buffer) - 1);
-    close(fd);
-
-    if (bytes_read <= 0) {
-        perror("Failed to read io file");
-        return;
-    }
-
-    buffer[bytes_read] = '\0';
-
-    read_chars = strstr(buffer, "read_bytes:");
-    write_chars = strstr(buffer, "write_bytes:");
-
-    if (read_chars && write_chars) {
-        sscanf(read_chars, "read_bytes: %llu", read_bytes);
-        sscanf(write_chars, "write_bytes: %llu", write_bytes);
-    }
-}
-static void lsh_add_state(struct pstree_item *item){
-	unsigned long min_majflt;
-	_SystemStats start_stats = {} ;
-    _MemoryInfo start_memory ={};
-    _Io start_io = {-1,-1};
-	if(systemState_file == NULL) 
-		return;
-    min_majflt=lsh_read_proc_pid_stat(item->pid->real);
-	get_system_stats(&start_stats );
-	get_memory_swap_usage(&start_memory);
-	get_io_counts(&start_io.read_bytes,&start_io.write_bytes);
-	fprintf(systemState_file,"%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%lu\n",item->pid->real,start_stats.pgfaults,
-    start_stats.pgpgin,
-    start_stats.pgpgout,
-    start_stats.ctxt,
-    start_stats.softirq,
-    start_memory.mem_free,start_memory.mem_total,start_memory.swap_free,start_memory.swap_total,
-    start_io.read_bytes,start_io.write_bytes,min_majflt);
-    /*printf("%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-    start_stats.pgfaults,
-    start_stats.pgpgin,
-    start_stats.pgpgout,
-    start_stats.ctxt,
-    start_stats.softirq,
-    start_memory.mem_free,start_memory.mem_total,start_memory.swap_free,start_memory.swap_total,
-    start_io.read_bytes,start_io.write_bytes);*/
 }
 
 static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasite_dump_pages_args *args,
@@ -865,8 +618,8 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	unsigned long pmc_size;
 	int possible_pid_reuse = 0;
 	bool has_parent;
-	//PyObject * pDict;
 	int parent_predump_mode = -1;
+
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
 	pr_info("----------------------------------------\n");
@@ -874,7 +627,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	timing_start(TIME_MEMDUMP);
 
 	pr_debug("   Private vmas %lu/%lu pages\n", vma_area_list->nr_priv_pages_longest, vma_area_list->nr_priv_pages);
-	
+
 	/*
 	 * Step 0 -- prepare
 	 */
@@ -882,7 +635,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	pmc_size = max(vma_area_list->nr_priv_pages_longest, vma_area_list->nr_shared_pages_longest);
 	if (pmc_init(&pmc, item->pid->real, &vma_area_list->h, pmc_size * PAGE_SIZE))
 		return -1;
-	
+
 	if (!(mdc->pre_dump || mdc->lazy))
 		/*
 		 * Chunk mode pushes pages portion by portion. This mode
@@ -891,7 +644,6 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 */
 		cpp_flags |= PP_CHUNK_MODE;
 	pp = create_page_pipe(vma_area_list->nr_priv_pages, mdc->lazy ? NULL : pargs_iovs(args), cpp_flags);
-	
 	if (!pp)
 		goto out;
 
@@ -914,42 +666,21 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		if (ret)
 			xfer.parent = NULL + 1;
 	}
-	
+
 	if (xfer.parent) {
 		possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
 		if (possible_pid_reuse == -1)
 			goto out_xfer;
 	}
-	
+
 	/*
 	 * Step 1 -- generate the pagemap
 	 */
 	args->off = 0;
 	has_parent = !!xfer.parent && !possible_pid_reuse;
-
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
-	//bug
-	lsh_read_proc_pid_stat(item->pid->real);
-	if (opts.live_migration){
-		// pr_info("opts.pageCategory_file=%s",opts.pageCategory_file);
-		// pr_info("opts.pageState_file=%s",opts.pageState_file);
-		// pr_info("opts.systemState_file=%s",opts.systemState_file);
-		pr_info("live migration !\n");
-		pageState_file=fopen(opts.pageState_file, "w+"); 
-		if (pageState_file  == NULL) {
-        	goto out_xfer;
-    	}
-		fprintf(pageState_file,"pid,adder,isDirty,isAccessed\n");
-		systemState_file=fopen(opts.systemState_file, "w+"); 
-		if (pageState_file  == NULL) {
-        	goto out_xfer;
-    	}
-		fprintf(systemState_file,"pid,pgfaults,pgpgin,pgpgout,ctxt,softirq,mem_free,mem_total,swap_free,swap_total,read_bytes,write_bytes,flt\n");
-		lsh_add_state(item);
-	}else 
-		pr_debug("No live migrate");
-	
+
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
 		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
 					parent_predump_mode);
@@ -975,8 +706,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		ret = xfer_pages(pp, &xfer);
 	if (ret)
 		goto out_xfer;
-	if(opts.live_migration )
-		lsh_add_state(item);
+
 	timing_stop(TIME_MEMDUMP);
 
 	/*
@@ -997,9 +727,7 @@ out_pp:
 		dmpi(item)->mem_pp = pp;
 out:
 	pmc_fini(&pmc);
-	
-	if (pageState_file  != NULL) fclose(pageState_file);
-	if (systemState_file  != NULL) fclose(systemState_file);
+	pr_info("----------------------------------------\n");
 	return exit_code;
 }
 
@@ -1139,6 +867,8 @@ int prepare_mm_pid(struct pstree_item *i)
 			ri->vmas.rst_priv_size += vma_area_len(vma);
 			if (vma_has_guard_gap_hidden(vma))
 				ri->vmas.rst_priv_size += PAGE_SIZE;
+			if (vma_area_is(vma, VMA_AREA_SHSTK))
+				ri->vmas.rst_priv_size += PAGE_SIZE;
 		}
 
 		pr_info("vma 0x%" PRIx64 " 0x%" PRIx64 "\n", vma->e->start, vma->e->end);
@@ -1177,6 +907,9 @@ static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
 	if (!vma_area_is_private(vma, kdat.task_size))
 		return false;
 	if (!vma_area_is_private(pvma, kdat.task_size))
+		return false;
+	/* ... but not hugetlb mappings */
+	if (vma->e->flags & MAP_HUGETLB || pvma->e->flags & MAP_HUGETLB)
 		return false;
 	/* ... have growsdown and anon flags coincide */
 	if ((vma->e->flags ^ pvma->e->flags) & (MAP_GROWSDOWN | MAP_ANONYMOUS))
@@ -1277,6 +1010,14 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 		vma->e->start -= PAGE_SIZE;
 
 	size = vma_entry_len(vma->e);
+
+	/*
+	 * map an extra page for shadow stack VMAs, it will be used as a
+	 * temporary shadow stack
+	 */
+	if (vma_area_is(vma, VMA_AREA_SHSTK))
+		size += PAGE_SIZE;
+
 	if (!vma_inherited(vma)) {
 		int flag = 0;
 		/*
@@ -1353,6 +1094,15 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 static inline bool vma_force_premap(struct vma_area *vma, struct list_head *head)
 {
 	/*
+	 * Shadow stack VMAs cannot be mmap()ed, they must be created using
+	 * map_shadow_stack() system call.
+	 * Premap them to reserve virtual address space and populate them
+	 * to have there contents available for later copying.
+	 */
+	if (vma_area_is(vma, VMA_AREA_SHSTK))
+		return true;
+
+	/*
 	 * On kernels with 4K guard pages, growsdown VMAs
 	 * always have one guard page at the
 	 * beginning and sometimes this page contains data.
@@ -1416,6 +1166,13 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 		if (!vma_area_is_private(vma, kdat.task_size))
 			continue;
 
+		if (vma->e->flags & MAP_HUGETLB)
+			continue;
+
+		/* VMA offset may change due to plugin so we cannot premap */
+		if (vma->e->status & VMA_EXT_PLUGIN)
+			continue;
+
 		if (vma->pvma == NULL && pr->pieok && !vma_force_premap(vma, &vmas->h)) {
 			/*
 			 * VMA in question is not shared with anyone. We'll
@@ -1426,7 +1183,7 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 			do {
 				if (pr->pe->vaddr + pr->pe->nr_pages * PAGE_SIZE <= vma->e->start)
 					continue;
-				if (pr->pe->vaddr > vma->e->end)
+				if (pr->pe->vaddr >= vma->e->end)
 					vma->e->status |= VMA_NO_PROT_WRITE;
 				break;
 			} while (pr->advance(pr));
@@ -1456,6 +1213,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_shared = 0;
 	unsigned int nr_dropped = 0;
 	unsigned int nr_compared = 0;
+	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
 	unsigned long va;
 
@@ -1531,7 +1289,8 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				len >>= PAGE_SHIFT;
 				nr_restored += len;
 				i += len - 1;
-				pr_debug("Enqueue page-read\n");
+
+				nr_enqueued++;
 				continue;
 			}
 
@@ -1627,7 +1386,8 @@ err_read:
 
 	pr_info("nr_restored_pages: %d\n", nr_restored);
 	pr_info("nr_shared_pages:   %d\n", nr_shared);
-	pr_info("nr_dropped_pages:   %d\n", nr_dropped);
+	pr_info("nr_dropped_pages:  %d\n", nr_dropped);
+	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
 
 	return 0;
@@ -1639,8 +1399,6 @@ err_addr:
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 {
-	MmEntry *mm = rsti(t)->mm;
-
 	/*
 	 * There is no need to disable it if the page read doesn't
 	 * have parent. In this case VMA will be empty until
@@ -1663,8 +1421,6 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 		pr_perror("Cannot disable THP");
 		return -1;
 	}
-	if (!(mm->has_thp_disabled && mm->thp_disabled))
-		rsti(t)->has_thp_enabled = true;
 
 	return 0;
 }

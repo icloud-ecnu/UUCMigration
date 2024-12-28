@@ -15,6 +15,7 @@ import (
 
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/image/v5/types"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/homedir"
 	"github.com/sirupsen/logrus"
 )
@@ -61,7 +62,7 @@ func DefaultPolicyPath(sys *types.SystemContext) string {
 	}
 
 	userPolicyFilePath := filepath.Join(homedir.Get(), filepath.FromSlash(".config/containers/policy.json"))
-	_, err := os.Stat(userPolicyFilePath)
+	err := fileutils.Exists(userPolicyFilePath)
 	if err == nil {
 		return userPolicyFilePath
 	}
@@ -131,8 +132,11 @@ func parseUids(colonDelimitKeys []byte) []string {
 				continue
 			}
 			parseduid := uid
-			if strings.Contains(uid, "<") && strings.Contains(uid, ">") {
-				parseduid = strings.SplitN(strings.SplitAfterN(uid, "<", 2)[1], ">", 2)[0]
+			if ltidx := strings.Index(uid, "<"); ltidx != -1 {
+				subuid := parseduid[ltidx+1:]
+				if gtidx := strings.Index(subuid, ">"); gtidx != -1 {
+					parseduid = subuid[:gtidx]
+				}
 			}
 			parseduids = append(parseduids, parseduid)
 		}
@@ -215,7 +219,7 @@ func AddPolicyEntries(policyPath string, input AddPolicyEntriesInput) error {
 		return err
 	}
 
-	_, err = os.Stat(policyPath)
+	err = fileutils.Exists(policyPath)
 	if !os.IsNotExist(err) {
 		policyContent, err := os.ReadFile(policyPath)
 		if err != nil {

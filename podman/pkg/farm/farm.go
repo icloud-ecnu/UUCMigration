@@ -14,8 +14,8 @@ import (
 	"github.com/containers/buildah/define"
 	lplatform "github.com/containers/common/libimage/platform"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra"
 	"github.com/hashicorp/go-multierror"
 	"github.com/sirupsen/logrus"
 )
@@ -32,7 +32,7 @@ type Schedule struct {
 	platformBuilders map[string]string // target->connection
 }
 
-func newFarmWithBuilders(_ context.Context, name string, destinations *map[string]config.Destination, localEngine entities.ImageEngine, buildLocal bool) (*Farm, error) {
+func newFarmWithBuilders(_ context.Context, name string, cons []config.Connection, localEngine entities.ImageEngine, buildLocal bool) (*Farm, error) {
 	farm := &Farm{
 		builders:    make(map[string]entities.ImageEngine),
 		localEngine: localEngine,
@@ -43,25 +43,24 @@ func newFarmWithBuilders(_ context.Context, name string, destinations *map[strin
 		builderGroup multierror.Group
 	)
 	// Set up the remote connections to handle the builds
-	for name, dest := range *destinations {
-		name, dest := name, dest
+	for _, con := range cons {
 		builderGroup.Go(func() error {
-			fmt.Printf("Connecting to %q\n", name)
+			fmt.Printf("Connecting to %q\n", con.Name)
 			engine, err := infra.NewImageEngine(&entities.PodmanConfig{
 				EngineMode:   entities.TunnelMode,
-				URI:          dest.URI,
-				Identity:     dest.Identity,
-				MachineMode:  dest.IsMachine,
-				FarmNodeName: name,
+				URI:          con.URI,
+				Identity:     con.Identity,
+				MachineMode:  con.IsMachine,
+				FarmNodeName: con.Name,
 			})
 			if err != nil {
-				return fmt.Errorf("initializing image engine at %q: %w", dest.URI, err)
+				return fmt.Errorf("initializing image engine at %q: %w", con.URI, err)
 			}
 
-			defer fmt.Printf("Builder %q ready\n", name)
+			defer fmt.Printf("Builder %q ready\n", con.Name)
 			builderMutex.Lock()
 			defer builderMutex.Unlock()
-			farm.builders[name] = engine
+			farm.builders[con.Name] = engine
 			return nil
 		})
 	}
@@ -90,12 +89,12 @@ func newFarmWithBuilders(_ context.Context, name string, destinations *map[strin
 
 func NewFarm(ctx context.Context, name string, localEngine entities.ImageEngine, buildLocal bool) (*Farm, error) {
 	// Get the destinations of the connections specified in the farm
-	destinations, err := getFarmDestinations(name)
+	name, destinations, err := getFarmDestinations(name)
 	if err != nil {
 		return nil, err
 	}
 
-	return newFarmWithBuilders(ctx, name, &destinations, localEngine, buildLocal)
+	return newFarmWithBuilders(ctx, name, destinations, localEngine, buildLocal)
 }
 
 // Done performs any necessary end-of-process cleanup for the farm's members.
@@ -115,7 +114,6 @@ func (f *Farm) Status(ctx context.Context) (map[string]error, error) {
 		statusGroup multierror.Group
 	)
 	for _, engine := range f.builders {
-		engine := engine
 		statusGroup.Go(func() error {
 			logrus.Debugf("getting status of %q", engine.FarmNodeName(ctx))
 			defer logrus.Debugf("got status of %q", engine.FarmNodeName(ctx))
@@ -159,7 +157,6 @@ func (f *Farm) NativePlatforms(ctx context.Context) ([]string, error) {
 		nativeGroup multierror.Group
 	)
 	for _, engine := range f.builders {
-		engine := engine
 		nativeGroup.Go(func() error {
 			logrus.Debugf("getting native platform of %q\n", engine.FarmNodeName(ctx))
 			defer logrus.Debugf("got native platform of %q", engine.FarmNodeName(ctx))
@@ -199,7 +196,6 @@ func (f *Farm) EmulatedPlatforms(ctx context.Context) ([]string, error) {
 		emulatedGroup multierror.Group
 	)
 	for _, engine := range f.builders {
-		engine := engine
 		emulatedGroup.Go(func() error {
 			logrus.Debugf("getting emulated platforms of %q", engine.FarmNodeName(ctx))
 			defer logrus.Debugf("got emulated platforms of %q", engine.FarmNodeName(ctx))
@@ -260,7 +256,6 @@ func (f *Farm) Schedule(ctx context.Context, platforms []string) (Schedule, erro
 	// Make notes of which platforms we can build for natively, and which
 	// ones we can build for using emulation.
 	for name, engine := range f.builders {
-		name, engine := name, engine
 		infoGroup.Go(func() error {
 			inspect, err := engine.FarmNodeInspect(ctx)
 			if err != nil {
@@ -377,7 +372,6 @@ func (f *Farm) Build(ctx context.Context, schedule Schedule, options entities.Bu
 		builder entities.ImageEngine
 	}
 	for platform, builder := range schedule.platformBuilders {
-		platform, builder := platform, builder
 		outReader, outWriter := io.Pipe()
 		errReader, errWriter := io.Pipe()
 		go func() {
@@ -460,22 +454,21 @@ func (f *Farm) Build(ctx context.Context, schedule Schedule, options entities.Bu
 	return nil
 }
 
-func getFarmDestinations(name string) (map[string]config.Destination, error) {
-	dest := make(map[string]config.Destination)
-	cfg, err := config.ReadCustomConfig()
+func getFarmDestinations(name string) (string, []config.Connection, error) {
+	cfg, err := config.Default()
 	if err != nil {
-		return dest, err
+		return "", nil, err
 	}
 
-	// If no farm name is given, then grab all the service destinations available
 	if name == "" {
-		return cfg.Engine.ServiceDestinations, nil
+		if name, cons, err := cfg.GetDefaultFarmConnections(); err == nil {
+			// Use default farm if is there is one
+			return name, cons, nil
+		}
+		// If no farm name is given, then grab all the service destinations available
+		cons, err := cfg.GetAllConnections()
+		return name, cons, err
 	}
-
-	// Go through the connections in the farm and get their destination
-	for _, c := range cfg.Farms.List[name] {
-		dest[c] = cfg.Engine.ServiceDestinations[c]
-	}
-
-	return dest, nil
+	cons, err := cfg.GetFarmConnections(name)
+	return name, cons, err
 }

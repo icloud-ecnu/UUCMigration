@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -7,14 +6,17 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/containers/common/libnetwork/types"
-	"github.com/containers/podman/v4/libpod/define"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/sirupsen/logrus"
 	bolt "go.etcd.io/bbolt"
 )
@@ -78,6 +80,19 @@ func NewBoltState(path string, runtime *Runtime) (State, error) {
 	state.runtime = runtime
 
 	logrus.Debugf("Initializing boltdb state at %s", path)
+
+	// BoltDB is deprecated and, as of Podman 5.0, we no longer allow the
+	// creation of new Bolt states.
+	// If the DB does not already exist, error out.
+	// To continue testing in CI, allow creation iff an undocumented env
+	// var is set.
+	if os.Getenv("CI_DESIRED_DATABASE") != "boltdb" {
+		if err := fileutils.Exists(path); err != nil && errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("the BoltDB backend has been deprecated, no new BoltDB databases can be created: %w", define.ErrInvalidArg)
+		}
+	} else {
+		logrus.Debugf("Allowing deprecated database backend due to CI_DESIRED_DATABASE.")
+	}
 
 	db, err := bolt.Open(path, 0600, nil)
 	if err != nil {
@@ -1455,7 +1470,7 @@ func (s *BoltState) GetContainerExitCodeTimeStamp(id string) (*time.Time, error)
 	})
 }
 
-// PruneExitCodes removes exit codes older than 5 minutes unless the associated
+// PruneContainerExitCodes removes exit codes older than 5 minutes unless the associated
 // container still exists.
 func (s *BoltState) PruneContainerExitCodes() error {
 	if !s.valid {

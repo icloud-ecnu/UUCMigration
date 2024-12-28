@@ -1,3 +1,5 @@
+//go:build !remote
+
 package libpod
 
 import (
@@ -5,11 +7,11 @@ import (
 	"net/http"
 
 	"github.com/containers/common/pkg/secrets"
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
 	"github.com/gorilla/schema"
 )
 

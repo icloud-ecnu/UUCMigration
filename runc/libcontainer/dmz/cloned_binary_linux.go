@@ -64,9 +64,6 @@ func Memfd(comment string) (*os.File, SealFunc, error) {
 }
 
 func sealFile(f **os.File) error {
-	if err := (*f).Chmod(0o511); err != nil {
-		return err
-	}
 	// When sealing an O_TMPFILE-style descriptor we need to
 	// re-open the path as O_PATH to clear the existing write
 	// handle we have.
@@ -107,6 +104,9 @@ func mktemp(dir string) (*os.File, SealFunc, error) {
 	// Unlink the file and verify it was unlinked.
 	if err := os.Remove(file.Name()); err != nil {
 		return nil, nil, fmt.Errorf("unlinking classic tmpfile: %w", err)
+	}
+	if err := file.Chmod(0o511); err != nil {
+		return nil, nil, fmt.Errorf("chmod classic tmpfile: %w", err)
 	}
 	var stat unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
@@ -212,6 +212,23 @@ func IsCloned(exe *os.File) bool {
 // make sure the container process can never resolve the original runc binary.
 // For more details on why this is necessary, see CVE-2019-5736.
 func CloneSelfExe(tmpDir string) (*os.File, error) {
+	// Try to create a temporary overlayfs to produce a readonly version of
+	// /proc/self/exe that cannot be "unwrapped" by the container. In contrast
+	// to CloneBinary, this technique does not require any extra memory usage
+	// and does not have the (fairly noticeable) performance impact of copying
+	// a large binary file into a memfd.
+	//
+	// Based on some basic performance testing, the overlayfs approach has
+	// effectively no performance overhead (it is on par with both
+	// MS_BIND+MS_RDONLY and no binary cloning at all) while memfd copying adds
+	// around ~60% overhead during container startup.
+	overlayFile, err := sealedOverlayfs("/proc/self/exe", tmpDir)
+	if err == nil {
+		logrus.Debug("runc-dmz: using overlayfs for sealed /proc/self/exe") // used for tests
+		return overlayFile, nil
+	}
+	logrus.WithError(err).Debugf("could not use overlayfs for /proc/self/exe sealing -- falling back to making a temporary copy")
+
 	selfExe, err := os.Open("/proc/self/exe")
 	if err != nil {
 		return nil, fmt.Errorf("opening current binary: %w", err)

@@ -113,6 +113,7 @@ enum {
 	CR_FD_PIPES,
 	CR_FD_TTY_FILES,
 	CR_FD_MEMFD_FILE,
+	CR_FD_PIDFD,
 
 	CR_FD_AUTOFS,
 
@@ -122,8 +123,8 @@ enum {
 /* file descriptors template */
 struct cr_fd_desc_tmpl {
 	const char *fmt; /* format for the name */
-	u32 magic; /* magic in the header */
-	int oflags; /* flags for image_open */
+	u32 magic;	 /* magic in the header */
+	int oflags;	 /* flags for image_open */
 };
 
 extern struct cr_fd_desc_tmpl imgset_template[CR_FD_MAX];

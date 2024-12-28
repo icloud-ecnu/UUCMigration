@@ -62,8 +62,20 @@
  */
 typedef struct {
 	uint64_t filter_off; /* Input: which filter */
-	uint64_t flags; /* Output: filter's flags */
+	uint64_t flags;	     /* Output: filter's flags */
 } seccomp_metadata_t;
+
+#ifndef PTRACE_GET_RSEQ_CONFIGURATION
+#define PTRACE_GET_RSEQ_CONFIGURATION 0x420f
+
+struct __ptrace_rseq_configuration {
+	uint64_t rseq_abi_pointer;
+	uint32_t rseq_abi_size;
+	uint32_t signature;
+	uint32_t flags;
+	uint32_t pad;
+};
+#endif
 
 #ifdef PTRACE_EVENT_STOP
 #if PTRACE_EVENT_STOP == 7 /* Bad value from Linux 3.1-3.3, fixed in 3.4 */
@@ -72,6 +84,19 @@ typedef struct {
 #endif
 #ifndef PTRACE_EVENT_STOP
 #define PTRACE_EVENT_STOP 128
+#endif
+
+/*
+ * Amazon Linux 2 uses glibc 2.26. PTRACE_ARCH_PRCTL was added in glibc 2.27.
+ * This allows CRIU to build on Amazon Linux 2.
+ *
+ * Note that in sys/ptrace.h, PTRACE_ARCH_PRCTL is an enum value so the
+ * preprocessor doesn't know about it. PT_ARCH_PRCTL is the preprocessor symbol
+ * that matches the value of PTRACE_ARCH_PRCTL. So look for PT_ARCH_PRCTL to
+ * decide if PTRACE_ARCH_PRCTL is available or not.
+ */
+#if defined(__x86_64__) && !defined(PT_ARCH_PRCTL)
+#define PTRACE_ARCH_PRCTL 30 /* From asm/ptrace-abi.h. */
 #endif
 
 extern int ptrace_suspend_seccomp(pid_t pid);

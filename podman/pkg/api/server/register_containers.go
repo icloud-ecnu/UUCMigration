@@ -1,10 +1,12 @@
+//go:build !remote
+
 package server
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v4/pkg/api/handlers/compat"
-	"github.com/containers/podman/v4/pkg/api/handlers/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/compat"
+	"github.com/containers/podman/v5/pkg/api/handlers/libpod"
 	"github.com/gorilla/mux"
 )
 
@@ -71,21 +73,21 @@ func (s *APIServer) registerContainersHandlers(r *mux.Router) error {
 	//    name: filters
 	//    type: string
 	//    description: |
-	//       Returns a list of containers.
-	//        - ancestor=(<image-name>[:<tag>], <image id>, or <image@digest>)
-	//        - before=(<container id> or <container name>)
-	//        - expose=(<port>[/<proto>]|<startport-endport>/[<proto>])
-	//        - exited=<int> containers with exit code of <int>
-	//        - health=(starting|healthy|unhealthy|none)
-	//        - id=<ID> a container's ID
-	//        - is-task=(true|false)
-	//        - label=key or label="key=value" of a container label
-	//        - name=<name> a container's name
-	//        - network=(<network id> or <network name>)
-	//        - publish=(<port>[/<proto>]|<startport-endport>/[<proto>])
-	//        - since=(<container id> or <container name>)
-	//        - status=(created|restarting|running|removing|paused|exited|dead)
-	//        - volume=(<volume name> or <mount point destination>)
+	//        A JSON encoded value of the filters (a `map[string][]string`) to process on the containers list. Available filters:
+	//        - `ancestor`=(`<image-name>[:<tag>]`, `<image id>`, or `<image@digest>`)
+	//        - `before`=(`<container id>` or `<container name>`)
+	//        - `expose`=(`<port>[/<proto>]` or `<startport-endport>/[<proto>]`)
+	//        - `exited=<int>` containers with exit code of `<int>`
+	//        - `health`=(`starting`, `healthy`, `unhealthy` or `none`)
+	//        - `id=<ID>` a container's ID
+	//        - `is-task`=(`true` or `false`)
+	//        - `label`=(`key` or `"key=value"`) of a container label
+	//        - `name=<name>` a container's name
+	//        - `network`=(`<network id>` or `<network name>`)
+	//        - `publish`=(`<port>[/<proto>]` or `<startport-endport>/[<proto>]`)
+	//        - `since`=(`<container id>` or `<container name>`)
+	//        - `status`=(`created`, `restarting`, `running`, `removing`, `paused`, `exited` or `dead`)
+	//        - `volume`=(`<volume name>` or `<mount point destination>`)
 	// produces:
 	// - application/json
 	// responses:
@@ -675,6 +677,35 @@ func (s *APIServer) registerContainersHandlers(r *mux.Router) error {
 	//     $ref: "#/responses/internalError"
 	r.HandleFunc(VersionedPath("/containers/{name}/rename"), s.APIHandler(compat.RenameContainer)).Methods(http.MethodPost)
 	r.HandleFunc("/containers/{name}/rename", s.APIHandler(compat.RenameContainer)).Methods(http.MethodPost)
+	// swagger:operation POST /containers/{name}/update compat ContainerUpdate
+	// ---
+	// tags:
+	//   - containers (compat)
+	// summary: Update configuration of an existing container
+	// description: Change configuration settings for an existing container without requiring recreation.
+	// parameters:
+	//  - in: path
+	//    name: name
+	//    type: string
+	//    required: true
+	//    description: Full or partial ID or full name of the container to rename
+	//  - in: body
+	//    name: resources
+	//    required: false
+	//    description: attributes for updating the container
+	//    schema:
+	//      $ref: "#/definitions/containerUpdateRequest"
+	// produces:
+	// - application/json
+	// responses:
+	//   200:
+	//     description: no error
+	//   404:
+	//     $ref: "#/responses/containerNotFound"
+	//   500:
+	//     $ref: "#/responses/internalError"
+	r.HandleFunc(VersionedPath("/containers/{name}/update"), s.APIHandler(compat.UpdateContainer)).Methods(http.MethodPost)
+	r.HandleFunc("/containers/{name}/update", s.APIHandler(compat.UpdateContainer)).Methods(http.MethodPost)
 
 	/*
 		libpod endpoints
@@ -1747,25 +1778,36 @@ func (s *APIServer) registerContainersHandlers(r *mux.Router) error {
 	// ---
 	// tags:
 	//   - containers
-	// summary: Update an existing containers cgroup configuration
-	// description: Update an existing containers cgroup configuration.
+	// summary: Updates the configuration of an existing container, allowing changes to resource limits and healthchecks
+	// description: Updates the configuration of an existing container, allowing changes to resource limits and healthchecks.
 	// parameters:
 	//  - in: path
 	//    name: name
 	//    type: string
 	//    required: true
 	//    description: Full or partial ID or full name of the container to update
+	//  - in: query
+	//    name: restartPolicy
+	//    type: string
+	//    required: false
+	//    description: New restart policy for the container.
+	//  - in: query
+	//    name: restartRetries
+	//    type: integer
+	//    required: false
+	//    description: New amount of retries for the container's restart policy. Only allowed if restartPolicy is set to on-failure
 	//  - in: body
-	//    name: resources
+	//    name: config
 	//    description: attributes for updating the container
 	//    schema:
 	//      $ref: "#/definitions/UpdateEntities"
 	// produces:
 	// - application/json
 	// responses:
-	//   responses:
-	//     201:
-	//       $ref: "#/responses/containerUpdateResponse"
+	//   201:
+	//     $ref: "#/responses/containerUpdateResponse"
+	//   400:
+	//     $ref: "#/responses/badParamError"
 	//   404:
 	//     $ref: "#/responses/containerNotFound"
 	//   500:

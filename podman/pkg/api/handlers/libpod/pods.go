@@ -1,3 +1,5 @@
+//go:build !remote
+
 package libpod
 
 import (
@@ -8,17 +10,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/api/handlers"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi"
-	"github.com/containers/podman/v4/pkg/specgen"
-	"github.com/containers/podman/v4/pkg/specgen/generate"
-	"github.com/containers/podman/v4/pkg/specgenutil"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/specgen/generate"
+	"github.com/containers/podman/v5/pkg/specgenutil"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/gorilla/schema"
 	"github.com/hashicorp/go-multierror"
 	"github.com/sirupsen/logrus"
@@ -46,6 +48,9 @@ func PodCreate(w http.ResponseWriter, r *http.Request) {
 		infraOptions.Net = &entities.NetOptions{}
 		infraOptions.Devices = psg.Devices
 		infraOptions.SecurityOpt = psg.SecurityOpt
+		if !psg.Userns.IsDefault() {
+			infraOptions.UserNS = psg.Userns.String()
+		}
 		if psg.ShareParent == nil {
 			t := true
 			psg.ShareParent = &t
@@ -177,7 +182,10 @@ func PodStop(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	report := entities.PodStopReport{Id: pod.ID()}
+	report := entities.PodStopReport{
+		Id:       pod.ID(),
+		RawInput: pod.Name(),
+	}
 	for id, err := range responses {
 		report.Errs = append(report.Errs, fmt.Errorf("stopping container %s: %w", id, err))
 	}
@@ -199,7 +207,7 @@ func PodStart(w http.ResponseWriter, r *http.Request) {
 	}
 	status, err := pod.GetPodStatus()
 	if err != nil {
-		utils.Error(w, http.StatusInternalServerError, err)
+		utils.InternalServerError(w, err)
 		return
 	}
 	if status == define.PodStateRunning {
@@ -209,11 +217,19 @@ func PodStart(w http.ResponseWriter, r *http.Request) {
 
 	responses, err := pod.Start(r.Context())
 	if err != nil && !errors.Is(err, define.ErrPodPartialFail) {
-		utils.Error(w, http.StatusConflict, err)
+		utils.InternalServerError(w, err)
 		return
 	}
 
-	report := entities.PodStartReport{Id: pod.ID()}
+	cfg, err := pod.Config()
+	if err != nil {
+		utils.InternalServerError(w, err)
+		return
+	}
+	report := entities.PodStartReport{
+		Id:       pod.ID(),
+		RawInput: cfg.Name,
+	}
 	for id, err := range responses {
 		report.Errs = append(report.Errs, fmt.Errorf("%v: %w", "starting container "+id, err))
 	}
@@ -400,12 +416,8 @@ func PodTop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// We are committed now - all errors logged but not reported to client, ship has sailed
-	w.WriteHeader(http.StatusOK)
+	wroteContent := false
 	w.Header().Set("Content-Type", "application/json")
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
 
 	encoder := json.NewEncoder(w)
 
@@ -417,11 +429,22 @@ loop: // break out of for/select infinite` loop
 		default:
 			output, err := pod.GetPodPidInformation([]string{query.PsArgs})
 			if err != nil {
-				logrus.Infof("Error from %s %q : %v", r.Method, r.URL, err)
-				break loop
+				if !wroteContent {
+					utils.InternalServerError(w, err)
+				} else {
+					// ship has sailed, client already got a 200 response and expects valid
+					// PodTopOKBody json format so we no longer can send the error.
+					logrus.Infof("Error from %s %q : %v", r.Method, r.URL, err)
+				}
+				return
 			}
 
 			if len(output) > 0 {
+				if !wroteContent {
+					// Write header only first time around
+					w.WriteHeader(http.StatusOK)
+					wroteContent = true
+				}
 				body := handlers.PodTopOKBody{}
 				body.Titles = utils.PSTitles(output[0])
 				for i := range body.Titles {
@@ -559,14 +582,13 @@ func PodStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var flush = func() {}
+	flush := func() {}
 	if flusher, ok := w.(http.Flusher); ok {
 		flush = flusher.Flush
 	}
 	// Collect the stats and send them over the wire.
 	containerEngine := abi.ContainerEngine{Libpod: runtime}
 	reports, err := containerEngine.PodStats(r.Context(), query.NamesOrIDs, options)
-
 	// Error checks as documented in swagger.
 	if err != nil {
 		if errors.Is(err, define.ErrNoSuchPod) {

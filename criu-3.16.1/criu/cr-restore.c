@@ -22,7 +22,7 @@
 #include <compel/ptrace.h>
 #include "common/compiler.h"
 
-#include "linux/mount.h"
+#include "linux/rseq.h"
 
 #include "clone-noasan.h"
 #include "cr_options.h"
@@ -79,11 +79,14 @@
 #include "timens.h"
 #include "bpfmap.h"
 #include "apparmor.h"
+#include "pidfd.h"
 
 #include "parasite-syscall.h"
 #include "files-reg.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include "compel/include/asm/syscall.h"
+
+#include "linux/mount.h"
 
 #include "protobuf.h"
 #include "images/sa.pb-c.h"
@@ -96,6 +99,8 @@
 #include "restore.h"
 
 #include "cr-errno.h"
+#include "timer.h"
+#include "sigact.h"
 
 #ifndef arch_export_restore_thread
 #define arch_export_restore_thread __export_restore_thread
@@ -116,7 +121,6 @@ static int restore_task_with_children(void *);
 static int sigreturn_restore(pid_t pid, struct task_restore_args *ta, unsigned long alen, CoreEntry *core);
 static int prepare_restorer_blob(void);
 static int prepare_rlimits(int pid, struct task_restore_args *, CoreEntry *core);
-static int prepare_posix_timers(int pid, struct task_restore_args *ta, CoreEntry *core);
 static int prepare_signals(int pid, struct task_restore_args *, CoreEntry *core);
 
 /*
@@ -277,7 +281,7 @@ static struct collect_image_info *cinfos_files[] = {
 	&unix_sk_cinfo,	      &fifo_cinfo,     &pipe_cinfo,    &nsfile_cinfo,	    &packet_sk_cinfo,
 	&netlink_sk_cinfo,    &eventfd_cinfo,  &epoll_cinfo,   &epoll_tfd_cinfo,    &signalfd_cinfo,
 	&tunfile_cinfo,	      &timerfd_cinfo,  &inotify_cinfo, &inotify_mark_cinfo, &fanotify_cinfo,
-	&fanotify_mark_cinfo, &ext_file_cinfo, &memfd_cinfo,
+	&fanotify_mark_cinfo, &ext_file_cinfo, &memfd_cinfo, &pidfd_cinfo
 };
 
 /* These images are required to restore namespaces */
@@ -350,6 +354,10 @@ static int root_prepare_shared(void)
 	if (ret)
 		goto err;
 
+	ret = add_fake_unix_queuers();
+	if (ret)
+		goto err;
+
 	/*
 	 * This should be called with all packets collected AND all
 	 * fdescs and fles prepared BUT post-prep-s not run.
@@ -363,10 +371,6 @@ static int root_prepare_shared(void)
 		goto err;
 
 	ret = unix_prepare_root_shared();
-	if (ret)
-		goto err;
-
-	ret = add_fake_unix_queuers();
 	if (ret)
 		goto err;
 
@@ -403,268 +407,6 @@ static int populate_pid_proc(void)
 		return -1;
 	}
 	return 0;
-}
-
-static rt_sigaction_t sigchld_act;
-/*
- * If parent's sigaction has blocked SIGKILL (which is non-sense),
- * this parent action is non-valid and shouldn't be inherited.
- * Used to mark parent_act* no more valid.
- */
-static rt_sigaction_t parent_act[SIGMAX];
-#ifdef CONFIG_COMPAT
-static rt_sigaction_t_compat parent_act_compat[SIGMAX];
-#endif
-
-static bool sa_inherited(int sig, rt_sigaction_t *sa)
-{
-	rt_sigaction_t *pa;
-	int i;
-
-	if (current == root_item)
-		return false; /* XXX -- inherit from CRIU? */
-
-	pa = &parent_act[sig];
-
-	/* Omitting non-valid sigaction */
-	if (pa->rt_sa_mask.sig[0] & (1 << SIGKILL))
-		return false;
-
-	for (i = 0; i < _KNSIG_WORDS; i++)
-		if (pa->rt_sa_mask.sig[i] != sa->rt_sa_mask.sig[i])
-			return false;
-
-	return pa->rt_sa_handler == sa->rt_sa_handler && pa->rt_sa_flags == sa->rt_sa_flags &&
-	       pa->rt_sa_restorer == sa->rt_sa_restorer;
-}
-
-static int restore_native_sigaction(int sig, SaEntry *e)
-{
-	rt_sigaction_t act;
-	int ret;
-
-	ASSIGN_TYPED(act.rt_sa_handler, decode_pointer(e->sigaction));
-	ASSIGN_TYPED(act.rt_sa_flags, e->flags);
-	ASSIGN_TYPED(act.rt_sa_restorer, decode_pointer(e->restorer));
-#ifdef CONFIG_MIPS
-	e->has_mask_extended = 1;
-	BUILD_BUG_ON(sizeof(e->mask) * 2 != sizeof(act.rt_sa_mask.sig));
-
-	memcpy(&(act.rt_sa_mask.sig[0]), &e->mask, sizeof(act.rt_sa_mask.sig[0]));
-	memcpy(&(act.rt_sa_mask.sig[1]), &e->mask_extended, sizeof(act.rt_sa_mask.sig[1]));
-#else
-	BUILD_BUG_ON(sizeof(e->mask) != sizeof(act.rt_sa_mask.sig));
-	memcpy(act.rt_sa_mask.sig, &e->mask, sizeof(act.rt_sa_mask.sig));
-#endif
-	if (sig == SIGCHLD) {
-		sigchld_act = act;
-		return 0;
-	}
-
-	if (sa_inherited(sig - 1, &act))
-		return 1;
-
-	/*
-	 * A pure syscall is used, because glibc
-	 * sigaction overwrites se_restorer.
-	 */
-	ret = syscall(SYS_rt_sigaction, sig, &act, NULL, sizeof(k_rtsigset_t));
-	if (ret < 0) {
-		pr_perror("Can't restore sigaction");
-		return ret;
-	}
-
-	parent_act[sig - 1] = act;
-	/* Mark SIGKILL blocked which makes compat sigaction non-valid */
-#ifdef CONFIG_COMPAT
-	parent_act_compat[sig - 1].rt_sa_mask.sig[0] |= 1 << SIGKILL;
-#endif
-
-	return 1;
-}
-
-static void *stack32;
-
-#ifdef CONFIG_COMPAT
-static bool sa_compat_inherited(int sig, rt_sigaction_t_compat *sa)
-{
-	rt_sigaction_t_compat *pa;
-	int i;
-
-	if (current == root_item)
-		return false;
-
-	pa = &parent_act_compat[sig];
-
-	/* Omitting non-valid sigaction */
-	if (pa->rt_sa_mask.sig[0] & (1 << SIGKILL))
-		return false;
-
-	for (i = 0; i < _KNSIG_WORDS; i++)
-		if (pa->rt_sa_mask.sig[i] != sa->rt_sa_mask.sig[i])
-			return false;
-
-	return pa->rt_sa_handler == sa->rt_sa_handler && pa->rt_sa_flags == sa->rt_sa_flags &&
-	       pa->rt_sa_restorer == sa->rt_sa_restorer;
-}
-
-static int restore_compat_sigaction(int sig, SaEntry *e)
-{
-	rt_sigaction_t_compat act;
-	int ret;
-
-	ASSIGN_TYPED(act.rt_sa_handler, (u32)e->sigaction);
-	ASSIGN_TYPED(act.rt_sa_flags, e->flags);
-	ASSIGN_TYPED(act.rt_sa_restorer, (u32)e->restorer);
-	BUILD_BUG_ON(sizeof(e->mask) != sizeof(act.rt_sa_mask.sig));
-	memcpy(act.rt_sa_mask.sig, &e->mask, sizeof(act.rt_sa_mask.sig));
-
-	if (sig == SIGCHLD) {
-		memcpy(&sigchld_act, &act, sizeof(rt_sigaction_t_compat));
-		return 0;
-	}
-
-	if (sa_compat_inherited(sig - 1, &act))
-		return 1;
-
-	if (!stack32) {
-		stack32 = alloc_compat_syscall_stack();
-		if (!stack32)
-			return -1;
-	}
-
-	ret = arch_compat_rt_sigaction(stack32, sig, &act);
-	if (ret < 0) {
-		pr_err("Can't restore compat sigaction: %d\n", ret);
-		return ret;
-	}
-
-	parent_act_compat[sig - 1] = act;
-	/* Mark SIGKILL blocked which makes native sigaction non-valid */
-	parent_act[sig - 1].rt_sa_mask.sig[0] |= 1 << SIGKILL;
-
-	return 1;
-}
-#else
-static int restore_compat_sigaction(int sig, SaEntry *e)
-{
-	return -1;
-}
-#endif
-
-static int prepare_sigactions_from_core(TaskCoreEntry *tc)
-{
-	int sig, i;
-
-	if (tc->n_sigactions != SIGMAX - 2) {
-		pr_err("Bad number of sigactions in the image (%d, want %d)\n", (int)tc->n_sigactions, SIGMAX - 2);
-		return -1;
-	}
-
-	pr_info("Restore on-core sigactions for %d\n", vpid(current));
-
-	for (sig = 1, i = 0; sig <= SIGMAX; sig++) {
-		int ret;
-		SaEntry *e;
-		bool sigaction_is_compat;
-
-		if (sig == SIGKILL || sig == SIGSTOP)
-			continue;
-
-		e = tc->sigactions[i++];
-		sigaction_is_compat = e->has_compat_sigaction && e->compat_sigaction;
-		if (sigaction_is_compat)
-			ret = restore_compat_sigaction(sig, e);
-		else
-			ret = restore_native_sigaction(sig, e);
-
-		if (ret < 0)
-			return ret;
-	}
-
-	return 0;
-}
-
-/* Returns number of restored signals, -1 or negative errno on fail */
-static int restore_one_sigaction(int sig, struct cr_img *img, int pid)
-{
-	bool sigaction_is_compat;
-	SaEntry *e;
-	int ret = 0;
-
-	BUG_ON(sig == SIGKILL || sig == SIGSTOP);
-
-	ret = pb_read_one_eof(img, &e, PB_SIGACT);
-	if (ret == 0) {
-		if (sig != SIGMAX_OLD + 1) { /* backward compatibility */
-			pr_err("Unexpected EOF %d\n", sig);
-			return -1;
-		}
-		pr_warn("This format of sigacts-%d.img is deprecated\n", pid);
-		return -1;
-	}
-	if (ret < 0)
-		return ret;
-
-	sigaction_is_compat = e->has_compat_sigaction && e->compat_sigaction;
-	if (sigaction_is_compat)
-		ret = restore_compat_sigaction(sig, e);
-	else
-		ret = restore_native_sigaction(sig, e);
-
-	sa_entry__free_unpacked(e, NULL);
-
-	return ret;
-}
-
-static int prepare_sigactions_from_image(void)
-{
-	int pid = vpid(current);
-	struct cr_img *img;
-	int sig, rst = 0;
-	int ret = 0;
-
-	pr_info("Restore sigacts for %d\n", pid);
-
-	img = open_image(CR_FD_SIGACT, O_RSTR, pid);
-	if (!img)
-		return -1;
-
-	for (sig = 1; sig <= SIGMAX; sig++) {
-		if (sig == SIGKILL || sig == SIGSTOP)
-			continue;
-
-		ret = restore_one_sigaction(sig, img, pid);
-		if (ret < 0)
-			break;
-		if (ret)
-			rst++;
-	}
-
-	pr_info("Restored %d/%d sigacts\n", rst, SIGMAX - 3 /* KILL, STOP and CHLD */);
-
-	close_image(img);
-	return ret;
-}
-
-static int prepare_sigactions(CoreEntry *core)
-{
-	int ret;
-
-	if (!task_alive(current))
-		return 0;
-
-	if (core->tc->n_sigactions != 0)
-		ret = prepare_sigactions_from_core(core->tc);
-	else
-		ret = prepare_sigactions_from_image();
-
-	if (stack32) {
-		free_compat_syscall_stack(stack32);
-		stack32 = NULL;
-	}
-
-	return ret;
 }
 
 static int __collect_child_pids(struct pstree_item *p, int state, unsigned int *n)
@@ -811,6 +553,23 @@ static int open_cores(int pid, CoreEntry *leader_core)
 		}
 	}
 
+	for (i = 0; i < current->nr_threads; i++) {
+		ThreadCoreEntry *tc = cores[i]->thread_core;
+		struct rst_rseq *rseqs = rsti(current)->rseqe;
+		RseqEntry *rseqe = tc->rseq_entry;
+
+		/* compatibility with older CRIU versions */
+		if (!rseqe)
+			continue;
+
+		/* rseq cs had no RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL */
+		if (!rseqe->has_rseq_cs_pointer)
+			continue;
+
+		rseqs[i].rseq_abi_pointer = rseqe->rseq_abi_pointer;
+		rseqs[i].rseq_cs_pointer = rseqe->rseq_cs_pointer;
+	}
+
 	return 0;
 err:
 	xfree(cores);
@@ -844,6 +603,9 @@ static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc, struct task_restore_a
 	if (tc->has_child_subreaper)
 		args->child_subreaper = tc->child_subreaper;
 
+	if (tc->has_membarrier_registration_mask)
+		args->membarrier_registration_mask = tc->membarrier_registration_mask;
+
 	/* loginuid value is critical to restore */
 	if (kdat.luid == LUID_FULL && tc->has_loginuid && tc->loginuid != INVALID_UID) {
 		ret = prepare_loginuid(tc->loginuid);
@@ -860,7 +622,6 @@ static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc, struct task_restore_a
 	return 0;
 }
 
-static int prepare_itimers(int pid, struct task_restore_args *args, CoreEntry *core);
 static int prepare_mm(pid_t pid, struct task_restore_args *args);
 
 static int restore_one_alive_task(int pid, CoreEntry *core)
@@ -951,6 +712,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 
 	if (setup_uffd(pid, ta))
+		return -1;
+
+	if (arch_shstk_prepare(current, core, ta))
 		return -1;
 
 	return sigreturn_restore(pid, ta, args_len, core);
@@ -1330,7 +1094,22 @@ static inline int fork_with_pid(struct pstree_item *item)
 			return -1;
 
 		item->pid->state = ca.core->tc->task_state;
-		rsti(item)->cg_set = ca.core->tc->cg_set;
+
+		/*
+		 * Zombie tasks' cgroup is not dumped/restored.
+		 * cg_set == 0 is skipped in prepare_task_cgroup()
+		 */
+		if (item->pid->state == TASK_DEAD) {
+			rsti(item)->cg_set = 0;
+		} else {
+			if (ca.core->thread_core->has_cg_set)
+				rsti(item)->cg_set = ca.core->thread_core->cg_set;
+			else
+				rsti(item)->cg_set = ca.core->tc->cg_set;
+		}
+
+		if (ca.core->tc->has_stop_signo)
+			item->pid->stop_signo = ca.core->tc->stop_signo;
 
 		if (item->pid->state != TASK_DEAD && !task_alive(item)) {
 			pr_err("Unknown task state %d\n", item->pid->state);
@@ -1457,6 +1236,8 @@ static inline int fork_with_pid(struct pstree_item *item)
 		item->pid->real = ret;
 		pr_debug("PID: real %d virt %d\n", item->pid->real, vpid(item));
 	}
+
+	arch_shstk_unlock(item, ca.core, pid);
 
 err_unlock:
 	if (!(ca.clone_flags & CLONE_NEWPID))
@@ -1724,7 +1505,7 @@ static int create_children_and_session(void)
 	return 0;
 }
 
-static int restore_task_with_children(void *_arg)
+static int __restore_task_with_children(void *_arg)
 {
 	struct cr_clone_arg *ca = _arg;
 	pid_t pid;
@@ -1760,7 +1541,7 @@ static int restore_task_with_children(void *_arg)
 	}
 
 	if (log_init_by_pid(vpid(current)))
-		return -1;
+		goto err;
 
 	if (current->parent == NULL) {
 		/*
@@ -1787,8 +1568,18 @@ static int restore_task_with_children(void *_arg)
 				goto err;
 		}
 
+		if (set_opts_cap_eff())
+			goto err;
+
 		/* Wait prepare_userns */
 		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
+			goto err;
+
+		/*
+		 * Since we don't support nesting of cgroup namespaces, let's
+		 * only set up the cgns (if it exists) in the init task.
+		 */
+		if (prepare_cgroup_namespace(current) < 0)
 			goto err;
 	}
 
@@ -1801,7 +1592,7 @@ static int restore_task_with_children(void *_arg)
 	 * we will only move the root one there, others will
 	 * just have it inherited.
 	 */
-	if (prepare_task_cgroup(current) < 0)
+	if (restore_task_cgroup(current) < 0)
 		goto err;
 
 	/* Restore root task */
@@ -1906,6 +1697,16 @@ err:
 	exit(1);
 }
 
+static int restore_task_with_children(void *_arg)
+{
+	struct cr_clone_arg *arg = _arg;
+	struct pstree_item *item = arg->item;
+	CoreEntry *core = arg->core;
+
+	return arch_shstk_trampoline(item, core, __restore_task_with_children,
+				     arg);
+}
+
 static int attach_to_tasks(bool root_seized)
 {
 	struct pstree_item *item;
@@ -1942,6 +1743,10 @@ static int attach_to_tasks(bool root_seized)
 				return -1;
 			}
 
+			if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
+				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
+				return -1;
+			}
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
 			 * although seccomp is restored at the very end of the
@@ -1962,7 +1767,51 @@ static int attach_to_tasks(bool root_seized)
 	return 0;
 }
 
-static int catch_tasks(bool root_seized, enum trace_flags *flag)
+static int restore_rseq_cs(void)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		int i;
+
+		if (!task_alive(item))
+			continue;
+
+		if (item->nr_threads == 1) {
+			item->threads[0].real = item->pid->real;
+		} else {
+			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads)) {
+				pr_err("restore_rseq_cs: parse_threads failed\n");
+				return -1;
+			}
+		}
+
+		for (i = 0; i < item->nr_threads; i++) {
+			pid_t pid = item->threads[i].real;
+			struct rst_rseq *rseqe = rsti(item)->rseqe;
+
+			if (!rseqe) {
+				pr_err("restore_rseq_cs: rsti(item)->rseqe is NULL\n");
+				return -1;
+			}
+
+			if (!rseqe[i].rseq_cs_pointer || !rseqe[i].rseq_abi_pointer)
+				continue;
+
+			if (ptrace_poke_area(
+				    pid, &rseqe[i].rseq_cs_pointer,
+				    decode_pointer(rseqe[i].rseq_abi_pointer + offsetof(struct criu_rseq, rseq_cs)),
+				    sizeof(uint64_t))) {
+				pr_err("Can't restore rseq_cs pointer (pid: %d)\n", pid);
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int catch_tasks(bool root_seized)
 {
 	struct pstree_item *item;
 
@@ -1992,31 +1841,13 @@ static int catch_tasks(bool root_seized, enum trace_flags *flag)
 				return -1;
 			}
 
-			ret = compel_stop_pie(pid, rsti(item)->breakpoint, flag, fault_injected(FI_NO_BREAKPOINTS));
+			ret = compel_stop_pie(pid, rsti(item)->breakpoint, fault_injected(FI_NO_BREAKPOINTS));
 			if (ret < 0)
 				return -1;
 		}
 	}
 
 	return 0;
-}
-
-static int clear_breakpoints(void)
-{
-	struct pstree_item *item;
-	int ret = 0, i;
-
-	if (fault_injected(FI_NO_BREAKPOINTS))
-		return 0;
-
-	for_each_pstree_item(item) {
-		if (!task_alive(item))
-			continue;
-		for (i = 0; i < item->nr_threads; i++)
-			ret |= ptrace_flush_breakpoints(item->threads[i].real);
-	}
-
-	return ret;
 }
 
 static void finalize_restore(void)
@@ -2042,8 +1873,14 @@ static void finalize_restore(void)
 
 		xfree(ctl);
 
-		if ((item->pid->state == TASK_STOPPED) || (opts.final_state == TASK_STOPPED))
+		if (opts.final_state == TASK_STOPPED)
 			kill(item->pid->real, SIGSTOP);
+		else if (item->pid->state == TASK_STOPPED) {
+			if (item->pid->stop_signo > 0)
+				kill(item->pid->real, item->pid->stop_signo);
+			else
+				kill(item->pid->real, SIGSTOP);
+		}
 	}
 }
 
@@ -2061,7 +1898,7 @@ static int finalize_restore_detach(void)
 		for (i = 0; i < item->nr_threads; i++) {
 			pid = item->threads[i].real;
 			if (pid < 0) {
-				pr_err("pstree item has unvalid pid %d\n", pid);
+				pr_err("pstree item has invalid pid %d\n", pid);
 				continue;
 			}
 
@@ -2153,7 +1990,6 @@ static void reap_zombies(void)
 
 static int restore_root_task(struct pstree_item *init)
 {
-	enum trace_flags flag = TRACE_ALL;
 	int ret, fd, mnt_ns_fd = -1;
 	int root_seized = 0;
 	struct pstree_item *item;
@@ -2316,6 +2152,10 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	ret = stop_cgroupd();
+	if (ret < 0)
+		goto out_kill;
+
 	ret = move_veth_to_bridge();
 	if (ret < 0)
 		goto out_kill;
@@ -2368,7 +2208,7 @@ skip_ns_bouncing:
 
 	timing_stop(TIME_RESTORE);
 
-	if (catch_tasks(root_seized, &flag)) {
+	if (catch_tasks(root_seized)) {
 		pr_err("Can't catch all tasks\n");
 		goto out_kill_network_unlocked;
 	}
@@ -2378,16 +2218,43 @@ skip_ns_bouncing:
 
 	__restore_switch_stage(CR_STATE_COMPLETE);
 
-	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1), flag);
+	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
 	if (ret) {
 		pr_err("Can't stop all tasks on rt_sigreturn\n");
 		goto out_kill_network_unlocked;
 	}
 
-	if (clear_breakpoints())
-		pr_err("Unable to flush breakpoints\n");
-
 	finalize_restore();
+
+	/* just before releasing threads we have to restore rseq_cs */
+	if (restore_rseq_cs())
+		pr_err("Unable to restore rseq_cs state\n");
+
+	/*
+	 * Some external devices such as GPUs might need a very late
+	 * trigger to kick-off some events, memory notifiers and for
+	 * restarting the previously restored queues during criu restore
+	 * stage. This is needed since criu pie code may shuffle VMAs
+	 * around so things such as registering MMU notifiers (for GPU
+	 * mapped memory) could be done sanely once the pie code hands
+	 * over the control to master process.
+	 */
+	pr_info("Run late stage hook from criu master for external devices\n");
+	for_each_pstree_item(item) {
+		if (!task_alive(item))
+			continue;
+		ret = run_plugins(RESUME_DEVICES_LATE, item->pid->real);
+		/*
+		 * This may not really be an error. Only certain plugin hooks
+		 * (if available) will return success such as amdgpu_plugin that
+		 * validates the pid of the resuming tasks in the kernel mode.
+		 * Most of the times, it'll be -ENOTSUP and in few cases, it
+		 * might actually be a true error code but that would be also
+		 * captured in the plugin so no need to print the error here.
+		 */
+		if (ret < 0)
+			pr_debug("restore late stage hook for external plugin failed\n");
+	}
 
 	ret = run_scripts(ACT_PRE_RESUME);
 	if (ret)
@@ -2594,251 +2461,6 @@ static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_he
 	return -1;
 }
 
-static inline int timeval_valid(struct timeval *tv)
-{
-	return (tv->tv_sec >= 0) && ((unsigned long)tv->tv_usec < USEC_PER_SEC);
-}
-
-static inline int decode_itimer(char *n, ItimerEntry *ie, struct itimerval *val)
-{
-	if (ie->isec == 0 && ie->iusec == 0) {
-		memzero_p(val);
-		return 0;
-	}
-
-	val->it_interval.tv_sec = ie->isec;
-	val->it_interval.tv_usec = ie->iusec;
-
-	if (!timeval_valid(&val->it_interval)) {
-		pr_err("Invalid timer interval\n");
-		return -1;
-	}
-
-	if (ie->vsec == 0 && ie->vusec == 0) {
-		/*
-		 * Remaining time was too short. Set it to
-		 * interval to make the timer armed and work.
-		 */
-		val->it_value.tv_sec = ie->isec;
-		val->it_value.tv_usec = ie->iusec;
-	} else {
-		val->it_value.tv_sec = ie->vsec;
-		val->it_value.tv_usec = ie->vusec;
-	}
-
-	if (!timeval_valid(&val->it_value)) {
-		pr_err("Invalid timer value\n");
-		return -1;
-	}
-
-	pr_info("Restored %s timer to %ld.%ld -> %ld.%ld\n", n, val->it_value.tv_sec, val->it_value.tv_usec,
-		val->it_interval.tv_sec, val->it_interval.tv_usec);
-
-	return 0;
-}
-
-/*
- * Legacy itimers restore from CR_FD_ITIMERS
- */
-
-static int prepare_itimers_from_fd(int pid, struct task_restore_args *args)
-{
-	int ret = -1;
-	struct cr_img *img;
-	ItimerEntry *ie;
-
-	if (!deprecated_ok("Itimers"))
-		return -1;
-
-	img = open_image(CR_FD_ITIMERS, O_RSTR, pid);
-	if (!img)
-		return -1;
-
-	ret = pb_read_one(img, &ie, PB_ITIMER);
-	if (ret < 0)
-		goto out;
-	ret = decode_itimer("real", ie, &args->itimers[0]);
-	itimer_entry__free_unpacked(ie, NULL);
-	if (ret < 0)
-		goto out;
-
-	ret = pb_read_one(img, &ie, PB_ITIMER);
-	if (ret < 0)
-		goto out;
-	ret = decode_itimer("virt", ie, &args->itimers[1]);
-	itimer_entry__free_unpacked(ie, NULL);
-	if (ret < 0)
-		goto out;
-
-	ret = pb_read_one(img, &ie, PB_ITIMER);
-	if (ret < 0)
-		goto out;
-	ret = decode_itimer("prof", ie, &args->itimers[2]);
-	itimer_entry__free_unpacked(ie, NULL);
-	if (ret < 0)
-		goto out;
-out:
-	close_image(img);
-	return ret;
-}
-
-static int prepare_itimers(int pid, struct task_restore_args *args, CoreEntry *core)
-{
-	int ret = 0;
-	TaskTimersEntry *tte = core->tc->timers;
-
-	if (!tte)
-		return prepare_itimers_from_fd(pid, args);
-
-	ret |= decode_itimer("real", tte->real, &args->itimers[0]);
-	ret |= decode_itimer("virt", tte->virt, &args->itimers[1]);
-	ret |= decode_itimer("prof", tte->prof, &args->itimers[2]);
-
-	return ret;
-}
-
-static inline int timespec_valid(struct timespec *ts)
-{
-	return (ts->tv_sec >= 0) && ((unsigned long)ts->tv_nsec < NSEC_PER_SEC);
-}
-
-static inline int decode_posix_timer(PosixTimerEntry *pte, struct restore_posix_timer *pt)
-{
-	pt->val.it_interval.tv_sec = pte->isec;
-	pt->val.it_interval.tv_nsec = pte->insec;
-
-	if (!timespec_valid(&pt->val.it_interval)) {
-		pr_err("Invalid timer interval(posix)\n");
-		return -1;
-	}
-
-	if (pte->vsec == 0 && pte->vnsec == 0) {
-		/*
-		 * Remaining time was too short. Set it to
-		 * interval to make the timer armed and work.
-		 */
-		pt->val.it_value.tv_sec = pte->isec;
-		pt->val.it_value.tv_nsec = pte->insec;
-	} else {
-		pt->val.it_value.tv_sec = pte->vsec;
-		pt->val.it_value.tv_nsec = pte->vnsec;
-	}
-
-	if (!timespec_valid(&pt->val.it_value)) {
-		pr_err("Invalid timer value(posix)\n");
-		return -1;
-	}
-
-	pt->spt.it_id = pte->it_id;
-	pt->spt.clock_id = pte->clock_id;
-	pt->spt.si_signo = pte->si_signo;
-	pt->spt.it_sigev_notify = pte->it_sigev_notify;
-	pt->spt.sival_ptr = decode_pointer(pte->sival_ptr);
-	pt->spt.notify_thread_id = pte->notify_thread_id;
-	pt->overrun = pte->overrun;
-
-	return 0;
-}
-
-static int cmp_posix_timer_proc_id(const void *p1, const void *p2)
-{
-	return ((struct restore_posix_timer *)p1)->spt.it_id - ((struct restore_posix_timer *)p2)->spt.it_id;
-}
-
-static void sort_posix_timers(struct task_restore_args *ta)
-{
-	void *tmem;
-
-	/*
-	 * This is required for restorer's create_posix_timers(),
-	 * it will probe them one-by-one for the desired ID, since
-	 * kernel doesn't provide another API for timer creation
-	 * with given ID.
-	 */
-
-	if (ta->posix_timers_n > 0) {
-		tmem = rst_mem_remap_ptr((unsigned long)ta->posix_timers, RM_PRIVATE);
-		qsort(tmem, ta->posix_timers_n, sizeof(struct restore_posix_timer), cmp_posix_timer_proc_id);
-	}
-}
-
-/*
- * Legacy posix timers restoration from CR_FD_POSIX_TIMERS
- */
-
-static int prepare_posix_timers_from_fd(int pid, struct task_restore_args *ta)
-{
-	struct cr_img *img;
-	int ret = -1;
-	struct restore_posix_timer *t;
-
-	if (!deprecated_ok("Posix timers"))
-		return -1;
-
-	img = open_image(CR_FD_POSIX_TIMERS, O_RSTR, pid);
-	if (!img)
-		return -1;
-
-	ta->posix_timers_n = 0;
-	while (1) {
-		PosixTimerEntry *pte;
-
-		ret = pb_read_one_eof(img, &pte, PB_POSIX_TIMER);
-		if (ret <= 0)
-			break;
-
-		t = rst_mem_alloc(sizeof(struct restore_posix_timer), RM_PRIVATE);
-		if (!t)
-			break;
-
-		ret = decode_posix_timer(pte, t);
-		if (ret < 0)
-			break;
-
-		posix_timer_entry__free_unpacked(pte, NULL);
-		ta->posix_timers_n++;
-	}
-
-	close_image(img);
-	if (!ret)
-		sort_posix_timers(ta);
-
-	return ret;
-}
-
-static int prepare_posix_timers(int pid, struct task_restore_args *ta, CoreEntry *core)
-{
-	int i, ret = -1;
-	TaskTimersEntry *tte = core->tc->timers;
-	struct restore_posix_timer *t;
-
-	ta->posix_timers = (struct restore_posix_timer *)rst_mem_align_cpos(RM_PRIVATE);
-
-	if (!tte)
-		return prepare_posix_timers_from_fd(pid, ta);
-
-	ta->posix_timers_n = tte->n_posix;
-	for (i = 0; i < ta->posix_timers_n; i++) {
-		t = rst_mem_alloc(sizeof(struct restore_posix_timer), RM_PRIVATE);
-		if (!t)
-			goto out;
-
-		if (decode_posix_timer(tte->posix[i], t))
-			goto out;
-	}
-
-	ret = 0;
-	sort_posix_timers(ta);
-out:
-	return ret;
-}
-
-static inline int verify_cap_size(CredsEntry *ce)
-{
-	return ((ce->n_cap_inh == CR_CAP_SIZE) && (ce->n_cap_eff == CR_CAP_SIZE) && (ce->n_cap_prm == CR_CAP_SIZE) &&
-		(ce->n_cap_bnd == CR_CAP_SIZE));
-}
-
 static int prepare_mm(pid_t pid, struct task_restore_args *args)
 {
 	int exe_fd, i, ret = -1;
@@ -2864,7 +2486,7 @@ static int prepare_mm(pid_t pid, struct task_restore_args *args)
 
 	args->fd_exe_link = exe_fd;
 
-	args->has_thp_enabled = rsti(current)->has_thp_enabled;
+	args->thp_disabled = mm->has_thp_disabled && mm->thp_disabled;
 
 	ret = 0;
 out:
@@ -2938,7 +2560,7 @@ static int validate_sched_parm(struct rst_sched_param *sp)
 	if ((sp->nice < -20) || (sp->nice > 19))
 		return 0;
 
-	switch (sp->policy) {
+	switch (sp->policy & ~SCHED_RESET_ON_FORK) {
 	case SCHED_RR:
 	case SCHED_FIFO:
 		return ((sp->prio > 0) && (sp->prio < 100));
@@ -2969,6 +2591,55 @@ static int prep_sched_info(struct rst_sched_param *sp, ThreadCoreEntry *tc)
 	}
 
 	return 0;
+}
+
+static int prep_rseq(struct rst_rseq_param *rseq, ThreadCoreEntry *tc)
+{
+	/* compatibility with older CRIU versions */
+	if (!tc->rseq_entry)
+		return 0;
+
+	rseq->rseq_abi_pointer = tc->rseq_entry->rseq_abi_pointer;
+	rseq->rseq_abi_size = tc->rseq_entry->rseq_abi_size;
+	rseq->signature = tc->rseq_entry->signature;
+
+	if (rseq->rseq_abi_pointer && !kdat.has_rseq) {
+		pr_err("rseq: can't restore as kernel doesn't support it\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
+{
+	if (!kdat.has_rseq) {
+		rseq->rseq_abi_pointer = 0;
+		return;
+	}
+
+	if (!kdat.has_ptrace_get_rseq_conf) {
+#if defined(__GLIBC__) && defined(RSEQ_SIG)
+		rseq->rseq_abi_pointer = encode_pointer(__criu_thread_pointer() + __rseq_offset);
+		/*
+		 * Current glibc reports the feature/active size in
+		 * __rseq_size, not the size passed to the kernel.
+		 * This could be 20, but older kernels expect 32 for
+		 * the size argument even if only 20 bytes are used.
+		 */
+		rseq->rseq_abi_size = __rseq_size;
+		if (rseq->rseq_abi_size < 32)
+			rseq->rseq_abi_size = 32;
+		rseq->signature = RSEQ_SIG;
+#else
+		rseq->rseq_abi_pointer = 0;
+#endif
+		return;
+	}
+
+	rseq->rseq_abi_pointer = kdat.libc_rseq_conf.rseq_abi_pointer;
+	rseq->rseq_abi_size = kdat.libc_rseq_conf.rseq_abi_size;
+	rseq->signature = kdat.libc_rseq_conf.signature;
 }
 
 static rlim_t decode_rlim(rlim_t ival)
@@ -3058,11 +2729,11 @@ static int prepare_rlimits(int pid, struct task_restore_args *ta, CoreEntry *cor
 	return 0;
 }
 
-static int signal_to_mem(SiginfoEntry *sie)
+static int signal_to_mem(SiginfoEntry *se)
 {
 	siginfo_t *info, *t;
 
-	info = (siginfo_t *)sie->siginfo.data;
+	info = (siginfo_t *)se->siginfo.data;
 	t = rst_mem_alloc(sizeof(siginfo_t), RM_PRIVATE);
 	if (!t)
 		return -1;
@@ -3083,24 +2754,24 @@ static int open_signal_image(int type, pid_t pid, unsigned int *nr)
 
 	*nr = 0;
 	while (1) {
-		SiginfoEntry *sie;
+		SiginfoEntry *se;
 
-		ret = pb_read_one_eof(img, &sie, PB_SIGINFO);
+		ret = pb_read_one_eof(img, &se, PB_SIGINFO);
 		if (ret <= 0)
 			break;
-		if (sie->siginfo.len != sizeof(siginfo_t)) {
+		if (se->siginfo.len != sizeof(siginfo_t)) {
 			pr_err("Unknown image format\n");
 			ret = -1;
 			break;
 		}
 
-		ret = signal_to_mem(sie);
+		ret = signal_to_mem(se);
 		if (ret)
 			break;
 
 		(*nr)++;
 
-		siginfo_entry__free_unpacked(sie, NULL);
+		siginfo_entry__free_unpacked(se, NULL);
 	}
 
 	close_image(img);
@@ -3212,16 +2883,30 @@ static bool groups_match(gid_t *groups, int n_groups)
 	return ret;
 }
 
+static void copy_caps(u32 *out_caps, u32 *in_caps, int n_words)
+{
+	int i, cap_end;
+
+	for (i = kdat.last_cap + 1; i < 32 * n_words; ++i) {
+		if (~in_caps[i / 32] & (1 << (i % 32)))
+			continue;
+
+		pr_warn("Dropping unsupported capability %d > %d)\n", i, kdat.last_cap);
+		/* extra caps will be cleared below */
+	}
+
+	n_words = min(n_words, (kdat.last_cap + 31) / 32);
+	cap_end = (kdat.last_cap & 31) + 1;
+	memcpy(out_caps, in_caps, sizeof(*out_caps) * n_words);
+	if ((cap_end & 31) && n_words)
+		out_caps[n_words - 1] &= (1 << cap_end) - 1;
+	memset(out_caps + n_words, 0, sizeof(*out_caps) * (CR_CAP_SIZE - n_words));
+}
+
 static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned long *prev_pos)
 {
 	unsigned long this_pos;
 	struct thread_creds_args *args;
-
-	if (!verify_cap_size(ce)) {
-		pr_err("Caps size mismatch %d %d %d %d\n", (int)ce->n_cap_inh, (int)ce->n_cap_eff, (int)ce->n_cap_prm,
-		       (int)ce->n_cap_bnd);
-		return ERR_PTR(-EINVAL);
-	}
 
 	this_pos = rst_mem_align_cpos(RM_PRIVATE);
 
@@ -3258,7 +2943,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 
 			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
 			args->lsm_profile = lsm_profile;
-			strlcpy(args->lsm_profile, rendered, lsm_profile_len + 1);
+			__strlcpy(args->lsm_profile, rendered, lsm_profile_len + 1);
 			xfree(rendered);
 		}
 	} else {
@@ -3292,7 +2977,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 
 			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
 			args->lsm_sockcreate = lsm_sockcreate;
-			strlcpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len + 1);
+			__strlcpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len + 1);
 			xfree(rendered);
 		}
 	} else {
@@ -3310,10 +2995,10 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 	args->creds.groups = NULL;
 	args->creds.lsm_profile = NULL;
 
-	memcpy(args->cap_inh, ce->cap_inh, sizeof(args->cap_inh));
-	memcpy(args->cap_eff, ce->cap_eff, sizeof(args->cap_eff));
-	memcpy(args->cap_prm, ce->cap_prm, sizeof(args->cap_prm));
-	memcpy(args->cap_bnd, ce->cap_bnd, sizeof(args->cap_bnd));
+	copy_caps(args->cap_inh, ce->cap_inh, ce->n_cap_inh);
+	copy_caps(args->cap_eff, ce->cap_eff, ce->n_cap_eff);
+	copy_caps(args->cap_prm, ce->cap_prm, ce->n_cap_prm);
+	copy_caps(args->cap_bnd, ce->cap_bnd, ce->n_cap_bnd);
 
 	if (ce->n_groups && !groups_match(ce->groups, ce->n_groups)) {
 		unsigned int *groups;
@@ -3624,6 +3309,12 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	strncpy(task_args->comm, core->tc->comm, TASK_COMM_LEN - 1);
 	task_args->comm[TASK_COMM_LEN - 1] = 0;
 
+	prep_libc_rseq_info(&task_args->libc_rseq);
+
+	task_args->uid = opts.uid;
+	for (i = 0; i < CR_CAP_SIZE; i++)
+		task_args->cap_eff[i] = opts.cap_eff[i];
+
 	/*
 	 * Fill up per-thread data.
 	 */
@@ -3680,6 +3371,17 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		thread_args[i].gpregs = *CORE_THREAD_ARCH_INFO(tcore)->gpregs;
 		thread_args[i].clear_tid_addr = CORE_THREAD_ARCH_INFO(tcore)->clear_tid_addr;
 		core_get_tls(tcore, &thread_args[i].tls);
+
+		if (tcore->thread_core->has_cg_set && rsti(current)->cg_set != tcore->thread_core->cg_set) {
+			thread_args[i].cg_set = tcore->thread_core->cg_set;
+			thread_args[i].cgroupd_sk = dup(get_service_fd(CGROUPD_SK));
+		} else {
+			thread_args[i].cg_set = -1;
+		}
+
+		ret = prep_rseq(&thread_args[i].rseq, tcore->thread_core);
+		if (ret)
+			goto err;
 
 		rst_reloc_creds(&thread_args[i], &creds_pos_next);
 
@@ -3771,6 +3473,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	close_service_fd(USERNSD_SK);
 	close_service_fd(FDSTORE_SK_OFF);
 	close_service_fd(RPC_SK_OFF);
+	close_service_fd(CGROUPD_SK);
 
 	__gcov_flush();
 

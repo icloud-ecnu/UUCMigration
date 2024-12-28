@@ -66,7 +66,7 @@ EOF
     # container completes fast, and the cleanup *did* happen properly
     # the container is now gone.  So, we need to ignore "no such
     # container" errors from podman wait.
-    CONTAINERS_CONF="$conf_tmp" run_podman '?' wait "$cid"
+    CONTAINERS_CONF="$conf_tmp" run_podman '?' wait --condition=removing "$cid"
     if [[ $status != 0 ]]; then
         is "$output" "Error:.*no such container" "unexpected error from podman wait"
     fi
@@ -104,10 +104,10 @@ See 'podman create --help'" "--module must be specified before the command"
 
     run_podman rm -f $cid
 
-    # Nonexistent module path
-    nonesuch=${PODMAN_TMPDIR}/nonexistent
+    # Nonexistent module path with comma
+    nonesuch=${PODMAN_TMPDIR}/nonexistent,withcomma
     run_podman 1 --module=$nonesuch sdfsdfdsf
-    is "$output" "Failed to obtain podman configuration: could not resolve module \"$nonesuch\": stat $nonesuch: no such file or directory" \
+    is "$output" "Failed to obtain podman configuration: could not resolve module \"$nonesuch\": faccessat $nonesuch: no such file or directory" \
        "--module=ENOENT"
 }
 
@@ -188,7 +188,7 @@ EOF
     XDG_CONFIG_HOME=$fake_home run_podman 1 --module=$nonesuch invalid-command
     expect="Failed to obtain podman configuration: could not resolve module \"$nonesuch\": 3 errors occurred:"
     for dir in $fake_home /etc /usr/share;do
-        expect+=$'\n\t'"* stat $dir/containers/containers.conf.modules/$nonesuch: no such file or directory"
+        expect+=$'\n\t'"* faccessat $dir/containers/containers.conf.modules/$nonesuch: no such file or directory"
     done
     is "$output" "$expect" "--module=ENOENT : error message"
 }
@@ -227,7 +227,9 @@ EOF
     cname="$output"
 
     # Make sure `env_host` is read
-    run_podman container inspect $cname --format "{{.Config.Env}}"
+    # Only print the env vars that start with "FOO" to avoid printing output that
+    # may be considered problematic (see run_podman in helpers.bash).
+    run_podman container inspect $cname --format '{{range .Config.Env}} {{if eq "F" (slice . 0 1) }} {{.}} {{end}} {{end}}'
     assert "$output" =~ "FOO=$random_env_var" "--module should yield injecting host env vars into the container"
 
     # Make sure `privileged` is read during container creation
@@ -244,7 +246,7 @@ EOF
     run_podman container exec $cname grep CapBnd /proc/self/status
     non_privileged_caps="$output"
     run_podman --module=$conf_tmp container exec $cname grep CapBnd /proc/self/status
-    assert "$output" != "$non_privileged_caps" "--module should enable a prvileged exec session"
+    assert "$output" != "$non_privileged_caps" "--module should enable a privileged exec session"
 
     run_podman rm -f -t0 $cname
 }

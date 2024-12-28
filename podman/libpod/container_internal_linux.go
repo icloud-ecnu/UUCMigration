@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -19,9 +18,9 @@ import (
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/cgroups"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/utils"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/shutdown"
+	"github.com/containers/podman/v5/pkg/rootless"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/opencontainers/selinux/go-selinux/label"
@@ -69,13 +68,29 @@ func (c *Container) prepare() error {
 		tmpStateLock                    sync.Mutex
 	)
 
+	shutdown.Inhibit()
+	defer shutdown.Uninhibit()
+
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
+		if c.state.State == define.ContainerStateStopped {
+			// networking should not be reused after a stop
+			if err := c.cleanupNetwork(); err != nil {
+				createNetNSErr = err
+				return
+			}
+		}
+
 		// Set up network namespace if not already set up
 		noNetNS := c.state.NetNS == ""
 		if c.config.CreateNetNS && noNetNS && !c.config.PostConfigureNetNS {
+			c.reservedPorts, createNetNSErr = c.bindPorts()
+			if createNetNSErr != nil {
+				return
+			}
+
 			netNS, networkStatus, createNetNSErr = c.runtime.createNetNS(c)
 			if createNetNSErr != nil {
 				return
@@ -142,6 +157,11 @@ func (c *Container) prepare() error {
 	}
 
 	if createErr != nil {
+		for _, f := range c.reservedPorts {
+			// make sure to close all ports again on errors
+			f.Close()
+		}
+		c.reservedPorts = nil
 		return createErr
 	}
 
@@ -171,19 +191,20 @@ func (c *Container) cleanupNetwork() error {
 	}
 
 	// Stop the container's network namespace (if it has one)
-	if err := c.runtime.teardownNetNS(c); err != nil {
-		logrus.Errorf("Unable to clean up network for container %s: %q", c.ID(), err)
-	}
-
+	neterr := c.runtime.teardownNetNS(c)
 	c.state.NetNS = ""
 	c.state.NetworkStatus = nil
-	c.state.NetworkStatusOld = nil
 
-	if c.valid {
-		return c.save()
+	// always save even when there was an error
+	err = c.save()
+	if err != nil {
+		if neterr != nil {
+			logrus.Errorf("Unable to clean up network for container %s: %q", c.ID(), neterr)
+		}
+		return err
 	}
 
-	return nil
+	return neterr
 }
 
 // reloadNetwork reloads the network for the given container, recreating
@@ -390,7 +411,7 @@ func (c *Container) getOCICgroupPath() (string, error) {
 	case c.config.NoCgroups:
 		return "", nil
 	case c.config.CgroupsMode == cgroupSplit:
-		selfCgroup, err := utils.GetOwnCgroupDisallowRoot()
+		selfCgroup, err := cgroups.GetOwnCgroupDisallowRoot()
 		if err != nil {
 			return "", err
 		}
@@ -414,27 +435,6 @@ func (c *Container) getOCICgroupPath() (string, error) {
 	default:
 		return "", fmt.Errorf("invalid cgroup manager %s requested: %w", cgroupManager, define.ErrInvalidArg)
 	}
-}
-
-// If the container is rootless, set up the slirp4netns network
-func (c *Container) setupRootlessNetwork() error {
-	// set up slirp4netns again because slirp4netns will die when conmon exits
-	if c.config.NetMode.IsSlirp4netns() {
-		err := c.runtime.setupSlirp4netns(c, c.state.NetNS)
-		if err != nil {
-			return err
-		}
-	}
-
-	// set up rootlesskit port forwarder again since it dies when conmon exits
-	// we use rootlesskit port forwarder only as rootless and when bridge network is used
-	if rootless.IsRootless() && c.config.NetMode.IsBridge() && len(c.config.PortMappings) > 0 {
-		err := c.runtime.setupRootlessPortMappingViaRLK(c, c.state.NetNS, c.state.NetworkStatus)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func openDirectory(path string) (fd int, err error) {
@@ -619,9 +619,18 @@ func (c *Container) setCgroupsPath(g *generate.Generator) error {
 	return nil
 }
 
-func (c *Container) addSlirp4netnsDNS(nameservers []string) []string {
-	// slirp4netns has a built in DNS forwarder.
-	if c.config.NetMode.IsSlirp4netns() {
+// addSpecialDNS adds special dns servers for slirp4netns and pasta
+func (c *Container) addSpecialDNS(nameservers []string) []string {
+	switch {
+	case c.config.NetMode.IsBridge():
+		info, err := c.runtime.network.RootlessNetnsInfo()
+		if err == nil && info != nil {
+			nameservers = append(nameservers, info.DnsForwardIps...)
+		}
+	case c.pastaResult != nil:
+		nameservers = append(nameservers, c.pastaResult.DNSForwardIPs...)
+	case c.config.NetMode.IsSlirp4netns():
+		// slirp4netns has a built in DNS forwarder.
 		slirp4netnsDNS, err := slirp4netns.GetDNS(c.slirp4netnsSubnet)
 		if err != nil {
 			logrus.Warn("Failed to determine Slirp4netns DNS: ", err.Error())
@@ -683,7 +692,7 @@ func (c *Container) makePlatformBindMounts() error {
 	// Make /etc/hostname
 	// This should never change, so no need to recreate if it exists
 	if _, ok := c.state.BindMounts["/etc/hostname"]; !ok {
-		hostnamePath, err := c.writeStringToRundir("hostname", c.Hostname())
+		hostnamePath, err := c.writeStringToRundir("hostname", c.Hostname()+"\n")
 		if err != nil {
 			return fmt.Errorf("creating hostname file for container %s: %w", c.ID(), err)
 		}
@@ -693,16 +702,14 @@ func (c *Container) makePlatformBindMounts() error {
 }
 
 func (c *Container) getConmonPidFd() int {
-	if c.state.ConmonPID != 0 {
-		// Track lifetime of conmon precisely using pidfd_open + poll.
-		// There are many cases for this to fail, for instance conmon is dead
-		// or pidfd_open is not supported (pre linux 5.3), so fall back to the
-		// traditional loop with poll + sleep
-		if fd, err := unix.PidfdOpen(c.state.ConmonPID, 0); err == nil {
-			return fd
-		} else if err != unix.ENOSYS && err != unix.ESRCH {
-			logrus.Debugf("PidfdOpen(%d) failed: %v", c.state.ConmonPID, err)
-		}
+	// Track lifetime of conmon precisely using pidfd_open + poll.
+	// There are many cases for this to fail, for instance conmon is dead
+	// or pidfd_open is not supported (pre linux 5.3), so fall back to the
+	// traditional loop with poll + sleep
+	if fd, err := unix.PidfdOpen(c.state.ConmonPID, 0); err == nil {
+		return fd
+	} else if err != unix.ENOSYS && err != unix.ESRCH {
+		logrus.Debugf("PidfdOpen(%d) failed: %v", c.state.ConmonPID, err)
 	}
 	return -1
 }

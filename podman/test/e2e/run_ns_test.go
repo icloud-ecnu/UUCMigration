@@ -1,10 +1,12 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"os/exec"
 	"strings"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -25,7 +27,7 @@ var _ = Describe("Podman run ns", func() {
 
 		session = podmanTest.Podman([]string{"run", "--pid=badpid", fedoraMinimal, "bash", "-c", "echo $$"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "unrecognized namespace mode badpid passed"))
 	})
 
 	It("podman run --cgroup private test", func() {
@@ -79,7 +81,7 @@ var _ = Describe("Podman run ns", func() {
 	It("podman run bad ipc pid test", func() {
 		session := podmanTest.Podman([]string{"run", "--ipc=badpid", fedoraMinimal, "bash", "-c", "echo $$"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "unrecognized namespace mode badpid passed"))
 	})
 
 	It("podman run mounts fresh cgroup", func() {

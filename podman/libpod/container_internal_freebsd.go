@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -13,7 +12,7 @@ import (
 	"time"
 
 	"github.com/containers/common/libnetwork/types"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/rootless"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/sirupsen/logrus"
@@ -51,6 +50,10 @@ func (c *Container) prepare() error {
 		// Set up network namespace if not already set up
 		noNetNS := c.state.NetNS == ""
 		if c.config.CreateNetNS && noNetNS && !c.config.PostConfigureNetNS {
+			c.reservedPorts, createNetNSErr = c.bindPorts()
+			if createNetNSErr != nil {
+				return
+			}
 			ctrNS, networkStatus, createNetNSErr = c.runtime.createNetNS(c)
 			if createNetNSErr != nil {
 				return
@@ -113,6 +116,11 @@ func (c *Container) prepare() error {
 			logrus.Errorf("Preparing container %s: %v", c.ID(), createErr)
 			createErr = fmt.Errorf("cleaning up container %s network after setup failure: %w", c.ID(), err)
 		}
+		for _, f := range c.reservedPorts {
+			// make sure to close all ports again on errors
+			f.Close()
+		}
+		c.reservedPorts = nil
 		return createErr
 	}
 
@@ -138,15 +146,18 @@ func (c *Container) cleanupNetwork() error {
 	}
 
 	// Stop the container's network namespace (if it has one)
-	if err := c.runtime.teardownNetNS(c); err != nil {
-		logrus.Errorf("Unable to cleanup network for container %s: %q", c.ID(), err)
+	neterr := c.runtime.teardownNetNS(c)
+
+	// always save even when there was an error
+	err = c.save()
+	if err != nil {
+		if neterr != nil {
+			logrus.Errorf("Unable to clean up network for container %s: %q", c.ID(), neterr)
+		}
+		return err
 	}
 
-	if c.valid {
-		return c.save()
-	}
-
-	return nil
+	return neterr
 }
 
 // reloadNetwork reloads the network for the given container, recreating
@@ -194,15 +205,18 @@ func openDirectory(path string) (fd int, err error) {
 
 func (c *Container) addNetworkNamespace(g *generate.Generator) error {
 	if c.config.CreateNetNS {
-		if c.state.NetNS == "" {
-			// This should not happen since network setup
-			// errors should be propagated correctly from
-			// (*Runtime).createNetNS. Check for it anyway
-			// since it caused nil pointer dereferences in
-			// the past (see #16333).
-			return fmt.Errorf("Inconsistent state: c.config.CreateNetNS is set but c.state.NetNS is nil")
+		// If PostConfigureNetNS is set (which is true on FreeBSD 13.3
+		// and later), we can manage a container's network settings
+		// without an extra parent jail to own the vnew.
+		//
+		// In this case, the OCI runtime creates a new vnet for the
+		// container jail, otherwise it creates the container jail as a
+		// child of the jail owning the vnet.
+		if c.config.PostConfigureNetNS {
+			g.AddAnnotation("org.freebsd.jail.vnet", "new")
+		} else {
+			g.AddAnnotation("org.freebsd.parentJail", c.state.NetNS)
 		}
-		g.AddAnnotation("org.freebsd.parentJail", c.state.NetNS)
 	}
 	return nil
 }
@@ -252,7 +266,7 @@ func (c *Container) addSharedNamespaces(g *generate.Generator) error {
 	}
 	needEnv := true
 	for _, checkEnv := range g.Config.Process.Env {
-		if strings.SplitN(checkEnv, "=", 2)[0] == "HOSTNAME" {
+		if strings.HasPrefix(checkEnv, "HOSTNAME=") {
 			needEnv = false
 			break
 		}
@@ -277,7 +291,7 @@ func (c *Container) setCgroupsPath(g *generate.Generator) error {
 	return nil
 }
 
-func (c *Container) addSlirp4netnsDNS(nameservers []string) []string {
+func (c *Container) addSpecialDNS(nameservers []string) []string {
 	return nameservers
 }
 

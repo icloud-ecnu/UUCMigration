@@ -91,6 +91,38 @@ function setup() {
     assert "$output" =~ "Error: options for paths to the credential file and to the Docker-compatible credential file can not be set simultaneously"
 }
 
+@test "podman login - check with --config global option" {
+    dockerconfig=${PODMAN_LOGIN_WORKDIR}/docker
+    rm -rf $dockerconfig
+
+    registry=localhost:${PODMAN_LOGIN_REGISTRY_PORT}
+
+    run_podman --config $dockerconfig login \
+        --tls-verify=false \
+        --username ${PODMAN_LOGIN_USER} \
+        --password ${PODMAN_LOGIN_PASS} \
+        $registry
+
+    # Confirm that config file now exists
+    test -e $dockerconfig/config.json || \
+        die "podman login did not create config $dockerconfig/config.json"
+
+    # Special bracket form needed because of colon in host:port
+    run jq -r ".[\"auths\"][\"$registry\"][\"auth\"]" <$dockerconfig/config.json
+    is "$status" "0" "jq from $dockerconfig/config.json"
+
+    expect_userpass="${PODMAN_LOGIN_USER}:${PODMAN_LOGIN_PASS}"
+    actual_userpass=$(base64 -d <<<"$output")
+    is "$actual_userpass" "$expect_userpass" "credentials stored in $dockerconfig/config.json"
+
+    # Now log out and make sure credentials are removed
+    run_podman --config $dockerconfig logout $registry
+
+    run jq -r '.auths' <$dockerconfig/config.json
+    is "$status" "0" "jq from $dockerconfig/config.json"
+    is "$output" "{}" "credentials removed from $dockerconfig/config.json"
+}
+
 # Some push tests
 @test "podman push fail" {
 
@@ -117,9 +149,8 @@ EOF
 }
 
 function _push_search_test() {
-    # Preserve image ID for later comparison against push/pulled image
-    run_podman inspect --format '{{.Id}}' $IMAGE
-    iid=$output
+    # Look up image config digest for later comparison against push/pulled image
+    local img_config_digest; img_config_digest=$(image_config_digest $IMAGE)
 
     destname=ok-$(random_string 10 | tr A-Z a-z)-ok
     # Use command-line credentials
@@ -156,8 +187,8 @@ function _push_search_test() {
                localhost:${PODMAN_LOGIN_REGISTRY_PORT}/$destname
 
     # Compare to original image
-    run_podman inspect --format '{{.Id}}' $destname
-    is "$output" "$iid" "Image ID of pulled image == original IID"
+    local img_config_digest2; img_config_digest2=$(image_config_digest localhost:${PODMAN_LOGIN_REGISTRY_PORT}/$destname)
+    assert "$img_config_digest2" = "$img_config_digest" "config digest of pulled image == original digest"
 
     run_podman rmi $destname
 }
@@ -220,11 +251,6 @@ function _test_skopeo_credential_sharing() {
 }
 
 @test "podman login - shares credentials with skopeo - default auth file" {
-    if is_rootless; then
-        if [ -z "${XDG_RUNTIME_DIR}" ]; then
-            skip "skopeo does not match podman when XDG_RUNTIME_DIR unset; #823"
-        fi
-    fi
     _test_skopeo_credential_sharing
 }
 
@@ -293,6 +319,83 @@ function _test_skopeo_credential_sharing() {
 
     run_podman secret rm $secret
 
+}
+
+@test "podman pull images with retry" {
+    run_podman pull -q --retry 4 --retry-delay "10s" $IMAGE
+    run_podman 125 pull -q --retry 4 --retry-delay "bogus" $IMAGE
+    is "$output" 'Error: time: invalid duration "bogus"' "bad retry-delay"
+
+    skip_if_remote "running a local registry doesn't work with podman-remote"
+    start_registry
+    authfile=${PODMAN_LOGIN_WORKDIR}/auth-$(random_string 10).json
+    run_podman login --tls-verify=false \
+               --username ${PODMAN_LOGIN_USER} \
+               --password-stdin \
+               --authfile=$authfile \
+               localhost:${PODMAN_LOGIN_REGISTRY_PORT} <<<"${PODMAN_LOGIN_PASS}"
+    is "$output" "Login Succeeded!" "output from podman login"
+
+    image1="localhost:${PODMAN_LOGIN_REGISTRY_PORT}/test:1.0"
+
+    run_podman tag $IMAGE $image1
+    run_podman push --authfile=$authfile \
+        --tls-verify=false $mid \
+        $image1
+    run_podman rmi $image1
+
+    local podman_image_config_digest=$(image_config_digest $IMAGE)
+
+    run_podman pull -q --retry 4 --retry-delay "0s" --authfile=$authfile \
+        --tls-verify=false $image1
+    local pulled_image_config_digest; pulled_image_config_digest=$(image_config_digest @$output)
+    assert "$pulled_image_config_digest" = "$podman_image_config_digest" "First pull (before stopping registry)"
+    run_podman rmi $image1
+
+    # This actually STOPs the registry, so the port is unbound...
+    pause_registry
+    # ...then, in eight seconds, we start it again
+    (sleep 8; unpause_registry) &
+    run_podman 0+w pull -q --retry 4 --retry-delay "5s" --authfile=$authfile \
+            --tls-verify=false $image1
+    assert "$output" =~ "Failed, retrying in 5s.*Error: initializing.* connection refused"
+    local pulled_image_config_digest2; pulled_image_config_digest2=$(image_config_digest "@${lines[-1]}")
+    assert "$pulled_image_config_digest2" = "$podman_image_config_digest" "push should succeed via retry"
+    unpause_registry
+
+    run_podman rmi $image1
+}
+
+@test "podman containers.conf retry" {
+    skip_if_remote "containers.conf settings not set for remote connections"
+    run_podman pull --help
+    assert "$output" =~ "--retry .*performing pull \(default 3\)"
+
+    run_podman push --help
+    assert "$output" =~ "--retry .*performing push \(default 3\)"
+
+    containersConf=$PODMAN_TMPDIR/containers.conf
+    cat >$containersConf <<EOF
+[engine]
+retry=10
+retry_delay="5s"
+EOF
+
+    CONTAINERS_CONF="$containersConf" run_podman pull --help
+    assert "$output" =~ "--retry .*performing pull \(default 10\)"
+    assert "$output" =~ "--retry-delay .*pull failures \(default \"5s\"\)"
+
+    CONTAINERS_CONF="$containersConf" run_podman push --help
+    assert "$output" =~ "--retry .*performing push \(default 10\)"
+    assert "$output" =~ "--retry-delay .*push failures \(default \"5s\"\)"
+
+    CONTAINERS_CONF="$containersConf" run_podman create --help
+    assert "$output" =~ "--retry .*performing pull \(default 10\)"
+    assert "$output" =~ "--retry-delay .*pull failures \(default \"5s\"\)"
+
+    CONTAINERS_CONF="$containersConf" run_podman run --help
+    assert "$output" =~ "--retry .*performing pull \(default 10\)"
+    assert "$output" =~ "--retry-delay .*pull failures \(default \"5s\"\)"
 }
 
 # END   cooperation with skopeo

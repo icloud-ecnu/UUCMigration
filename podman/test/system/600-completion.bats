@@ -168,10 +168,10 @@ function check_shell_completion() {
 
                 *REGISTRY*)
                     run_completion "$@" $cmd "${extra_args[@]}" ""
-                    ### FIXME how can we get the configured registries?
                     _check_completion_end NoFileComp
-                    ### FIXME this fails if no registries are configured
                     assert "${#lines[@]}" -gt 2 "$* $cmd: No REGISTRIES found in suggestions"
+                    # We can assume quay.io as we force our own CONTAINERS_REGISTRIES_CONF below.
+                    assert "${lines[0]}" == "quay.io" "unqualified-search-registries from registries.conf listed"
 
                     match=true
                     # resume
@@ -213,8 +213,8 @@ function check_shell_completion() {
 
                 i=$(($i + 1))
                 # If the argument ends with ...] than we accept 0...n args
-                # Loop three times to make sure we are not only completing the first arg
-                if [[ ! ${arg} =~ "..." ]] || [[ i -gt 3 ]]; then
+                # Loop two times to make sure we are not only completing the first arg
+                if [[ ! ${arg} =~ "..." ]] || [[ i -gt 1 ]]; then
                     break
                 fi
 
@@ -262,16 +262,17 @@ function _check_no_suggestions() {
 }
 
 
+# bats test_tags=ci:parallel
 @test "podman shell completion test" {
 
-    random_container_name=$(random_string 30)
-    random_pod_name=$(random_string 30)
-    random_image_name=$(random_string 30)
-    random_image_name=${random_image_name,,} # name must be lowercase
+    random_container_name="c-$(safename)"
+    random_pod_name="p-$(safename)"
+    random_image_name="i-$(safename)"
     random_image_tag=$(random_string 5)
-    random_network_name=$(random_string 30)
-    random_volume_name=$(random_string 30)
-    random_secret_name=$(random_string 30)
+    random_network_name="n-$(safename)"
+    # Do not change the suffix, it is special debug for #23913
+    random_volume_name="v-$(safename)-ebpf-debug-23913"
+    random_secret_name="s-$(safename)"
     random_secret_content=$(random_string 30)
     secret_file=$PODMAN_TMPDIR/$(random_string 10)
 
@@ -309,6 +310,11 @@ function _check_no_suggestions() {
 
     # create secret
     run_podman secret create $random_secret_name $secret_file
+
+    # create our own registries.conf so we know what registry is set
+    local CONTAINERS_REGISTRIES_CONF="$PODMAN_TMPDIR/registries.conf"
+    echo 'unqualified-search-registries = ["quay.io"]' > "$CONTAINERS_REGISTRIES_CONF"
+    export CONTAINERS_REGISTRIES_CONF
 
     # Called with no args -- start with 'podman --help'. check_shell_completion() will
     # recurse for any subcommands.
@@ -350,17 +356,9 @@ function _check_no_suggestions() {
     for state in created running pause exited; do
         run_podman rm --force $state-$random_container_name
     done
-
-    # Clean up the pod pause image
-    run_podman image list --format '{{.ID}} {{.Repository}}'
-    while read id name; do
-        if [[ "$name" =~ /podman-pause ]]; then
-            run_podman rmi $id
-        fi
-    done <<<"$output"
-
 }
 
+# bats test_tags=ci:parallel
 @test "podman shell completion for paths in container/image" {
     skip_if_remote "mounting via remote does not work"
     for cmd in create run; do
@@ -389,27 +387,27 @@ function _check_no_suggestions() {
         assert "$output" =~ ".*^../../home/\$.*" "relative home directory suggested (cmd: podman $cmd ../../)"
     done
 
-    random_name=$(random_string 30)
+    ctrname="c-$(safename)"
     random_file=$(random_string 30)
-    run_podman run --name $random_name $IMAGE sh -c "touch /tmp/$random_file && touch /tmp/${random_file}2 && mkdir /emptydir"
+    run_podman run --name $ctrname $IMAGE sh -c "touch /tmp/$random_file && touch /tmp/${random_file}2 && mkdir /emptydir"
 
     # check completion for podman cp
     run_completion cp ""
-    assert "$output" =~ ".*^$random_name\:\$.*" "podman cp suggest container names"
+    assert "$output" =~ ".*^$ctrname\:\$.*" "podman cp suggest container names"
 
-    run_completion cp "$random_name:"
-    assert "$output" =~ ".*^$random_name\:/etc/\$.*" "podman cp suggest paths in container"
+    run_completion cp "$ctrname:"
+    assert "$output" =~ ".*^$ctrname\:/etc/\$.*" "podman cp suggest paths in container"
 
-    run_completion cp "$random_name:/tmp"
-    assert "$output" =~ ".*^$random_name\:/tmp/$random_file\$.*" "podman cp suggest custom file in container"
+    run_completion cp "$ctrname:/tmp"
+    assert "$output" =~ ".*^$ctrname\:/tmp/$random_file\$.*" "podman cp suggest custom file in container"
 
-    run_completion cp "$random_name:/tmp/$random_file"
-    assert "$output" =~ ".*^$random_name\:/tmp/$random_file\$.*" "podman cp suggest /tmp/$random_file file in container"
-    assert "$output" =~ ".*^$random_name\:/tmp/${random_file}2\$.*" "podman cp suggest /tmp/${random_file}2 file in container"
+    run_completion cp "$ctrname:/tmp/$random_file"
+    assert "$output" =~ ".*^$ctrname\:/tmp/$random_file\$.*" "podman cp suggest /tmp/$random_file file in container"
+    assert "$output" =~ ".*^$ctrname\:/tmp/${random_file}2\$.*" "podman cp suggest /tmp/${random_file}2 file in container"
 
-    run_completion cp "$random_name:/emptydir"
-    assert "$output" =~ ".*^$random_name\:/emptydir/\$.*ShellCompDirectiveNoSpace" "podman cp suggest empty dir with no space directive (:2)"
+    run_completion cp "$ctrname:/emptydir"
+    assert "$output" =~ ".*^$ctrname\:/emptydir/\$.*ShellCompDirectiveNoSpace" "podman cp suggest empty dir with no space directive (:2)"
 
     # cleanup container
-    run_podman rm $random_name
+    run_podman rm $ctrname
 }

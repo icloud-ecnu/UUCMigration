@@ -505,6 +505,17 @@ void join_namespaces(char *nslist)
 		if (setns(ns->fd, flag) < 0)
 			bail("failed to setns into %s namespace", ns->type);
 
+		/*
+		 * If we change user namespaces, make sure we switch to root in the
+		 * namespace (this matches the logic for unshare(CLONE_NEWUSER)), lots
+		 * of things can break if we aren't the right user. See
+		 * <https://github.com/opencontainers/runc/issues/4466> for one example.
+		 */
+		if (flag == CLONE_NEWUSER) {
+			if (setresuid(0, 0, 0) < 0)
+				bail("failed to become root in user namespace");
+		}
+
 		close(ns->fd);
 	}
 
@@ -570,13 +581,6 @@ void nsexec(void)
 		/* We are not a runc init. Just return to go runtime. */
 		return;
 	}
-
-	/*
-	 * Inform the parent we're past initial setup.
-	 * For the other side of this, see initWaiter.
-	 */
-	if (write(pipenum, "", 1) != 1)
-		bail("could not inform the parent we are past initial setup");
 
 	write_log(DEBUG, "=> nsexec container setup");
 
@@ -902,7 +906,7 @@ void nsexec(void)
 					bail("failed to sync with parent: write(SYNC_USERMAP_PLS)");
 
 				/* ... wait for mapping ... */
-				write_log(DEBUG, "request stage-0 to map user namespace");
+				write_log(DEBUG, "waiting stage-0 to complete the mapping of user namespace");
 				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
 					bail("failed to sync with parent: read(SYNC_USERMAP_ACK)");
 				if (s != SYNC_USERMAP_ACK)

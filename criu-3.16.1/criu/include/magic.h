@@ -29,7 +29,7 @@
 
 /*
  * The magic-s below correspond to coordinates
- * of various Russian towns in the NNNNEEEE form.
+ * of various towns in the NNNNEEEE form.
  */
 
 #define INVENTORY_MAGIC	     0x58313116 /* Veliky Novgorod */
@@ -100,6 +100,7 @@
 #define BPFMAP_FILE_MAGIC    0x57506142 /* Alapayevsk */
 #define BPFMAP_DATA_MAGIC    0x64324033 /* Arkhangelsk */
 #define APPARMOR_MAGIC	     0x59423047 /* Nikolskoye */
+#define PIDFD_MAGIC	     0x54435556 /* Ufa */
 
 #define IFADDR_MAGIC	RAW_IMAGE_MAGIC
 #define ROUTE_MAGIC	RAW_IMAGE_MAGIC

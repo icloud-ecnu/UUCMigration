@@ -2,6 +2,7 @@ package volumes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -9,8 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"errors"
-
+	"github.com/containers/buildah/copier"
 	"github.com/containers/buildah/define"
 	"github.com/containers/buildah/internal"
 	internalParse "github.com/containers/buildah/internal/parse"
@@ -22,6 +22,7 @@ import (
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/lockfile"
 	"github.com/containers/storage/pkg/unshare"
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	selinux "github.com/opencontainers/selinux/go-selinux"
 )
@@ -54,6 +55,7 @@ func CacheParent() string {
 	return filepath.Join(tmpdir.GetTempDir(), buildahCacheDir+"-"+strconv.Itoa(unshare.GetRootlessUID()))
 }
 
+// FIXME: this code needs to be merged with pkg/parse/parse.go ValidateVolumeOpts
 // GetBindMount parses a single bind mount entry from the --mount flag.
 // Returns specifiedMount and a string which contains name of image that we mounted otherwise its empty.
 // Caller is expected to perform unmount of any mounted images
@@ -69,8 +71,8 @@ func GetBindMount(ctx *types.SystemContext, args []string, contextDir string, st
 	fromImage := ""
 
 	for _, val := range args {
-		kv := strings.SplitN(val, "=", 2)
-		switch kv[0] {
+		argName, argValue, hasArgValue := strings.Cut(val, "=")
+		switch argName {
 		case "type":
 			// This is already processed
 			continue
@@ -80,7 +82,7 @@ func GetBindMount(ctx *types.SystemContext, args []string, contextDir string, st
 		case "ro", "nosuid", "nodev", "noexec":
 			// TODO: detect duplication of these options.
 			// (Is this necessary?)
-			newMount.Options = append(newMount.Options, kv[0])
+			newMount.Options = append(newMount.Options, argName)
 			mountReadability = true
 		case "rw", "readwrite":
 			newMount.Options = append(newMount.Options, "rw")
@@ -89,28 +91,37 @@ func GetBindMount(ctx *types.SystemContext, args []string, contextDir string, st
 			// Alias for "ro"
 			newMount.Options = append(newMount.Options, "ro")
 			mountReadability = true
-		case "shared", "rshared", "private", "rprivate", "slave", "rslave", "Z", "z", "U":
-			newMount.Options = append(newMount.Options, kv[0])
+		case "shared", "rshared", "private", "rprivate", "slave", "rslave", "Z", "z", "U", "no-dereference":
+			if hasArgValue {
+				return newMount, "", fmt.Errorf("%v: %w", val, errBadOptionArg)
+			}
+			newMount.Options = append(newMount.Options, argName)
 		case "from":
-			if len(kv) == 1 {
-				return newMount, "", fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, "", fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			fromImage = kv[1]
+			fromImage = argValue
 		case "bind-propagation":
-			if len(kv) == 1 {
-				return newMount, "", fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, "", fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			newMount.Options = append(newMount.Options, kv[1])
+			switch argValue {
+			default:
+				return newMount, "", fmt.Errorf("%v: %q: %w", argName, argValue, errBadMntOption)
+			case "shared", "rshared", "private", "rprivate", "slave", "rslave":
+				// this should be the relevant parts of the same list of options we accepted above
+			}
+			newMount.Options = append(newMount.Options, argValue)
 		case "src", "source":
-			if len(kv) == 1 {
-				return newMount, "", fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, "", fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			newMount.Source = kv[1]
+			newMount.Source = argValue
 		case "target", "dst", "destination":
-			if len(kv) == 1 {
-				return newMount, "", fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, "", fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			targetPath := kv[1]
+			targetPath := argValue
 			if !path.IsAbs(targetPath) {
 				targetPath = filepath.Join(workDir, targetPath)
 			}
@@ -124,23 +135,20 @@ func GetBindMount(ctx *types.SystemContext, args []string, contextDir string, st
 				return newMount, "", fmt.Errorf("cannot pass 'relabel' option more than once: %w", errBadOptionArg)
 			}
 			setRelabel = true
-			if len(kv) != 2 {
-				return newMount, "", fmt.Errorf("%s mount option must be 'private' or 'shared': %w", kv[0], errBadMntOption)
-			}
-			switch kv[1] {
+			switch argValue {
 			case "private":
 				newMount.Options = append(newMount.Options, "Z")
 			case "shared":
 				newMount.Options = append(newMount.Options, "z")
 			default:
-				return newMount, "", fmt.Errorf("%s mount option must be 'private' or 'shared': %w", kv[0], errBadMntOption)
+				return newMount, "", fmt.Errorf("%s mount option must be 'private' or 'shared': %w", argName, errBadMntOption)
 			}
 		case "consistency":
 			// Option for OS X only, has no meaning on other platforms
 			// and can thus be safely ignored.
 			// See also the handling of the equivalent "delegated" and "cached" in ValidateVolumeOpts
 		default:
-			return newMount, "", fmt.Errorf("%v: %w", kv[0], errBadMntOption)
+			return newMount, "", fmt.Errorf("%v: %w", argName, errBadMntOption)
 		}
 	}
 
@@ -188,7 +196,11 @@ func GetBindMount(ctx *types.SystemContext, args []string, contextDir string, st
 	// buildkit parity: support absolute path for sources from current build context
 	if contextDir != "" {
 		// path should be /contextDir/specified path
-		newMount.Source = filepath.Join(contextDir, filepath.Clean(string(filepath.Separator)+newMount.Source))
+		evaluated, err := copier.Eval(contextDir, newMount.Source, copier.EvalOptions{})
+		if err != nil {
+			return newMount, "", err
+		}
+		newMount.Source = evaluated
 	} else {
 		// looks like its coming from `build run --mount=type=bind` allow using absolute path
 		// error out if no source is set
@@ -218,7 +230,7 @@ func GetBindMount(ctx *types.SystemContext, args []string, contextDir string, st
 // GetCacheMount parses a single cache mount entry from the --mount flag.
 //
 // If this function succeeds and returns a non-nil *lockfile.LockFile, the caller must unlock it (when??).
-func GetCacheMount(args []string, store storage.Store, imageMountLabel string, additionalMountPoints map[string]internal.StageMountDetails, workDir string) (specs.Mount, *lockfile.LockFile, error) {
+func GetCacheMount(args []string, _ storage.Store, _ string, additionalMountPoints map[string]internal.StageMountDetails, workDir string) (specs.Mount, *lockfile.LockFile, error) {
 	var err error
 	var mode uint64
 	var buildahLockFilesDir string
@@ -234,25 +246,25 @@ func GetCacheMount(args []string, store storage.Store, imageMountLabel string, a
 	}
 	// if id is set a new subdirectory with `id` will be created under /host-temp/buildah-build-cache/id
 	id := ""
-	//buidkit parity: cache directory defaults to 755
+	// buildkit parity: cache directory defaults to 0o755
 	mode = 0o755
-	//buidkit parity: cache directory defaults to uid 0 if not specified
+	// buildkit parity: cache directory defaults to uid 0 if not specified
 	uid := 0
-	//buidkit parity: cache directory defaults to gid 0 if not specified
+	// buildkit parity: cache directory defaults to gid 0 if not specified
 	gid := 0
 	// sharing mode
 	sharing := "shared"
 
 	for _, val := range args {
-		kv := strings.SplitN(val, "=", 2)
-		switch kv[0] {
+		argName, argValue, hasArgValue := strings.Cut(val, "=")
+		switch argName {
 		case "type":
 			// This is already processed
 			continue
 		case "nosuid", "nodev", "noexec":
 			// TODO: detect duplication of these options.
 			// (Is this necessary?)
-			newMount.Options = append(newMount.Options, kv[0])
+			newMount.Options = append(newMount.Options, argName)
 		case "rw", "readwrite":
 			newMount.Options = append(newMount.Options, "rw")
 		case "readonly", "ro":
@@ -260,33 +272,39 @@ func GetCacheMount(args []string, store storage.Store, imageMountLabel string, a
 			newMount.Options = append(newMount.Options, "ro")
 			setReadOnly = true
 		case "Z", "z":
-			newMount.Options = append(newMount.Options, kv[0])
+			newMount.Options = append(newMount.Options, argName)
 			foundSElinuxLabel = true
 		case "shared", "rshared", "private", "rprivate", "slave", "rslave", "U":
-			newMount.Options = append(newMount.Options, kv[0])
+			newMount.Options = append(newMount.Options, argName)
 			setShared = true
 		case "sharing":
-			sharing = kv[1]
+			sharing = argValue
 		case "bind-propagation":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			newMount.Options = append(newMount.Options, kv[1])
+			switch argValue {
+			default:
+				return newMount, nil, fmt.Errorf("%v: %q: %w", argName, argValue, errBadMntOption)
+			case "shared", "rshared", "private", "rprivate", "slave", "rslave":
+				// this should be the relevant parts of the same list of options we accepted above
+			}
+			newMount.Options = append(newMount.Options, argValue)
 		case "id":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			id = kv[1]
+			id = argValue
 		case "from":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			fromStage = kv[1]
+			fromStage = argValue
 		case "target", "dst", "destination":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			targetPath := kv[1]
+			targetPath := argValue
 			if !path.IsAbs(targetPath) {
 				targetPath = filepath.Join(workDir, targetPath)
 			}
@@ -296,36 +314,36 @@ func GetCacheMount(args []string, store storage.Store, imageMountLabel string, a
 			newMount.Destination = targetPath
 			setDest = true
 		case "src", "source":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			newMount.Source = kv[1]
+			newMount.Source = argValue
 		case "mode":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			mode, err = strconv.ParseUint(kv[1], 8, 32)
+			mode, err = strconv.ParseUint(argValue, 8, 32)
 			if err != nil {
 				return newMount, nil, fmt.Errorf("unable to parse cache mode: %w", err)
 			}
 		case "uid":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			uid, err = strconv.Atoi(kv[1])
+			uid, err = strconv.Atoi(argValue)
 			if err != nil {
 				return newMount, nil, fmt.Errorf("unable to parse cache uid: %w", err)
 			}
 		case "gid":
-			if len(kv) == 1 {
-				return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, nil, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			gid, err = strconv.Atoi(kv[1])
+			gid, err = strconv.Atoi(argValue)
 			if err != nil {
 				return newMount, nil, fmt.Errorf("unable to parse cache gid: %w", err)
 			}
 		default:
-			return newMount, nil, fmt.Errorf("%v: %w", kv[0], errBadMntOption)
+			return newMount, nil, fmt.Errorf("%v: %w", argName, errBadMntOption)
 		}
 	}
 
@@ -340,8 +358,9 @@ func GetCacheMount(args []string, store storage.Store, imageMountLabel string, a
 	}
 
 	if fromStage != "" {
-		// do not create cache on host
-		// instead use read-only mounted stage as cache
+		// do not create and use a cache directory on the host,
+		// instead use the location in the mounted stage or
+		// temporary directory as the cache
 		mountPoint := ""
 		if additionalMountPoints != nil {
 			if val, ok := additionalMountPoints[fromStage]; ok {
@@ -350,40 +369,48 @@ func GetCacheMount(args []string, store storage.Store, imageMountLabel string, a
 				}
 			}
 		}
-		// Cache does not supports using image so if not stage found
-		// return with error
+		// Cache does not support using an image so if there's no such
+		// stage or temporary directory, return an error
 		if mountPoint == "" {
 			return newMount, nil, fmt.Errorf("no stage found with name %s", fromStage)
 		}
 		// path should be /contextDir/specified path
-		newMount.Source = filepath.Join(mountPoint, filepath.Clean(string(filepath.Separator)+newMount.Source))
+		evaluated, err := copier.Eval(mountPoint, string(filepath.Separator)+newMount.Source, copier.EvalOptions{})
+		if err != nil {
+			return newMount, nil, err
+		}
+		newMount.Source = evaluated
 	} else {
-		// we need to create cache on host if no image is being used
+		// we need to create the cache directory on the host if no image is being used
 
-		// since type is cache and cache can be reused by consecutive builds
+		// since type is cache and a cache can be reused by consecutive builds
 		// create a common cache directory, which persists on hosts within temp lifecycle
 		// add subdirectory if specified
 
 		// cache parent directory: creates separate cache parent for each user.
 		cacheParent := CacheParent()
 		// create cache on host if not present
-		err = os.MkdirAll(cacheParent, os.FileMode(0755))
+		err = os.MkdirAll(cacheParent, os.FileMode(0o755))
 		if err != nil {
 			return newMount, nil, fmt.Errorf("unable to create build cache directory: %w", err)
 		}
 
 		if id != "" {
-			newMount.Source = filepath.Join(cacheParent, filepath.Clean(id))
-			buildahLockFilesDir = filepath.Join(BuildahCacheLockfileDir, filepath.Clean(id))
+			// Don't let the user control where we place the directory.
+			dirID := digest.FromString(id).Encoded()[:16]
+			newMount.Source = filepath.Join(cacheParent, dirID)
+			buildahLockFilesDir = filepath.Join(BuildahCacheLockfileDir, dirID)
 		} else {
-			newMount.Source = filepath.Join(cacheParent, filepath.Clean(newMount.Destination))
-			buildahLockFilesDir = filepath.Join(BuildahCacheLockfileDir, filepath.Clean(newMount.Destination))
+			// Don't let the user control where we place the directory.
+			dirID := digest.FromString(newMount.Destination).Encoded()[:16]
+			newMount.Source = filepath.Join(cacheParent, dirID)
+			buildahLockFilesDir = filepath.Join(BuildahCacheLockfileDir, dirID)
 		}
 		idPair := idtools.IDPair{
 			UID: uid,
 			GID: gid,
 		}
-		//buildkit parity: change uid and gid if specified otheriwise keep `0`
+		// buildkit parity: change uid and gid if specified, otherwise keep `0`
 		err = idtools.MkdirAllAndChownNew(newMount.Source, os.FileMode(mode), idPair)
 		if err != nil {
 			return newMount, nil, fmt.Errorf("unable to change uid,gid of cache directory: %w", err)
@@ -391,7 +418,7 @@ func GetCacheMount(args []string, store storage.Store, imageMountLabel string, a
 
 		// create a subdirectory inside `cacheParent` just to store lockfiles
 		buildahLockFilesDir = filepath.Join(cacheParent, buildahLockFilesDir)
-		err = os.MkdirAll(buildahLockFilesDir, os.FileMode(0700))
+		err = os.MkdirAll(buildahLockFilesDir, os.FileMode(0o700))
 		if err != nil {
 			return newMount, nil, fmt.Errorf("unable to create build cache lockfiles directory: %w", err)
 		}
@@ -504,6 +531,7 @@ func GetVolumes(ctx *types.SystemContext, store storage.Store, volumes []string,
 // getMounts takes user-provided input from the --mount flag and creates OCI
 // spec mounts.
 // buildah run --mount type=bind,src=/etc/resolv.conf,target=/etc/resolv.conf ...
+// buildah run --mount type=cache,target=/var/cache ...
 // buildah run --mount type=tmpfs,target=/dev/shm ...
 //
 // If this function succeeds, the caller must unlock the returned *lockfile.LockFile s if any (when??).
@@ -563,7 +591,7 @@ func getMounts(ctx *types.SystemContext, store storage.Store, mounts []string, c
 			}
 			finalMounts[mount.Destination] = mount
 		case TypeTmpfs:
-			mount, err := GetTmpfsMount(tokens)
+			mount, err := GetTmpfsMount(tokens, workDir)
 			if err != nil {
 				return nil, mountedImages, nil, err
 			}
@@ -581,7 +609,7 @@ func getMounts(ctx *types.SystemContext, store storage.Store, mounts []string, c
 }
 
 // GetTmpfsMount parses a single tmpfs mount entry from the --mount flag
-func GetTmpfsMount(args []string) (specs.Mount, error) {
+func GetTmpfsMount(args []string, workDir string) (specs.Mount, error) {
 	newMount := specs.Mount{
 		Type:   TypeTmpfs,
 		Source: TypeTmpfs,
@@ -590,42 +618,46 @@ func GetTmpfsMount(args []string) (specs.Mount, error) {
 	setDest := false
 
 	for _, val := range args {
-		kv := strings.SplitN(val, "=", 2)
-		switch kv[0] {
+		argName, argValue, hasArgValue := strings.Cut(val, "=")
+		switch argName {
 		case "type":
 			// This is already processed
 			continue
 		case "ro", "nosuid", "nodev", "noexec":
-			newMount.Options = append(newMount.Options, kv[0])
+			newMount.Options = append(newMount.Options, argName)
 		case "readonly":
 			// Alias for "ro"
 			newMount.Options = append(newMount.Options, "ro")
 		case "tmpcopyup":
-			//the path that is shadowed by the tmpfs mount is recursively copied up to the tmpfs itself.
-			newMount.Options = append(newMount.Options, kv[0])
+			// the path that is shadowed by the tmpfs mount is recursively copied up to the tmpfs itself.
+			newMount.Options = append(newMount.Options, argName)
 		case "tmpfs-mode":
-			if len(kv) == 1 {
-				return newMount, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			newMount.Options = append(newMount.Options, fmt.Sprintf("mode=%s", kv[1]))
+			newMount.Options = append(newMount.Options, fmt.Sprintf("mode=%s", argValue))
 		case "tmpfs-size":
-			if len(kv) == 1 {
-				return newMount, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			newMount.Options = append(newMount.Options, fmt.Sprintf("size=%s", kv[1]))
+			newMount.Options = append(newMount.Options, fmt.Sprintf("size=%s", argValue))
 		case "src", "source":
 			return newMount, errors.New("source is not supported with tmpfs mounts")
 		case "target", "dst", "destination":
-			if len(kv) == 1 {
-				return newMount, fmt.Errorf("%v: %w", kv[0], errBadOptionArg)
+			if !hasArgValue {
+				return newMount, fmt.Errorf("%v: %w", argName, errBadOptionArg)
 			}
-			if err := parse.ValidateVolumeCtrDir(kv[1]); err != nil {
+			targetPath := argValue
+			if !path.IsAbs(targetPath) {
+				targetPath = filepath.Join(workDir, targetPath)
+			}
+			if err := parse.ValidateVolumeCtrDir(targetPath); err != nil {
 				return newMount, err
 			}
-			newMount.Destination = kv[1]
+			newMount.Destination = targetPath
 			setDest = true
 		default:
-			return newMount, fmt.Errorf("%v: %w", kv[0], errBadMntOption)
+			return newMount, fmt.Errorf("%v: %w", argName, errBadMntOption)
 		}
 	}
 

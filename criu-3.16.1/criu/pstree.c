@@ -222,6 +222,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	item->pid->ns[0].virt = -1;
 	item->pid->real = -1;
 	item->pid->state = TASK_UNDEF;
+	item->pid->stop_signo = -1;
 	item->born_sid = -1;
 	item->pid->item = item;
 	futex_init(&item->task_st);
@@ -380,17 +381,26 @@ static int prepare_pstree_for_shell_job(pid_t pid)
 		}
 
 		for_each_pstree_item(pi) {
+			if (pi->sid == current_sid) {
+				pr_err("Current sid %d intersects with sid of (%d) in images\n", current_sid, vpid(pi));
+				return -1;
+			}
 			if (pi->sid == old_sid)
 				pi->sid = current_sid;
-		}
 
-		if (lookup_create_item(current_sid) == NULL)
-			return -1;
+			if (pi->pgid == current_sid) {
+				pr_err("Current sid %d intersects with pgid of (%d) in images\n", current_sid,
+				       vpid(pi));
+				return -1;
+			}
+			if (pi->pgid == old_sid)
+				pi->pgid = current_sid;
+		}
 	}
 
 	/* root_item is a group leader */
 	if (root_item->pgid == vpid(root_item))
-		return 0;
+		goto add_fake_session_leader;
 
 	old_gid = root_item->pgid;
 	if (old_gid != current_gid) {
@@ -403,14 +413,21 @@ static int prepare_pstree_for_shell_job(pid_t pid)
 		}
 
 		for_each_pstree_item(pi) {
+			if (current_gid != current_sid && pi->pgid == current_gid) {
+				pr_err("Current gid %d intersects with pgid of (%d) in images\n", current_gid,
+				       vpid(pi));
+				return -1;
+			}
 			if (pi->pgid == old_gid)
 				pi->pgid = current_gid;
 		}
-
-		if (lookup_create_item(current_gid) == NULL)
-			return -1;
 	}
 
+	if (old_gid != current_gid && !lookup_create_item(current_gid))
+		return -1;
+add_fake_session_leader:
+	if (old_sid != current_sid && !lookup_create_item(current_sid))
+		return -1;
 	return 0;
 }
 
@@ -864,7 +881,7 @@ static int prepare_pstree_kobj_ids(void)
 		if (!item->ids) {
 			if (item == root_item) {
 				pr_err("No IDS for root task.\n");
-				pr_err("Images currupted or too old criu was used for dump.\n");
+				pr_err("Images corrupted or too old criu was used for dump.\n");
 				return -1;
 			}
 
@@ -951,6 +968,31 @@ static int prepare_pstree_kobj_ids(void)
 	return 0;
 }
 
+static int prepare_pstree_rseqs(void)
+{
+	struct pstree_item *item;
+
+	for_each_pstree_item(item) {
+		struct rst_rseq *rseqs;
+		size_t sz = sizeof(*rseqs) * item->nr_threads;
+
+		if (!task_alive(item))
+			continue;
+
+		rseqs = shmalloc(sz);
+		if (!rseqs) {
+			pr_err("prepare_pstree_rseqs shmalloc(%lu) failed\n", (unsigned long)sz);
+			return -1;
+		}
+
+		memset(rseqs, 0, sz);
+
+		rsti(item)->rseqe = rseqs;
+	}
+
+	return 0;
+}
+
 int prepare_pstree(void)
 {
 	int ret;
@@ -1008,6 +1050,17 @@ int prepare_pstree(void)
 		 * pstree with properly injected helper tasks.
 		 */
 		ret = prepare_pstree_ids(pid);
+	if (!ret)
+		/*
+		 * We need to alloc shared buffers for RseqEntry'es
+		 * arrays (one RseqEntry per pstree item thread).
+		 *
+		 * We need shared memory because we perform
+		 * open_core() on the late stage inside
+		 * restore_one_alive_task(), so that's the only
+		 * way to transfer that data to the main CRIU process.
+		 */
+		ret = prepare_pstree_rseqs();
 
 	return ret;
 }

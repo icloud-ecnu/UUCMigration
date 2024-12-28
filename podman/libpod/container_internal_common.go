@@ -1,6 +1,4 @@
 //go:build !remote && (linux || freebsd)
-// +build !remote
-// +build linux freebsd
 
 package libpod
 
@@ -9,14 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
+	"net"
 	"os"
+	"os/exec"
 	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,23 +37,25 @@ import (
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/common/pkg/subscriptions"
 	"github.com/containers/common/pkg/umask"
-	cutil "github.com/containers/common/pkg/util"
 	is "github.com/containers/image/v5/storage"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/pkg/annotations"
-	"github.com/containers/podman/v4/pkg/checkpoint/crutils"
-	"github.com/containers/podman/v4/pkg/criu"
-	"github.com/containers/podman/v4/pkg/lookup"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/util"
-	"github.com/containers/podman/v4/version"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/annotations"
+	"github.com/containers/podman/v5/pkg/checkpoint/crutils"
+	"github.com/containers/podman/v5/pkg/criu"
+	"github.com/containers/podman/v5/pkg/lookup"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/util"
+	"github.com/containers/podman/v5/version"
 	"github.com/containers/storage/pkg/archive"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/lockfile"
+	"github.com/containers/storage/pkg/unshare"
 	stypes "github.com/containers/storage/types"
 	securejoin "github.com/cyphar/filepath-securejoin"
-	runcuser "github.com/opencontainers/runc/libcontainer/user"
+	"github.com/moby/sys/capability"
+	runcuser "github.com/moby/sys/user"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -86,7 +91,7 @@ func parseOptionIDs(ctrMappings []idtools.IDMap, option string) ([]idtools.IDMap
 		if relative {
 			found := false
 			for _, m := range ctrMappings {
-				if v.ContainerID >= m.ContainerID && v.ContainerID < m.ContainerID+m.Size {
+				if v.HostID >= m.ContainerID && v.HostID < m.ContainerID+m.Size {
 					v.HostID += m.HostID - m.ContainerID
 					found = true
 					break
@@ -175,6 +180,18 @@ func getOverlayUpperAndWorkDir(options []string) (string, string, error) {
 	return upperDir, workDir, nil
 }
 
+// hasCapSysResource returns whether the current process has CAP_SYS_RESOURCE.
+var hasCapSysResource = sync.OnceValues(func() (bool, error) {
+	currentCaps, err := capability.NewPid2(0)
+	if err != nil {
+		return false, err
+	}
+	if err = currentCaps.Load(); err != nil {
+		return false, err
+	}
+	return currentCaps.Get(capability.EFFECTIVE, capability.CAP_SYS_RESOURCE), nil
+})
+
 // Generate spec for a container
 // Accepts a map of the container's dependencies
 func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFuncRet func(), err error) {
@@ -195,7 +212,7 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 	overrides := c.getUserOverrides()
 	execUser, err := lookup.GetUserGroupInfo(c.state.Mountpoint, c.config.User, overrides)
 	if err != nil {
-		if cutil.StringInSlice(c.config.User, c.config.HostUsers) {
+		if slices.Contains(c.config.HostUsers, c.config.User) {
 			execUser, err = lookupHostUser(c.config.User)
 		}
 		if err != nil {
@@ -366,7 +383,11 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 				if err := c.relabel(m.Source, c.MountLabel(), label.IsShared(o)); err != nil {
 					return nil, nil, err
 				}
-
+			case "no-dereference":
+				// crun calls the option `copy-symlink`.
+				// Podman decided for --no-dereference as many
+				// bin-utils tools (e..g, touch, chown, cp) do.
+				options = append(options, "copy-symlink")
 			default:
 				options = append(options, o)
 			}
@@ -453,11 +474,23 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 			return nil, nil, fmt.Errorf("failed to create TempDir in the %s directory: %w", c.config.StaticDir, err)
 		}
 
+		imagePath := mountPoint
+		if volume.SubPath != "" {
+			safeMount, err := c.safeMountSubPath(mountPoint, volume.SubPath)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			safeMounts = append(safeMounts, safeMount)
+
+			imagePath = safeMount.mountPoint
+		}
+
 		var overlayMount spec.Mount
 		if volume.ReadWrite {
-			overlayMount, err = overlay.Mount(contentDir, mountPoint, volume.Dest, c.RootUID(), c.RootGID(), c.runtime.store.GraphOptions())
+			overlayMount, err = overlay.Mount(contentDir, imagePath, volume.Dest, c.RootUID(), c.RootGID(), c.runtime.store.GraphOptions())
 		} else {
-			overlayMount, err = overlay.MountReadOnly(contentDir, mountPoint, volume.Dest, c.RootUID(), c.RootGID(), c.runtime.store.GraphOptions())
+			overlayMount, err = overlay.MountReadOnly(contentDir, imagePath, volume.Dest, c.RootUID(), c.RootGID(), c.runtime.store.GraphOptions())
 		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("creating overlay mount for image %q failed: %w", volume.Source, err)
@@ -547,8 +580,21 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 		return nil, nil, err
 	}
 
-	g.SetRootPath(c.state.Mountpoint)
+	rootPath, err := c.getRootPathForOCI()
+	if err != nil {
+		return nil, nil, err
+	}
+	g.SetRootPath(rootPath)
 	g.AddAnnotation("org.opencontainers.image.stopSignal", strconv.FormatUint(uint64(c.config.StopSignal), 10))
+
+	if c.config.StopSignal != 0 {
+		g.AddAnnotation("org.systemd.property.KillSignal", strconv.FormatUint(uint64(c.config.StopSignal), 10))
+	}
+
+	if c.config.StopTimeout != 0 {
+		annotation := fmt.Sprintf("uint64 %d", c.config.StopTimeout*1000000) // sec to usec
+		g.AddAnnotation("org.systemd.property.TimeoutStopUSec", annotation)
+	}
 
 	if _, exists := g.Config.Annotations[annotations.ContainerManager]; !exists {
 		g.AddAnnotation(annotations.ContainerManager, annotations.ContainerManagerLibpod)
@@ -560,14 +606,16 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 
 	// Warning: CDI may alter g.Config in place.
 	if len(c.config.CDIDevices) > 0 {
-		registry := cdi.GetRegistry(
+		registry, err := cdi.NewCache(
 			cdi.WithAutoRefresh(false),
 		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("creating CDI registry: %w", err)
+		}
 		if err := registry.Refresh(); err != nil {
 			logrus.Debugf("The following error was triggered when refreshing the CDI registry: %v", err)
 		}
-		_, err := registry.InjectDevices(g.Config, c.config.CDIDevices...)
-		if err != nil {
+		if _, err := registry.InjectDevices(g.Config, c.config.CDIDevices...); err != nil {
 			return nil, nil, fmt.Errorf("setting up CDI devices: %w", err)
 		}
 	}
@@ -605,9 +653,6 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 		if err != nil {
 			return nil, nil, err
 		}
-		if err != nil {
-			return nil, nil, err
-		}
 		for name, secr := range c.config.EnvSecrets {
 			_, data, err := manager.LookupSecretData(secr.Name)
 			if err != nil {
@@ -632,26 +677,37 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 	// setup rlimits
 	nofileSet := false
 	nprocSet := false
-	isRootless := rootless.IsRootless()
-	if isRootless {
-		if g.Config.Process != nil && g.Config.Process.OOMScoreAdj != nil {
-			var err error
-			*g.Config.Process.OOMScoreAdj, err = maybeClampOOMScoreAdj(*g.Config.Process.OOMScoreAdj)
+	isRunningInUserNs := unshare.IsRootless()
+	if isRunningInUserNs && g.Config.Process != nil && g.Config.Process.OOMScoreAdj != nil {
+		var err error
+		*g.Config.Process.OOMScoreAdj, err = maybeClampOOMScoreAdj(*g.Config.Process.OOMScoreAdj)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	for _, rlimit := range c.config.Spec.Process.Rlimits {
+		if rlimit.Type == "RLIMIT_NOFILE" {
+			nofileSet = true
+		}
+		if rlimit.Type == "RLIMIT_NPROC" {
+			nprocSet = true
+		}
+	}
+	needsClamping := false
+	if !nofileSet || !nprocSet {
+		needsClamping = isRunningInUserNs
+		if !needsClamping {
+			has, err := hasCapSysResource()
 			if err != nil {
 				return nil, nil, err
 			}
+			needsClamping = !has
 		}
-		for _, rlimit := range c.config.Spec.Process.Rlimits {
-			if rlimit.Type == "RLIMIT_NOFILE" {
-				nofileSet = true
-			}
-			if rlimit.Type == "RLIMIT_NPROC" {
-				nprocSet = true
-			}
-		}
-		if !nofileSet {
-			max := rlimT(define.RLimitDefaultValue)
-			current := rlimT(define.RLimitDefaultValue)
+	}
+	if !nofileSet {
+		max := rlimT(define.RLimitDefaultValue)
+		current := rlimT(define.RLimitDefaultValue)
+		if needsClamping {
 			var rlimit unix.Rlimit
 			if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit); err != nil {
 				logrus.Warnf("Failed to return RLIMIT_NOFILE ulimit %q", err)
@@ -662,11 +718,13 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 			if rlimT(rlimit.Max) < max {
 				max = rlimT(rlimit.Max)
 			}
-			g.AddProcessRlimits("RLIMIT_NOFILE", uint64(max), uint64(current))
 		}
-		if !nprocSet {
-			max := rlimT(define.RLimitDefaultValue)
-			current := rlimT(define.RLimitDefaultValue)
+		g.AddProcessRlimits("RLIMIT_NOFILE", uint64(max), uint64(current))
+	}
+	if !nprocSet {
+		max := rlimT(define.RLimitDefaultValue)
+		current := rlimT(define.RLimitDefaultValue)
+		if needsClamping {
 			var rlimit unix.Rlimit
 			if err := unix.Getrlimit(unix.RLIMIT_NPROC, &rlimit); err != nil {
 				logrus.Warnf("Failed to return RLIMIT_NPROC ulimit %q", err)
@@ -677,8 +735,8 @@ func (c *Container) generateSpec(ctx context.Context) (s *spec.Spec, cleanupFunc
 			if rlimT(rlimit.Max) < max {
 				max = rlimT(rlimit.Max)
 			}
-			g.AddProcessRlimits("RLIMIT_NPROC", uint64(max), uint64(current))
 		}
+		g.AddProcessRlimits("RLIMIT_NPROC", uint64(max), uint64(current))
 	}
 
 	c.addMaskedPaths(&g)
@@ -720,7 +778,7 @@ func (c *Container) isWorkDirSymlink(resolvedPath string) bool {
 			}
 			if resolvedSymlinkWorkdir != "" {
 				resolvedPath = resolvedSymlinkWorkdir
-				_, err := os.Stat(resolvedSymlinkWorkdir)
+				err := fileutils.Exists(resolvedSymlinkWorkdir)
 				if err == nil {
 					// Symlink resolved successfully and resolved path exists on container,
 					// this is a valid use-case so return nil.
@@ -791,7 +849,7 @@ func (c *Container) resolveWorkDir() error {
 	if err != nil {
 		return fmt.Errorf("looking up %s inside of the container %s: %w", c.User(), c.ID(), err)
 	}
-	if err := os.Chown(resolvedWorkdir, int(uid), int(gid)); err != nil {
+	if err := idtools.SafeChown(resolvedWorkdir, int(uid), int(gid)); err != nil {
 		return fmt.Errorf("chowning container %s workdir to container root: %w", c.ID(), err)
 	}
 
@@ -865,7 +923,7 @@ func (c *Container) mountNotifySocket(g generate.Generator) error {
 			return fmt.Errorf("unable to create notify %q dir: %w", notifyDir, err)
 		}
 	}
-	if err := label.Relabel(notifyDir, c.MountLabel(), true); err != nil {
+	if err := c.relabel(notifyDir, c.MountLabel(), true); err != nil {
 		return fmt.Errorf("relabel failed %q: %w", notifyDir, err)
 	}
 	logrus.Debugf("Add bindmount notify %q dir", notifyDir)
@@ -1298,7 +1356,14 @@ func (c *Container) checkpoint(ctx context.Context, options ContainerCheckpointO
 		// The file has been deleted. Do not mention it.
 		c.state.CheckpointLog = ""
 	}
-
+	//scp命令
+	if options.LiveMigration {
+		cmd := exec.Command("scp", options.TargetFile, options.IPAddress+":/home/container")
+		output, err := cmd.Output()
+		if err != nil {
+			fmt.Println("Error:", err, "output:", output)
+		}
+	}
 	c.state.FinishedTime = time.Now()
 	return criuStatistics, runtimeCheckpointDuration, c.save()
 }
@@ -1418,7 +1483,7 @@ func (c *Container) restore(ctx context.Context, options ContainerCheckpointOpti
 
 	// Let's try to stat() CRIU's inventory file. If it does not exist, it makes
 	// no sense to try a restore. This is a minimal check if a checkpoint exists.
-	if _, err := os.Stat(filepath.Join(c.CheckpointPath(), "inventory.img")); os.IsNotExist(err) {
+	if err := fileutils.Exists(filepath.Join(c.CheckpointPath(), "inventory.img")); errors.Is(err, fs.ErrNotExist) {
 		return nil, 0, fmt.Errorf("a complete checkpoint for this container cannot be found, cannot restore: %w", err)
 	}
 
@@ -1628,7 +1693,7 @@ func (c *Container) restore(ctx context.Context, options ContainerCheckpointOpti
 	// Restore /dev/shm content
 	if c.config.ShmDir != "" && c.state.BindMounts["/dev/shm"] == c.config.ShmDir {
 		shmDirTarFileFullPath := filepath.Join(c.bundlePath(), metadata.DevShmCheckpointTar)
-		if _, err := os.Stat(shmDirTarFileFullPath); err != nil {
+		if err := fileutils.Exists(shmDirTarFileFullPath); err != nil {
 			logrus.Debug("Container checkpoint doesn't contain dev/shm: ", err.Error())
 		} else {
 			shmDirTarFile, err := os.Open(shmDirTarFileFullPath)
@@ -1692,6 +1757,15 @@ func (c *Container) restore(ctx context.Context, options ContainerCheckpointOpti
 		if err := crutils.CRRemoveDeletedFiles(c.ID(), c.bundlePath(), c.state.Mountpoint); err != nil {
 			return nil, 0, err
 		}
+	}
+
+	// setup hosts/resolv.conf files
+	// Note this should normally be called after the container is created in the runtime but before it is started.
+	// However restore starts the container right away. This means that if we do the call afterwards there is a
+	// short interval where the file is still empty. Thus I decided to call it before which makes it not working
+	// with PostConfigureNetNS (userns) but as this does not work anyway today so I don't see it as problem.
+	if err := c.completeNetworkSetup(); err != nil {
+		return nil, 0, fmt.Errorf("complete network setup: %w", err)
 	}
 
 	runtimeRestoreDuration, err = c.ociRuntime.CreateContainer(c, &options)
@@ -1816,10 +1890,6 @@ func (c *Container) mountIntoRootDirs(mountName string, mountPath string) error 
 
 // Make standard bind mounts to include in the container
 func (c *Container) makeBindMounts() error {
-	if err := os.Chown(c.state.RunDir, c.RootUID(), c.RootGID()); err != nil {
-		return fmt.Errorf("cannot chown run directory: %w", err)
-	}
-
 	if c.state.BindMounts == nil {
 		c.state.BindMounts = make(map[string]string)
 	}
@@ -1897,15 +1967,6 @@ func (c *Container) makeBindMounts() error {
 				err = c.mountIntoRootDirs(config.DefaultHostsFile, hostsPath)
 				if err != nil {
 					return fmt.Errorf("assigning mounts to container %s: %w", c.ID(), err)
-				}
-			}
-
-			if !hasCurrentUserMapped(c) {
-				if err := makeAccessible(resolvPath, c.RootUID(), c.RootGID()); err != nil {
-					return err
-				}
-				if err := makeAccessible(hostsPath, c.RootUID(), c.RootGID()); err != nil {
-					return err
 				}
 			}
 		} else {
@@ -2112,11 +2173,13 @@ func (c *Container) addResolvConf() error {
 		if len(networkNameServers) == 0 || networkBackend != string(types.Netavark) {
 			keepHostServers = true
 		}
-		// first add the nameservers from the networks status
-		nameservers = networkNameServers
-
-		// slirp4netns has a built in DNS forwarder.
-		nameservers = c.addSlirp4netnsDNS(nameservers)
+		if len(networkNameServers) > 0 {
+			// add the nameservers from the networks status
+			nameservers = networkNameServers
+		} else {
+			// pasta and slirp4netns have a built in DNS forwarder.
+			nameservers = c.addSpecialDNS(nameservers)
+		}
 	}
 
 	// Set DNS search domains
@@ -2164,6 +2227,10 @@ func (c *Container) checkForIPv6(netStatus map[string]types.StatusBlock) bool {
 				}
 			}
 		}
+	}
+
+	if c.pastaResult != nil {
+		return c.pastaResult.IPv6
 	}
 
 	return c.isSlirp4netnsIPv6()
@@ -2224,11 +2291,10 @@ func (c *Container) getHostsEntries() (etchosts.HostEntries, error) {
 	case c.config.NetMode.IsBridge():
 		entries = etchosts.GetNetworkHostEntries(c.state.NetworkStatus, names...)
 	case c.config.NetMode.IsPasta():
-		ip, err := getPastaIP(c.state)
-		if err != nil {
-			return nil, err
+		// this should never be the case but check just to be sure and not panic
+		if len(c.pastaResult.IPAddresses) > 0 {
+			entries = etchosts.HostEntries{{IP: c.pastaResult.IPAddresses[0].String(), Names: names}}
 		}
-		entries = etchosts.HostEntries{{IP: ip.String(), Names: names}}
 	case c.config.NetMode.IsSlirp4netns():
 		ip, err := getSlirp4netnsIP(c.slirp4netnsSubnet)
 		if err != nil {
@@ -2263,16 +2329,54 @@ func (c *Container) addHosts() error {
 	if err != nil {
 		return fmt.Errorf("failed to get container ip host entries: %w", err)
 	}
-	baseHostFile, err := etchosts.GetBaseHostFile(c.runtime.config.Containers.BaseHostsFile, c.state.Mountpoint)
+
+	// Consider container level BaseHostsFile configuration first.
+	// If it is empty, fallback to containers.conf level configuration.
+	baseHostsFileConf := c.config.BaseHostsFile
+	if baseHostsFileConf == "" {
+		baseHostsFileConf = c.runtime.config.Containers.BaseHostsFile
+	}
+	baseHostFile, err := etchosts.GetBaseHostFile(baseHostsFileConf, c.state.Mountpoint)
 	if err != nil {
 		return err
 	}
+
+	var exclude []net.IP
+	var preferIP string
+	if c.pastaResult != nil {
+		exclude = c.pastaResult.IPAddresses
+		if len(c.pastaResult.MapGuestAddrIPs) > 0 {
+			// we used --map-guest-addr to setup pasta so prefer this address
+			preferIP = c.pastaResult.MapGuestAddrIPs[0]
+		}
+	} else if c.config.NetMode.IsBridge() {
+		// When running rootless we have to check the rootless netns ip addresses
+		// to not assign a ip that is already used in the rootless netns as it would
+		// not be routed to the host.
+		// https://github.com/containers/podman/issues/22653
+		info, err := c.runtime.network.RootlessNetnsInfo()
+		if err == nil && info != nil {
+			exclude = info.IPAddresses
+			if len(info.MapGuestIps) > 0 {
+				// we used --map-guest-addr to setup pasta so prefer this address
+				preferIP = info.MapGuestIps[0]
+			}
+		}
+	}
+
+	hostContainersInternalIP := etchosts.GetHostContainersInternalIP(etchosts.HostContainersInternalOptions{
+		Conf:             c.runtime.config,
+		NetStatus:        c.state.NetworkStatus,
+		NetworkInterface: c.runtime.network,
+		Exclude:          exclude,
+		PreferIP:         preferIP,
+	})
 
 	return etchosts.New(&etchosts.Params{
 		BaseFile:                 baseHostFile,
 		ExtraHosts:               c.config.HostAdd,
 		ContainerIPs:             containerIPsEntries,
-		HostContainersInternalIP: etchosts.GetHostContainersInternalIP(c.runtime.config, c.state.NetworkStatus, c.runtime.network),
+		HostContainersInternalIP: hostContainersInternalIP,
 		TargetFile:               targetFile,
 	})
 }
@@ -2281,10 +2385,10 @@ func (c *Container) addHosts() error {
 // It will also add the path to the container bind mount map.
 // source is the path on the host, dest is the path in the container.
 func (c *Container) bindMountRootFile(source, dest string) error {
-	if err := os.Chown(source, c.RootUID(), c.RootGID()); err != nil {
+	if err := idtools.SafeChown(source, c.RootUID(), c.RootGID()); err != nil {
 		return err
 	}
-	if err := label.Relabel(source, c.MountLabel(), false); err != nil {
+	if err := c.relabel(source, c.MountLabel(), false); err != nil {
 		return err
 	}
 
@@ -2486,7 +2590,7 @@ func (c *Container) setHomeEnvIfNeeded() error {
 		overrides := c.getUserOverrides()
 		execUser, err := lookup.GetUserGroupInfo(c.state.Mountpoint, c.config.User, overrides)
 		if err != nil {
-			if cutil.StringInSlice(c.config.User, c.config.HostUsers) {
+			if slices.Contains(c.config.HostUsers, c.config.User) {
 				execUser, err = lookupHostUser(c.config.User)
 			}
 
@@ -2658,13 +2762,13 @@ func (c *Container) generatePasswdAndGroup() (string, string, error) {
 	// do anything more.
 	if needPasswd {
 		passwdPath := filepath.Join(c.config.StaticDir, "passwd")
-		if _, err := os.Stat(passwdPath); err == nil {
+		if err := fileutils.Exists(passwdPath); err == nil {
 			needPasswd = false
 		}
 	}
 	if needGroup {
 		groupPath := filepath.Join(c.config.StaticDir, "group")
-		if _, err := os.Stat(groupPath); err == nil {
+		if err := fileutils.Exists(groupPath); err == nil {
 			needGroup = false
 		}
 	}
@@ -2776,38 +2880,6 @@ func (c *Container) generatePasswdAndGroup() (string, string, error) {
 	return passwdPath, groupPath, nil
 }
 
-func (c *Container) copyTimezoneFile(zonePath string) (string, error) {
-	localtimeCopy := filepath.Join(c.state.RunDir, "localtime")
-	file, err := os.Stat(zonePath)
-	if err != nil {
-		return "", err
-	}
-	if file.IsDir() {
-		return "", errors.New("invalid timezone: is a directory")
-	}
-	src, err := os.Open(zonePath)
-	if err != nil {
-		return "", err
-	}
-	defer src.Close()
-	dest, err := os.Create(localtimeCopy)
-	if err != nil {
-		return "", err
-	}
-	defer dest.Close()
-	_, err = io.Copy(dest, src)
-	if err != nil {
-		return "", err
-	}
-	if err := c.relabel(localtimeCopy, c.config.MountLabel, false); err != nil {
-		return "", err
-	}
-	if err := dest.Chown(c.RootUID(), c.RootGID()); err != nil {
-		return "", err
-	}
-	return localtimeCopy, err
-}
-
 func (c *Container) cleanupOverlayMounts() error {
 	return overlay.CleanupContent(c.config.StaticDir)
 }
@@ -2815,15 +2887,15 @@ func (c *Container) cleanupOverlayMounts() error {
 // Creates and mounts an empty dir to mount secrets into, if it does not already exist
 func (c *Container) createSecretMountDir(runPath string) error {
 	src := filepath.Join(c.state.RunDir, "/run/secrets")
-	_, err := os.Stat(src)
+	err := fileutils.Exists(src)
 	if os.IsNotExist(err) {
 		if err := umask.MkdirAllIgnoreUmask(src, os.FileMode(0o755)); err != nil {
 			return err
 		}
-		if err := label.Relabel(src, c.config.MountLabel, false); err != nil {
+		if err := c.relabel(src, c.config.MountLabel, false); err != nil {
 			return err
 		}
-		if err := os.Chown(src, c.RootUID(), c.RootGID()); err != nil {
+		if err := idtools.SafeChown(src, c.RootUID(), c.RootGID()); err != nil {
 			return err
 		}
 		c.state.BindMounts[filepath.Join(runPath, "secrets")] = src
@@ -2831,6 +2903,15 @@ func (c *Container) createSecretMountDir(runPath string) error {
 	}
 
 	return err
+}
+
+func hasIdmapOption(options []string) bool {
+	for _, o := range options {
+		if o == "idmap" || strings.HasPrefix(o, "idmap=") {
+			return true
+		}
+	}
+	return false
 }
 
 // Fix ownership and permissions of the specified volume if necessary.
@@ -2848,15 +2929,33 @@ func (c *Container) fixVolumePermissions(v *ContainerNamedVolume) error {
 		return err
 	}
 
+	// If the volume is not empty, and it is not the first copy-up event -
+	// we should not do a chown.
+	if vol.state.NeedsChown && !vol.state.CopiedUp {
+		contents, err := os.ReadDir(vol.mountPoint())
+		if err != nil {
+			return fmt.Errorf("reading contents of volume %q: %w", vol.Name(), err)
+		}
+		// Not empty, do nothing and unset NeedsChown.
+		if len(contents) > 0 {
+			vol.state.NeedsChown = false
+			if err := vol.save(); err != nil {
+				return fmt.Errorf("saving volume %q state: %w", vol.Name(), err)
+			}
+			return nil
+		}
+	}
+
 	// Volumes owned by a volume driver are not chowned - we don't want to
 	// mess with a mount not managed by us.
 	if vol.state.NeedsChown && (!vol.UsesVolumeDriver() && vol.config.Driver != "image") {
-		vol.state.NeedsChown = false
-
 		uid := int(c.config.Spec.Process.User.UID)
 		gid := int(c.config.Spec.Process.User.GID)
 
-		if c.config.IDMappings.UIDMap != nil {
+		idmapped := hasIdmapOption(v.Options)
+
+		// if the volume is mounted with "idmap", leave the IDs in from the current environment.
+		if c.config.IDMappings.UIDMap != nil && !idmapped {
 			p := idtools.IDPair{
 				UID: uid,
 				GID: gid,
@@ -2870,6 +2969,10 @@ func (c *Container) fixVolumePermissions(v *ContainerNamedVolume) error {
 			gid = newPair.GID
 		}
 
+		if vol.state.CopiedUp {
+			vol.state.NeedsChown = false
+		}
+		vol.state.CopiedUp = false
 		vol.state.UIDChowned = uid
 		vol.state.GIDChowned = gid
 
@@ -2882,17 +2985,48 @@ func (c *Container) fixVolumePermissions(v *ContainerNamedVolume) error {
 			return err
 		}
 
-		if err := os.Lchown(mountPoint, uid, gid); err != nil {
+		if err := idtools.SafeLchown(mountPoint, uid, gid); err != nil {
 			return err
 		}
 
-		// Make sure the new volume matches the permissions of the target directory.
+		// Make sure the new volume matches the permissions of the target directory unless 'U' is
+		// provided (since the volume was already chowned in this case).
 		// https://github.com/containers/podman/issues/10188
+		if slices.Contains(v.Options, "U") {
+			return nil
+		}
+
 		st, err := os.Lstat(filepath.Join(c.state.Mountpoint, v.Dest))
 		if err == nil {
 			if stat, ok := st.Sys().(*syscall.Stat_t); ok {
-				if err := os.Lchown(mountPoint, int(stat.Uid), int(stat.Gid)); err != nil {
+				uid, gid := int(stat.Uid), int(stat.Gid)
+
+				// If the volume is idmapped then undo the conversion to obtain the desired UID/GID in the container
+				if c.config.IDMappings.UIDMap != nil && idmapped {
+					p := idtools.IDPair{
+						UID: uid,
+						GID: gid,
+					}
+					mappings := idtools.NewIDMappingsFromMaps(c.config.IDMappings.UIDMap, c.config.IDMappings.GIDMap)
+					newUID, newGID, err := mappings.ToContainer(p)
+					if err != nil {
+						return fmt.Errorf("mapping user %d:%d: %w", uid, gid, err)
+					}
+					uid, gid = newUID, newGID
+				}
+
+				if err := idtools.SafeLchown(mountPoint, uid, gid); err != nil {
 					return err
+				}
+
+				// UID/GID 0 are sticky - if we chown to root,
+				// we stop chowning thereafter.
+				if uid == 0 && gid == 0 && vol.state.NeedsChown {
+					vol.state.NeedsChown = false
+
+					if err := vol.save(); err != nil {
+						return fmt.Errorf("saving volume %q state to database: %w", vol.Name(), err)
+					}
 				}
 			}
 			if err := os.Chmod(mountPoint, st.Mode()); err != nil {
@@ -2923,7 +3057,12 @@ func (c *Container) relabel(src, mountLabel string, shared bool) error {
 			return nil
 		}
 	}
-	return label.Relabel(src, mountLabel, shared)
+	err := label.Relabel(src, mountLabel, shared)
+	if errors.Is(err, unix.ENOTSUP) {
+		logrus.Debugf("Labeling not supported on %q", src)
+		return nil
+	}
+	return err
 }
 
 func (c *Container) ChangeHostPathOwnership(src string, recurse bool, uid, gid int) error {

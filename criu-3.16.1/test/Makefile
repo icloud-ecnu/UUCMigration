@@ -5,13 +5,14 @@ export ZDTM_ARGS
 
 all:
 	$(MAKE) zdtm
+	$(MAKE) zdtm-config
 	$(MAKE) zdtm-pre-dump
 	$(MAKE) zdtm-snapshot
 	$(MAKE) zdtm-iter
 	$(MAKE) zdtm-freezer
 .PHONY: all
 
-TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit socketpairs overlayfs mnt-ext-dev shell-job
+TESTS = unix-callback mem-snap rpc libcriu mounts/ext security pipes crit socketpairs overlayfs mnt-ext-dev shell-job criu-ns skip-file-rwx-check
 
 other:
 	for t in $(TESTS); do				\
@@ -22,6 +23,10 @@ other:
 zdtm:
 	./zdtm.py run -a --parallel 2
 .PHONY: zdtm
+
+zdtm-config:
+	./zdtm.py run -a --parallel 2 --criu-config
+.PHONY: zdtm-config
 
 zdtm-pre-dump:
 	./zdtm.py run --pre 2:1 -t zdtm/transition/fork -f uns
@@ -40,10 +45,6 @@ zdtm-freezer:
 	./zdtm.py run --test zdtm/transition/thread-bomb --pre 3 --freezecg zdtm:f
 .PHONY: zdtm-freezer
 
-fault-injection:
-	$(MAKE) -C fault-injection
-.PHONY: fault-injection
-
 override CFLAGS += -D_GNU_SOURCE
 
 clean_root:
@@ -51,7 +52,7 @@ clean_root:
 .PHONY: clean_root
 
 clean: clean_root
-	$(RM) zdtm_ct zdtm-tst-list umount2 zdtm_test_config.conf
+	$(RM) zdtm_ct zdtm-tst-list umount2
 	$(Q) $(RM) *.log
 	$(Q) $(RM) -r ./dump/
 	$(Q) $(MAKE) -C zdtm cleandep clean cleanout

@@ -1,6 +1,4 @@
 //go:build !remote && (linux || freebsd)
-// +build !remote
-// +build linux freebsd
 
 package libpod
 
@@ -13,11 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	volplugin "github.com/containers/podman/v4/libpod/plugin"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	volplugin "github.com/containers/podman/v5/libpod/plugin"
 	"github.com/containers/storage"
 	"github.com/containers/storage/drivers/quota"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/stringid"
 	pluginapi "github.com/docker/go-plugins-helpers/volume"
@@ -86,7 +85,7 @@ func (r *Runtime) newVolume(ctx context.Context, noCreatePluginVolume bool, opti
 			switch strings.ToLower(key) {
 			case "device":
 				if strings.ToLower(volume.config.Options["type"]) == define.TypeBind {
-					if _, err := os.Stat(val); err != nil {
+					if err := fileutils.Exists(val); err != nil {
 						return nil, fmt.Errorf("invalid volume option %s for driver 'local': %w", key, err)
 					}
 				}
@@ -202,7 +201,11 @@ func (r *Runtime) newVolume(ctx context.Context, noCreatePluginVolume bool, opti
 				Inodes: volume.config.Inodes,
 				Size:   volume.config.Size,
 			}
-			if err := q.SetQuota(fullVolPath, quota); err != nil {
+			// Must use volPathRoot not fullVolPath, as we need the
+			// base path for the volume - without the `_data`
+			// subdirectory - so the quota ID assignment logic works
+			// properly.
+			if err := q.SetQuota(volPathRoot, quota); err != nil {
 				return nil, fmt.Errorf("failed to set size quota size=%d inodes=%d for volume directory %q: %w", volume.config.Size, volume.config.Inodes, fullVolPath, err)
 			}
 		}
@@ -358,13 +361,11 @@ func (r *Runtime) removeVolume(ctx context.Context, v *Volume, force bool, timeo
 		return define.ErrVolumeRemoved
 	}
 
-	v.lock.Lock()
-	defer v.lock.Unlock()
-
-	// Update volume status to pick up a potential removal from state
-	if err := v.update(); err != nil {
-		return err
-	}
+	// DANGEROUS: Do not lock here yet because we might needed to remove containers first.
+	// In general we must always acquire the ctr lock before a volume lock so we cannot lock.
+	// THIS MUST BE DONE to prevent ABBA deadlocks.
+	// It also means the are several races around creating containers with volumes and removing
+	// them in parallel. However that problem exists regadless of taking the lock here or not.
 
 	deps, err := r.state.VolumeInUse(v)
 	if err != nil {
@@ -399,6 +400,15 @@ func (r *Runtime) removeVolume(ctx context.Context, v *Volume, force bool, timeo
 				return fmt.Errorf("removing container %s that depends on volume %s: %w", ctr.ID(), v.Name(), err)
 			}
 		}
+	}
+
+	// Ok now we are good to lock.
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	// Update volume status to pick up a potential removal from state
+	if err := v.update(); err != nil {
+		return err
 	}
 
 	// If the volume is still mounted - force unmount it

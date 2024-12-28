@@ -9,7 +9,7 @@ TEST_LOG="${TEST_DIR}/test.log"
 DUMP_LOG="${TEST_DIR}/dump.log"
 RESTORE_LOG="${TEST_DIR}/restore.log"
 
-# shellcheck disable=1091
+# shellcheck source=test/others/env.sh
 source "${MAIN_DIR}/../env.sh" || exit 1
 
 echo "== Clean"
@@ -58,9 +58,20 @@ run_test test_notify
 if [ "$(uname -m)" = "x86_64" ]; then
 	# Skip this on aarch64 as aarch64 has no dirty page tracking
 	run_test test_iters
+	run_test test_pre_dump
 fi
 run_test test_errno
 run_test test_join_ns
+if criu check --feature mem_dirty_track > /dev/null; then
+	export CRIU_FEATURE_MEM_TRACK=1
+fi
+if criu check --feature uffd-noncoop > /dev/null; then
+	export CRIU_FEATURE_LAZY_PAGES=1
+fi
+if criu check --feature pidfd_store > /dev/null; then
+	export CRIU_FEATURE_PIDFD_STORE=1
+fi
+run_test test_feature_check
 
 echo "== Tests done"
 make libcriu_clean

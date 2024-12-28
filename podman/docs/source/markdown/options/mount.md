@@ -6,95 +6,101 @@
 
 Attach a filesystem mount to the container
 
-Current supported mount TYPEs are **bind**, **devpts**, **glob**, **image**, **ramfs**, **tmpfs** and **volume**. <sup>[[1]](#Footnote1)</sup>
+Current supported mount TYPEs are **bind**, **devpts**, **glob**, **image**, **ramfs**, **tmpfs** and **volume**.
 
-       e.g.
-       type=bind,source=/path/on/host,destination=/path/in/container
+Options common to all mount types:
 
-       type=bind,src=/path/on/host,dst=/path/in/container,relabel=shared
+- *src*, *source*: mount source spec for **bind**, **glob**, and **volume**.
+  Mandatory for **bind** and **glob**.
 
-       type=bind,src=/path/on/host,dst=/path/in/container,relabel=shared,U=true
+- *dst*, *destination*, *target*: mount destination spec.
 
-       type=devpts,destination=/dev/pts
+When source globs are specified without the destination directory,
+the files and directories are mounted with their complete path
+within the container. When the destination is specified, the
+files and directories matching the glob on the base file name
+on the destination directory are mounted. The option
+`type=glob,src=/foo*,destination=/tmp/bar` tells container engines
+to mount host files matching /foo* to the /tmp/bar/
+directory in the container.
 
-       type=glob,src=/usr/lib/libfoo*,destination=/usr/lib,ro=true
+Options specific to type=**volume**:
 
-       type=image,source=fedora,destination=/fedora-image,rw=true
+- *ro*, *readonly*: *true* or *false* (default if unspecified: *false*).
 
-       type=ramfs,tmpfs-size=512M,destination=/path/in/container
+- *U*, *chown*: *true* or *false* (default if unspecified: *false*). Recursively change the owner and group of the source volume based on the UID and GID of the container.
 
-       type=tmpfs,tmpfs-size=512M,destination=/path/in/container
+- *idmap*: If specified, create an idmapped mount to the target user namespace in the container.
+  The idmap option supports a custom mapping that can be different than the user namespace used by the container.
+  The mapping can be specified after the idmap option like: `idmap=uids=0-1-10#10-11-10;gids=0-100-10`.  For each triplet, the first value is the
+  start of the backing file system IDs that are mapped to the second value on the host.  The length of this mapping is given in the third value.
+  Multiple ranges are separated with #.  If the specified mapping is prepended with a '@' then the mapping is considered relative to the container
+  user namespace. The host ID for the mapping is changed to account for the relative position of the container user in the container user namespace.
 
-       type=tmpfs,destination=/path/in/container,noswap
+Options specific to type=**image**:
 
-       type=volume,source=vol1,destination=/path/in/container,ro=true
+- *rw*, *readwrite*: *true* or *false* (default if unspecified: *false*).
 
-       Common Options:
+- *subpath*: Mount only a specific path within the image, instead of the whole image.
 
-	      · src, source: mount source spec for bind, glob, and volume. Mandatory for bind and glob.
+Options specific to **bind** and **glob**:
 
-	      · dst, destination, target: mount destination spec.
+- *ro*, *readonly*: *true* or *false* (default if unspecified: *false*).
 
-	      When source globs are specified without the destination directory,
-              the files and directories are mounted with their complete path
-	      within the container. When the destination is specified, the
-	      files and directories matching the glob on the base file name
-	      on the destination directory are mounted. The option
-	      `type=glob,src=/foo*,destination=/tmp/bar` tells container engines
-	      to mount host files matching /foo* to the /tmp/bar/
-	      directory in the container.
+- *bind-propagation*: *shared*, *slave*, *private*, *unbindable*, *rshared*, *rslave*, *runbindable*, or **rprivate** (default).<sup>[[1]](#Footnote1)</sup> See also mount(2).
 
-       Options specific to volume:
+- *bind-nonrecursive*: do not set up a recursive bind mount. By default it is recursive.
 
-	      · ro, readonly: true or false (default).
+- *relabel*: *shared*, *private*.
 
-	      . U, chown: true or false (default). Change recursively the owner and group of the source volume based on the UID and GID of the container.
+- *idmap*: *true* or *false* (default if unspecified: *false*).  If true, create an idmapped mount to the target user namespace in the container.
 
-	      · idmap: true or false (default).  If specified, create an idmapped mount to the target user namespace in the container.
-          The idmap option supports a custom mapping that can be different than the user namespace used by the container.
-          The mapping can be specified after the idmap option like: `idmap=uids=0-1-10#10-11-10;gids=0-100-10`.  For each triplet, the first value is the
-          start of the backing file system IDs that are mapped to the second value on the host.  The length of this mapping is given in the third value.
-          Multiple ranges are separated with #.  If the specified mapping is prepended with a '@' then the mapping is considered relative to the container
-          user namespace. The host ID for the mapping is changed to account for the relative position of the container user in the container user namespace.
+- *U*, *chown*: *true* or *false* (default if unspecified: *false*). Recursively change the owner and group of the source volume based on the UID and GID of the container.
 
-       Options specific to image:
+- *no-dereference*: do not dereference symlinks but copy the link source into the mount destination.
 
-	      · rw, readwrite: true or false (default).
+Options specific to type=**tmpfs** and **ramfs**:
 
-       Options specific to bind and glob:
+- *ro*, *readonly*: *true* or *false* (default if unspecified: *false*).
 
-	      · ro, readonly: true or false (default).
+- *tmpfs-size*: Size of the tmpfs/ramfs mount, in bytes. Unlimited by default in Linux.
 
-	      · bind-propagation: shared, slave, private, unbindable, rshared, rslave, runbindable, or rprivate(default). See also mount(2).
+- *tmpfs-mode*: Octal file mode of the tmpfs/ramfs (e.g. 700 or 0700.).
 
-	      . bind-nonrecursive: do not set up a recursive bind mount. By default it is recursive.
+- *tmpcopyup*: Enable copyup from the image directory at the same location to the tmpfs/ramfs. Used by default.
 
-	      . relabel: shared, private.
+- *notmpcopyup*: Disable copying files from the image to the tmpfs/ramfs.
 
-	      · idmap: true or false (default).  If specified, create an idmapped mount to the target user namespace in the container.
+- *U*, *chown*: *true* or *false* (default if unspecified: *false*). Recursively change the owner and group of the source volume based on the UID and GID of the container.
 
-	      . U, chown: true or false (default). Change recursively the owner and group of the source volume based on the UID and GID of the container.
+Options specific to type=**devpts**:
 
-       Options specific to tmpfs and ramfs:
+- *uid*: numeric UID of the file owner (default: 0).
 
-	      · ro, readonly: true or false (default).
+- *gid*: numeric GID of the file owner (default: 0).
 
-	      · tmpfs-size: Size of the tmpfs/ramfs mount in bytes. Unlimited by default in Linux.
+- *mode*: octal permission mask for the file (default: 600).
 
-	      · tmpfs-mode: File mode of the tmpfs/ramfs in octal. (e.g. 700 or 0700.) Defaults to 1777 in Linux.
+- *max*: maximum number of PTYs (default: 1048576).
 
-	      · tmpcopyup: Enable copyup from the image directory at the same location to the tmpfs/ramfs. Used by default.
+Examples:
 
-	      · notmpcopyup: Disable copying files from the image to the tmpfs/ramfs.
+- `type=bind,source=/path/on/host,destination=/path/in/container`
 
-	      . U, chown: true or false (default). Change recursively the owner and group of the source volume based on the UID and GID of the container.
+- `type=bind,src=/path/on/host,dst=/path/in/container,relabel=shared`
 
-       Options specific to devpts:
+- `type=bind,src=/path/on/host,dst=/path/in/container,relabel=shared,U=true`
 
-	      · uid: UID of the file owner (default 0).
+- `type=devpts,destination=/dev/pts`
 
-	      · gid: GID of the file owner (default 0).
+- `type=glob,src=/usr/lib/libfoo*,destination=/usr/lib,ro=true`
 
-	      · mode: permission mask for the file (default 600).
+- `type=image,source=fedora,destination=/fedora-image,rw=true`
 
-	      · max: maximum number of PTYs (default 1048576).
+- `type=ramfs,tmpfs-size=512M,destination=/path/in/container`
+
+- `type=tmpfs,tmpfs-size=512M,destination=/path/in/container`
+
+- `type=tmpfs,destination=/path/in/container,noswap`
+
+- `type=volume,source=vol1,destination=/path/in/container,ro=true`

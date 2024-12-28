@@ -18,6 +18,7 @@
 #include "file-ids.h"
 #include "namespaces.h"
 #include "shmem.h"
+#include "hugetlb.h"
 
 #include "protobuf.h"
 #include "images/memfd.pb-c.h"
@@ -45,6 +46,7 @@ struct memfd_restore_inode {
 	int fdstore_id;
 	unsigned int pending_seals;
 	MemfdInodeEntry *mie;
+	bool was_opened_rw;
 };
 
 static LIST_HEAD(memfd_inodes);
@@ -57,22 +59,17 @@ static u32 memfd_inode_ids = 1;
 
 int is_memfd(dev_t dev)
 {
-	/*
-	 * TODO When MAP_HUGETLB is used, the file device is not shmem_dev,
-	 * Note that other parts of CRIU have similar issues, see
-	 * is_anon_shmem_map().
-	 */
 	return dev == kdat.shmem_dev;
 }
 
 static int dump_memfd_inode(int fd, struct memfd_dump_inode *inode, const char *name, const struct stat *st)
 {
 	MemfdInodeEntry mie = MEMFD_INODE_ENTRY__INIT;
-	int ret = -1;
+	int ret = -1, flag;
 	u32 shmid;
 
 	/*
-	  * shmids are chosen as the inode number of the corresponding mmaped
+	  * shmids are chosen as the inode number of the corresponding mmapped
 	  * file. See handle_vma() in proc_parse.c.
 	  * It works for memfd too, because we share the same device as the
 	  * shmem device.
@@ -91,10 +88,25 @@ static int dump_memfd_inode(int fd, struct memfd_dump_inode *inode, const char *
 	mie.name = (char *)name;
 	mie.size = st->st_size;
 	mie.shmid = shmid;
+	if (is_hugetlb_dev(inode->dev, &flag)) {
+		mie.has_hugetlb_flag = true;
+		mie.hugetlb_flag = flag | MFD_HUGETLB;
+	}
+	mie.mode = st->st_mode;
+	mie.has_mode = true;
 
 	mie.seals = fcntl(fd, F_GET_SEALS);
-	if (mie.seals == -1)
-		goto out;
+	if (mie.seals == -1) {
+		if (errno != EINVAL || ~mie.hugetlb_flag & MFD_HUGETLB) {
+			pr_perror("fcntl(F_GET_SEALS)");
+			goto out;
+		}
+		/* Kernels before 4.16 don't allow MFD_HUGETLB |
+		 * MFD_ALLOW_SEALING and return EINVAL for
+		 * fcntl(MFD_HUGETLB-enabled fd).
+		 */
+		mie.seals = F_SEAL_SEAL;
+	}
 
 	if (pb_write_one(img_from_set(glob_imgset, CR_FD_MEMFD_INODE), &mie, PB_MEMFD_INODE))
 		goto out;
@@ -222,6 +234,7 @@ static int collect_one_memfd_inode(void *o, ProtobufCMessage *base, struct cr_im
 	mutex_init(&inode->lock);
 	inode->fdstore_id = -1;
 	inode->pending_seals = 0;
+	inode->was_opened_rw = false;
 
 	list_add_tail(&inode->list, &memfd_inodes);
 
@@ -258,6 +271,9 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 		flags = MFD_ALLOW_SEALING;
 	}
 
+	if (mie->has_hugetlb_flag)
+		flags |= mie->hugetlb_flag;
+
 	fd = memfd_create(mie->name, flags);
 	if (fd < 0) {
 		pr_perror("Can't create memfd:%s", mie->name);
@@ -267,8 +283,13 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 	if (restore_memfd_shmem_content(fd, mie->shmid, mie->size))
 		goto out;
 
-	if (fchown(fd, mie->uid, mie->gid)) {
-		pr_perror("Can't change uid %d gid %d of memfd:%s", (int)mie->uid, (int)mie->gid, mie->name);
+	if (mie->has_mode)
+		ret = cr_fchperm(fd, mie->uid, mie->gid, mie->mode);
+	else
+		ret = cr_fchown(fd, mie->uid, mie->gid);
+	if (ret) {
+		pr_perror("Can't set permissions { uid %d gid %d mode %#o } of memfd:%s", (int)mie->uid,
+			  (int)mie->gid, mie->has_mode ? (int)mie->mode : -1, mie->name);
 		goto out;
 	}
 
@@ -302,7 +323,7 @@ static int memfd_open_inode(struct memfd_restore_inode *inode)
 	return fd;
 }
 
-int memfd_open(struct file_desc *d, u32 *fdflags)
+int memfd_open(struct file_desc *d, u32 *fdflags, bool filemap)
 {
 	struct memfd_info *mfi;
 	MemfdFileEntry *mfe;
@@ -312,55 +333,78 @@ int memfd_open(struct file_desc *d, u32 *fdflags)
 	mfi = container_of(d, struct memfd_info, d);
 	mfe = mfi->mfe;
 
-	if (inherited_fd(d, &fd))
-		return fd;
-
 	pr_info("Restoring memfd id=%d\n", mfe->id);
 
 	fd = memfd_open_inode(mfi->inode);
 	if (fd < 0)
-		goto err;
+		return -1;
 
 	/* Reopen the fd with original permissions */
 	flags = fdflags ? *fdflags : mfe->flags;
+
+	if (filemap && (flags & O_ACCMODE) == O_RDWR)
+		return fd;
+
+	if (!mfi->inode->was_opened_rw && (flags & O_ACCMODE) == O_RDWR) {
+		/*
+		 * If there is only a single RW-opened fd for a memfd, it can
+		 * be used to pass it to execveat() with AT_EMPTY_PATH to have
+		 * its contents executed.  This currently works only for the
+		 * original fd from memfd_create() so return the original fd
+		 * once -- in case the caller expects to be the sole opener
+		 * and does execveat() from this memfd.
+		 */
+		if (!fcntl(fd, F_SETFL, flags)) {
+			mfi->inode->was_opened_rw = true;
+			return fd;
+		}
+
+		pr_pwarn("Can't change fd flags to %#o for memfd id=%d", flags, mfe->id);
+	}
+
 	/*
 	 * Ideally we should call compat version open() to not force the
 	 * O_LARGEFILE file flag with regular open(). It doesn't seem that
 	 * important though.
 	 */
 	_fd = __open_proc(PROC_SELF, 0, flags, "fd/%d", fd);
-	if (_fd < 0) {
+	if (_fd < 0)
 		pr_perror("Can't reopen memfd id=%d", mfe->id);
-		goto err;
-	}
+	else if (!filemap && (flags & O_ACCMODE) == O_RDWR)
+		pr_warn("execveat(fd=%d, ..., AT_EMPTY_PATH) might fail after restore; memfd id=%d\n", _fd, mfe->id);
+
 	close(fd);
-	fd = _fd;
+	return _fd;
+}
+
+static int memfd_open_fe_fd(struct file_desc *d, int *new_fd)
+{
+	MemfdFileEntry *mfe;
+	int fd;
+
+	if (inherited_fd(d, new_fd))
+		return 0;
+
+	fd = memfd_open(d, NULL, false);
+	if (fd < 0)
+		return -1;
+
+	mfe = container_of(d, struct memfd_info, d)->mfe;
 
 	if (restore_fown(fd, mfe->fown) < 0)
 		goto err;
 
 	if (lseek(fd, mfe->pos, SEEK_SET) < 0) {
-		pr_perror("Can't restore file position of memfd id=%d", mfe->id);
+		pr_perror("Can't restore file position of %d for memfd id=%d", fd, mfe->id);
 		goto err;
 	}
 
-	return fd;
+	*new_fd = fd;
+	return 0;
 
 err:
-	if (fd >= 0)
-		close(fd);
+	close(fd);
 	return -1;
-}
-
-static int memfd_open_fe_fd(struct file_desc *fd, int *new_fd)
-{
-	int tmp;
-
-	tmp = memfd_open(fd, NULL);
-	if (tmp < 0)
-		return -1;
-	*new_fd = tmp;
-	return 0;
 }
 
 static char *memfd_d_name(struct file_desc *d, char *buf, size_t s)

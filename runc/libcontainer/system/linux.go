@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package system
 
@@ -7,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strconv"
 	"syscall"
 	"unsafe"
@@ -34,14 +32,6 @@ func (p ParentDeathSignal) Restore() error {
 
 func (p ParentDeathSignal) Set() error {
 	return SetParentDeathSignal(uintptr(p))
-}
-
-func Execv(cmd string, args []string, env []string) error {
-	name, err := exec.LookPath(cmd)
-	if err != nil {
-		return err
-	}
-	return Exec(name, args, env)
 }
 
 func Exec(cmd string, args []string, env []string) error {

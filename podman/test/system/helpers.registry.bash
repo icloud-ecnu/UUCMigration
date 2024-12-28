@@ -17,21 +17,35 @@ unset REGISTRY_AUTH_FILE
 # Start a local registry. Only needed on demand (e.g. by 150-login.bats)
 # and then only once: if we start, leave it running until final teardown.
 function start_registry() {
-    if [[ -d "$PODMAN_LOGIN_WORKDIR/auth" ]]; then
-        # Already started
-        return
+    AUTHDIR=${PODMAN_LOGIN_WORKDIR}/auth
+
+    local startflag=${PODMAN_LOGIN_WORKDIR}/OK
+
+    if ! mkdir $AUTHDIR; then
+        # *Possibly* already started. Or, possibly (when running
+        # parallel tests) another process is trying to start it.
+        # Give it some time.
+        local timeout=30
+        while [[ $timeout -gt 0 ]]; do
+            if [[ -e $startflag ]]; then
+                echo "Registry has already been started by another process"
+                return
+            fi
+
+            sleep 1
+            timeout=$((timeout - 1))
+        done
+
+        die "Internal error: timed out waiting for another process to start registry"
     fi
 
-    AUTHDIR=${PODMAN_LOGIN_WORKDIR}/auth
     mkdir -p $AUTHDIR
 
     # Registry image; copy of docker.io, but on our own registry
-    local REGISTRY_IMAGE="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/registry:2.8"
+    local REGISTRY_IMAGE="$PODMAN_TEST_IMAGE_REGISTRY/$PODMAN_TEST_IMAGE_USER/registry:2.8.2"
 
-    # Pull registry image, but into a separate container storage
-    mkdir ${PODMAN_LOGIN_WORKDIR}/root
-    mkdir ${PODMAN_LOGIN_WORKDIR}/runroot
-    PODMAN_LOGIN_ARGS="--storage-driver vfs --root ${PODMAN_LOGIN_WORKDIR}/root --runroot ${PODMAN_LOGIN_WORKDIR}/runroot"
+    # Pull registry image, but into a separate container storage and DB and everything
+    PODMAN_LOGIN_ARGS="--storage-driver vfs $(podman_isolation_opts ${PODMAN_LOGIN_WORKDIR})"
     # _prefetch() will retry twice on network error, and will also use
     # a pre-cached image if present (helpful on dev workstation, not in CI).
     _PODMAN_TEST_OPTS="${PODMAN_LOGIN_ARGS}" _prefetch $REGISTRY_IMAGE
@@ -58,21 +72,22 @@ function start_registry() {
 
     # Run the registry container.
     run_podman ${PODMAN_LOGIN_ARGS} run -d \
-               -p 127.0.0.1:${PODMAN_LOGIN_REGISTRY_PORT}:5000 \
+               --net=host \
                --name registry \
                -v $AUTHDIR:/auth:Z \
-               -e "REGISTRY_AUTH=htpasswd" \
-               -e "REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm" \
-               -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
-               -e REGISTRY_HTTP_TLS_CERTIFICATE=/auth/domain.crt \
-               -e REGISTRY_HTTP_TLS_KEY=/auth/domain.key \
+               -e REGISTRY_HTTP_ADDR="127.0.0.1:${PODMAN_LOGIN_REGISTRY_PORT}" \
+               -e REGISTRY_AUTH="htpasswd" \
+               -e REGISTRY_AUTH_HTPASSWD_REALM="Registry Realm" \
+               -e REGISTRY_AUTH_HTPASSWD_PATH="/auth/htpasswd" \
+               -e REGISTRY_HTTP_TLS_CERTIFICATE="/auth/domain.crt" \
+               -e REGISTRY_HTTP_TLS_KEY="/auth/domain.key" \
                $REGISTRY_IMAGE
     cid="$output"
 
-    # wait_for_port isn't enough: that just checks that podman has mapped the port...
     wait_for_port 127.0.0.1 ${PODMAN_LOGIN_REGISTRY_PORT}
-    # ...so we look in container logs for confirmation that registry is running.
-    _PODMAN_TEST_OPTS="${PODMAN_LOGIN_ARGS}" wait_for_output "listening on .::.:5000" $cid
+
+    touch $startflag
+    echo "I have started the registry"
 }
 
 function stop_registry() {
@@ -86,14 +101,9 @@ function stop_registry() {
         skip "[leaving registry running by request]"
     fi
 
-    run_podman --storage-driver vfs                      \
-               --root    ${PODMAN_LOGIN_WORKDIR}/root    \
-               --runroot ${PODMAN_LOGIN_WORKDIR}/runroot \
-               rm -f -t0 registry
-    run_podman --storage-driver vfs                      \
-               --root    ${PODMAN_LOGIN_WORKDIR}/root    \
-               --runroot ${PODMAN_LOGIN_WORKDIR}/runroot \
-               rmi -a -f
+    opts="--storage-driver vfs $(podman_isolation_opts ${PODMAN_LOGIN_WORKDIR})"
+    run_podman $opts rm -f -t0 registry
+    run_podman $opts rmi -a -f
 
     # By default, clean up
     if [ -z "${PODMAN_TEST_KEEP_LOGIN_WORKDIR}" ]; then
@@ -102,15 +112,42 @@ function stop_registry() {
         mount | grep ${PODMAN_LOGIN_WORKDIR} | awk '{print $3}' | xargs --no-run-if-empty umount
 
         if [[ $(id -u) -eq 0 ]]; then
-            rm -rf ${PODMAN_LOGIN_WORKDIR}
+            rm -rf ${PODMAN_LOGIN_WORKDIR}/*
         else
             # rootless image data is owned by a subuid
-            run_podman unshare rm -rf ${PODMAN_LOGIN_WORKDIR}
+            run_podman unshare rm -rf ${PODMAN_LOGIN_WORKDIR}/*
         fi
     fi
 
     # Make sure socket is closed
     if tcp_port_probe $PODMAN_LOGIN_REGISTRY_PORT; then
-        die "Socket still seems open"
+        # for debugging flakes
+        echo ""
+        echo "ps auxww --forest"
+        ps auxww --forest
+        echo ""
+        echo "lsof -i -P"
+        lsof -i -P
+        die "Socket $PODMAN_LOGIN_REGISTRY_PORT still seems open"
     fi
+}
+
+function pause_registry() {
+    if [[ ! -d "$PODMAN_LOGIN_WORKDIR/auth" ]]; then
+        # No registry running
+        return
+    fi
+
+    opts="--storage-driver vfs $(podman_isolation_opts ${PODMAN_LOGIN_WORKDIR})"
+    run_podman $opts stop registry
+}
+
+function unpause_registry() {
+    if [[ ! -d "$PODMAN_LOGIN_WORKDIR/auth" ]]; then
+        # No registry running
+        return
+    fi
+
+    opts="--storage-driver vfs $(podman_isolation_opts ${PODMAN_LOGIN_WORKDIR})"
+    run_podman $opts start registry
 }

@@ -27,12 +27,12 @@ env:
     ####
     # GCE project where images live
     IMAGE_PROJECT: "libpod-218412"
-    FEDORA_NAME: "fedora-39β"
-    PRIOR_FEDORA_NAME: "fedora-38"
+    FEDORA_NAME: "fedora-41"
+    PRIOR_FEDORA_NAME: "fedora-40"
     DEBIAN_NAME: "debian-13"
 
     # Image identifiers
-    IMAGE_SUFFIX: "c20231004t194547z-f39f38d13"
+    IMAGE_SUFFIX: "c20241107t210000z-f41f40d13"
     FEDORA_CACHE_IMAGE_NAME: "fedora-${IMAGE_SUFFIX}"
     PRIOR_FEDORA_CACHE_IMAGE_NAME: "prior-fedora-${IMAGE_SUFFIX}"
     DEBIAN_CACHE_IMAGE_NAME: "debian-${IMAGE_SUFFIX}"
@@ -120,13 +120,14 @@ vendor_task:
 
     # Runs within Cirrus's "community cluster"
     container:
-        image: docker.io/library/golang:latest
+        image: docker.io/library/golang:1.22
         cpu: 1
         memory: 1
 
     timeout_in: 5m
 
     vendor_script:
+        - './hack/check_vendor_toolchain.sh Try updating the image used by the vendor_task in .cirrus.yml.'
         - 'make vendor'
         - './hack/tree_status.sh'
 
@@ -137,15 +138,9 @@ cross_build_task:
     alias: cross_build
     only_if: >-
         $CIRRUS_CHANGE_TITLE !=~ '.*CI:DOCS.*'
-
-    osx_instance:
-        image: ghcr.io/cirruslabs/macos-ventura-base:latest
-
+    env:
+        HOME: /root
     script:
-        - brew update
-        - brew install go
-        - brew install go-md2man
-        - brew install gpgme
         - go version
         - make cross CGO_ENABLED=0
 
@@ -164,7 +159,7 @@ unit_task:
       - vendor
       - cross_build
 
-    timeout_in: 1h
+    timeout_in: 90m
 
     matrix:
         - env:
@@ -181,7 +176,7 @@ unit_task:
 
 
 conformance_task:
-    name: 'Build Conformance w/ $STORAGE_DRIVER'
+    name: 'Debian Conformance w/ $STORAGE_DRIVER'
     alias: conformance
     only_if: *not_build_docs
     depends_on: *smoke_vendor_cross
@@ -194,6 +189,7 @@ conformance_task:
     matrix:
         - env:
             STORAGE_DRIVER: 'vfs'
+            TMPDIR: '/var/tmp'
         - env:
             STORAGE_DRIVER: 'overlay'
 
@@ -213,10 +209,11 @@ integration_task:
             DISTRO_NV: "${FEDORA_NAME}"
             IMAGE_NAME: "${FEDORA_CACHE_IMAGE_NAME}"
             STORAGE_DRIVER: 'vfs'
-        - env:
-            DISTRO_NV: "${PRIOR_FEDORA_NAME}"
-            IMAGE_NAME: "${PRIOR_FEDORA_CACHE_IMAGE_NAME}"
-            STORAGE_DRIVER: 'vfs'
+        # Disabled until we update to f40/41 as f39 does not have go 1.22
+        # - env:
+        #     DISTRO_NV: "${PRIOR_FEDORA_NAME}"
+        #     IMAGE_NAME: "${PRIOR_FEDORA_CACHE_IMAGE_NAME}"
+        #     STORAGE_DRIVER: 'vfs'
         - env:
             DISTRO_NV: "${DEBIAN_NAME}"
             IMAGE_NAME: "${DEBIAN_CACHE_IMAGE_NAME}"
@@ -226,10 +223,11 @@ integration_task:
             DISTRO_NV: "${FEDORA_NAME}"
             IMAGE_NAME: "${FEDORA_CACHE_IMAGE_NAME}"
             STORAGE_DRIVER: 'overlay'
-        - env:
-            DISTRO_NV: "${PRIOR_FEDORA_NAME}"
-            IMAGE_NAME: "${PRIOR_FEDORA_CACHE_IMAGE_NAME}"
-            STORAGE_DRIVER: 'overlay'
+        # Disabled until we update to f40/41 as f39 does not have go 1.22
+        # - env:
+        #     DISTRO_NV: "${PRIOR_FEDORA_NAME}"
+        #     IMAGE_NAME: "${PRIOR_FEDORA_CACHE_IMAGE_NAME}"
+        #     STORAGE_DRIVER: 'overlay'
         - env:
             DISTRO_NV: "${DEBIAN_NAME}"
             IMAGE_NAME: "${DEBIAN_CACHE_IMAGE_NAME}"
@@ -270,11 +268,12 @@ integration_rootless_task:
             IMAGE_NAME: "${FEDORA_CACHE_IMAGE_NAME}"
             STORAGE_DRIVER: 'overlay'
             PRIV_NAME: rootless
-        - env:
-            DISTRO_NV: "${PRIOR_FEDORA_NAME}"
-            IMAGE_NAME: "${PRIOR_FEDORA_CACHE_IMAGE_NAME}"
-            STORAGE_DRIVER: 'overlay'
-            PRIV_NAME: rootless
+        # Disabled until we update to f40/41 as f39 does not have go 1.22
+        # - env:
+        #     DISTRO_NV: "${PRIOR_FEDORA_NAME}"
+        #     IMAGE_NAME: "${PRIOR_FEDORA_CACHE_IMAGE_NAME}"
+        #     STORAGE_DRIVER: 'overlay'
+        #     PRIV_NAME: rootless
         - env:
             DISTRO_NV: "${DEBIAN_NAME}"
             IMAGE_NAME: "${DEBIAN_CACHE_IMAGE_NAME}"
@@ -323,6 +322,8 @@ in_podman_task:
 # set of tasks all passed, and allows confirming that based on the status
 # of this task.
 success_task:
+    # N/B: The prow merge-bot (tide) is sensitized to this exact name, DO NOT CHANGE IT.
+    # Ref: https://github.com/openshift/release/pull/48909
     name: "Total Success"
     alias: success
 

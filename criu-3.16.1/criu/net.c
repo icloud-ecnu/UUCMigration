@@ -51,6 +51,9 @@
 #include "images/netdev.pb-c.h"
 #include "images/inventory.pb-c.h"
 
+#undef LOG_PREFIX
+#define LOG_PREFIX "net: "
+
 #ifndef IFLA_NEW_IFINDEX
 #define IFLA_NEW_IFINDEX 49
 #endif
@@ -108,15 +111,18 @@ int read_ns_sys_file(char *path, char *buf, int len)
 	}
 
 	rlen = read(fd, buf, len);
+	if (rlen == -1)
+		pr_perror("Can't read ns' %s", path);
 	close(fd);
 
 	if (rlen == len) {
+		buf[0] = '\0';
 		pr_err("Too small buffer to read ns sys file %s\n", path);
 		return -1;
 	}
 
-	if (rlen > 0)
-		buf[rlen - 1] = '\0';
+	if (rlen >= 0)
+		buf[rlen] = '\0';
 
 	return rlen;
 }
@@ -353,22 +359,23 @@ static int ipv6_conf_op(char *tgt, SysctlEntry **conf, int n, int op, SysctlEntr
 	return net_conf_op(tgt, conf, n, op, "ipv6", req, path, ARRAY_SIZE(devconfs6), devconfs6, def_conf);
 }
 
-static int unix_conf_op(SysctlEntry ***rconf, size_t *n, int op)
+static int unix_conf_op(SysctlEntry ***rconf, size_t *pn, int op)
 {
 	int i, ret = -1, flags = 0;
 	char path[ARRAY_SIZE(unix_conf_entries)][MAX_CONF_UNIX_PATH] = {};
 	struct sysctl_req req[ARRAY_SIZE(unix_conf_entries)] = {};
 	SysctlEntry **conf = *rconf;
+	size_t n = *pn;
 
-	if (*n != ARRAY_SIZE(unix_conf_entries)) {
-		pr_err("unix: Unexpected entries in config (%zu %zu)\n", *n, ARRAY_SIZE(unix_conf_entries));
+	if (n != ARRAY_SIZE(unix_conf_entries)) {
+		pr_err("unix: Unexpected entries in config (%zu %zu)\n", n, ARRAY_SIZE(unix_conf_entries));
 		return -EINVAL;
 	}
 
 	if (opts.weak_sysctls || op == CTL_READ)
 		flags = CTL_FLAGS_OPTIONAL;
 
-	for (i = 0; i < *n; i++) {
+	for (i = 0; i < n; i++) {
 		snprintf(path[i], MAX_CONF_UNIX_PATH, CONF_UNIX_FMT, unix_conf_entries[i]);
 		req[i].name = path[i];
 		req[i].flags = flags;
@@ -384,7 +391,7 @@ static int unix_conf_op(SysctlEntry ***rconf, size_t *n, int op)
 		}
 	}
 
-	ret = sysctl_op(req, *n, op, CLONE_NEWNET);
+	ret = sysctl_op(req, n, op, CLONE_NEWNET);
 	if (ret < 0) {
 		pr_err("unix: Failed to %s %s/<confs>\n", (op == CTL_READ) ? "read" : "write", CONF_UNIX_BASE);
 		return -1;
@@ -393,7 +400,7 @@ static int unix_conf_op(SysctlEntry ***rconf, size_t *n, int op)
 	if (op == CTL_READ) {
 		bool has_entries = false;
 
-		for (i = 0; i < *n; i++) {
+		for (i = 0; i < n; i++) {
 			if (req[i].flags & CTL_FLAGS_HAS) {
 				conf[i]->has_iarg = true;
 				if (!has_entries)
@@ -406,7 +413,7 @@ static int unix_conf_op(SysctlEntry ***rconf, size_t *n, int op)
 		 * Unix conf is optional.
 		 */
 		if (!has_entries) {
-			*n = 0;
+			*pn = 0;
 			*rconf = NULL;
 		}
 	}
@@ -662,7 +669,7 @@ static int dump_macvlan(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nl
 
 	ret = nla_parse_nested(data, IFLA_MACVLAN_FLAGS, info[IFLA_INFO_DATA], NULL);
 	if (ret < 0) {
-		pr_err("failed ot parse macvlan data\n");
+		pr_err("failed to parse macvlan data\n");
 		return -1;
 	}
 
@@ -772,7 +779,7 @@ static int dump_sit(NetDeviceEntry *nde, struct cr_imgset *imgset, struct nlattr
 	pr_info("Some data for SIT provided\n");
 	ret = nla_parse_nested(data, IFLA_IPTUN_MAX, info[IFLA_INFO_DATA], NULL);
 	if (ret < 0) {
-		pr_err("failed ot parse sit data\n");
+		pr_err("failed to parse sit data\n");
 		return -1;
 	}
 
@@ -1172,7 +1179,7 @@ struct newlink_req {
  * request.
  */
 struct newlink_extras {
-	int link; /* IFLA_LINK */
+	int link;	  /* IFLA_LINK */
 	int target_netns; /* IFLA_NET_NS_FD */
 };
 
@@ -1398,7 +1405,7 @@ static int move_veth(const char *netdev, struct ns_id *ns, struct net_link *link
 	len_val = strlen(netdev);
 	if (len_val >= IFNAMSIZ)
 		return -1;
-	strlcpy(mvreq.ifnam, netdev, IFNAMSIZ);
+	__strlcpy(mvreq.ifnam, netdev, IFNAMSIZ);
 
 	ret = userns_call(move_veth_cb, 0, &mvreq, sizeof(mvreq), ns->net.ns_fd);
 	if (ret < 0)
@@ -1528,7 +1535,7 @@ static int changeflags(int s, char *name, short flags)
 {
 	struct ifreq ifr;
 
-	strlcpy(ifr.ifr_name, name, IFNAMSIZ);
+	__strlcpy(ifr.ifr_name, name, IFNAMSIZ);
 	ifr.ifr_flags = flags;
 
 	if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
@@ -1744,7 +1751,7 @@ static int __restore_link(struct ns_id *ns, struct net_link *link, int nlsk)
 
 	switch (nde->type) {
 	case ND_TYPE__LOOPBACK: /* fallthrough */
-	case ND_TYPE__EXTLINK: /* see comment in images/netdev.proto */
+	case ND_TYPE__EXTLINK:	/* see comment in images/netdev.proto */
 		return restore_link_parms(link, nlsk);
 	case ND_TYPE__VENET:
 		return restore_one_link(ns, link, nlsk, venet_link_info, NULL);
@@ -2039,10 +2046,10 @@ static inline int dump_iptables(struct cr_imgset *fds)
 	 * and iptables backend is nft to prevent duplicate dumps.
 	 */
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
-	iptables_cmd = get_legacy_iptables_bin(false);
+	iptables_cmd = get_legacy_iptables_bin(false, false);
 
 	if (kdat.ipv6)
-		ip6tables_cmd = get_legacy_iptables_bin(true);
+		ip6tables_cmd = get_legacy_iptables_bin(true, false);
 #endif
 
 	if (!iptables_cmd) {
@@ -2250,12 +2257,12 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 	sockfd = img_raw_fd(img);
 	if (sockfd < 0) {
 		pr_err("Getting raw FD failed\n");
-		return -1;
+		goto out_image;
 	}
 	tmp_file = tmpfile();
 	if (!tmp_file) {
 		pr_perror("Failed to open tmpfile");
-		return -1;
+		goto out_image;
 	}
 
 	while ((n = read(sockfd, buf, 1024)) > 0) {
@@ -2264,24 +2271,33 @@ static int restore_ip_dump(int type, int pid, char *cmd)
 			pr_perror("Failed to write to tmpfile "
 				  "[written: %d; total: %d]",
 				  written, n);
-			goto close;
+			goto out_tmp_file;
 		}
 	}
 
 	if (fseek(tmp_file, 0, SEEK_SET)) {
 		pr_perror("Failed to set file position to beginning of tmpfile");
-		goto close;
+		goto out_tmp_file;
 	}
 
-	if (img) {
-		ret = run_ip_tool(cmd, "restore", NULL, NULL, fileno(tmp_file), -1, 0);
-		close_image(img);
+	if (type == CR_FD_RULE) {
+		/*
+		 * Delete 3 default rules to prevent duplicates. See kernel's
+		 * function fib_default_rules_init() for the details.
+		 */
+		run_ip_tool("rule", "flush", NULL, NULL, -1, -1, 0);
+		run_ip_tool("rule", "delete", "table", "local", -1, -1, 0);
 	}
 
-close:
+	ret = run_ip_tool(cmd, "restore", NULL, NULL, fileno(tmp_file), -1, 0);
+
+out_tmp_file:
 	if (fclose(tmp_file)) {
 		pr_perror("Failed to close tmpfile");
 	}
+
+out_image:
+	close_image(img);
 
 	return ret;
 }
@@ -2304,31 +2320,7 @@ static inline int restore_route(int pid)
 
 static inline int restore_rule(int pid)
 {
-	struct cr_img *img;
-	int ret = 0;
-
-	img = open_image(CR_FD_RULE, O_RSTR, pid);
-	if (!img) {
-		ret = -1;
-		goto out;
-	}
-
-	if (empty_image(img))
-		goto close;
-
-	/*
-	 * Delete 3 default rules to prevent duplicates. See kernel's
-	 * function fib_default_rules_init() for the details.
-	 */
-	run_ip_tool("rule", "flush", NULL, NULL, -1, -1, 0);
-	run_ip_tool("rule", "delete", "table", "local", -1, -1, 0);
-
-	if (restore_ip_dump(CR_FD_RULE, pid, "rule"))
-		ret = -1;
-close:
-	close_image(img);
-out:
-	return ret;
+	return restore_ip_dump(CR_FD_RULE, pid, "rule");
 }
 
 /*
@@ -2355,7 +2347,7 @@ static int prepare_xtable_lock(void)
 	}
 
 	if (mount(NULL, "/", NULL, MS_SLAVE | MS_REC, NULL)) {
-		pr_perror("Unable to conver mounts to slave mounts");
+		pr_perror("Unable to convert mounts to slave mounts");
 		return -1;
 	}
 	/*
@@ -2375,8 +2367,18 @@ static int prepare_xtable_lock(void)
 
 static inline int restore_iptables(int pid)
 {
+	char *iptables_cmd = "iptables-restore";
+	char *ip6tables_cmd = "ip6tables-restore";
+	char comm[32];
 	int ret = -1;
 	struct cr_img *img;
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	iptables_cmd = get_legacy_iptables_bin(false, true);
+
+	if (kdat.ipv6)
+		ip6tables_cmd = get_legacy_iptables_bin(true, true);
+#endif
 
 	img = open_image(CR_FD_IPTABLES, O_RSTR, pid);
 	if (img == NULL)
@@ -2387,7 +2389,19 @@ static inline int restore_iptables(int pid)
 		goto ipt6;
 	}
 
-	ret = run_iptables_tool("iptables-restore -w", img_raw_fd(img), -1);
+	if (!iptables_cmd) {
+		pr_err("Can't restore iptables dump - no legacy version present\n");
+		close_image(img);
+		return -1;
+	}
+
+	if (snprintf(comm, sizeof(comm), "%s -w", iptables_cmd) >= sizeof(comm)) {
+		pr_err("Can't fit '%s -w' to buffer\n", iptables_cmd);
+		close_image(img);
+		return -1;
+	}
+
+	ret = run_iptables_tool(comm, img_raw_fd(img), -1);
 	close_image(img);
 	if (ret)
 		return ret;
@@ -2398,7 +2412,19 @@ ipt6:
 	if (empty_image(img))
 		goto out;
 
-	ret = run_iptables_tool("ip6tables-restore -w", img_raw_fd(img), -1);
+	if (!ip6tables_cmd) {
+		pr_err("Can't restore ip6tables dump - no legacy version present\n");
+		close_image(img);
+		return -1;
+	}
+
+	if (snprintf(comm, sizeof(comm), "%s -w", ip6tables_cmd) >= sizeof(comm)) {
+		pr_err("Can't fit '%s -w' to buffer\n", ip6tables_cmd);
+		close_image(img);
+		return -1;
+	}
+
+	ret = run_iptables_tool(comm, img_raw_fd(img), -1);
 out:
 	close_image(img);
 
@@ -2406,13 +2432,62 @@ out:
 }
 
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
-static inline int restore_nftables(int pid)
+static inline int do_restore_nftables(struct cr_img *img)
 {
-	int ret = -1;
-	struct cr_img *img;
+	int exit_code = -1;
 	struct nft_ctx *nft;
 	off_t img_data_size;
 	char *buf;
+
+	if ((img_data_size = img_raw_size(img)) < 0) {
+		pr_err("image size mismatch\n");
+		goto out;
+	}
+
+	if (read_img_str(img, &buf, img_data_size) < 0) {
+		pr_err("Failed to read nftables data\n");
+		goto out;
+	}
+
+	nft = nft_ctx_new(NFT_CTX_DEFAULT);
+	if (!nft) {
+		pr_err("Failed to create nft context object\n");
+		goto buf_free_out;
+	}
+
+	if (nft_ctx_buffer_output(nft) || nft_ctx_buffer_error(nft)) {
+		pr_err("Failed to enable std/err output buffering\n");
+		goto nft_ctx_free_out;
+	}
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0)
+	if (nft_run_cmd_from_buffer(nft, buf, strlen(buf)))
+#elif defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	if (nft_run_cmd_from_buffer(nft, buf))
+#else
+	BUILD_BUG_ON(1);
+#endif
+	{
+		pr_err("nft command error:\n%s\n%s\n",
+		       nft_ctx_get_error_buffer(nft), buf);
+		goto nft_ctx_free_out;
+	}
+
+	exit_code = 0;
+
+nft_ctx_free_out:
+	nft_ctx_free(nft);
+buf_free_out:
+	xfree(buf);
+out:
+	return exit_code;
+}
+#endif
+
+static inline int restore_nftables(int pid)
+{
+	int exit_code = -1;
+	struct cr_img *img;
 
 	img = open_image(CR_FD_NFTABLES, O_RSTR, pid);
 	if (img == NULL)
@@ -2420,44 +2495,22 @@ static inline int restore_nftables(int pid)
 	if (empty_image(img)) {
 		/* Backward compatibility */
 		pr_info("Skipping nft restore, no image\n");
-		ret = 0;
+		exit_code = 0;
 		goto image_close_out;
 	}
 
-	if ((img_data_size = img_raw_size(img)) < 0)
-		goto image_close_out;
-
-	if (read_img_str(img, &buf, img_data_size) < 0)
-		goto image_close_out;
-
-	nft = nft_ctx_new(NFT_CTX_DEFAULT);
-	if (!nft)
-		goto buf_free_out;
-
-	if (nft_ctx_buffer_output(nft) || nft_ctx_buffer_error(nft) ||
-#if defined(CONFIG_HAS_NFTABLES_LIB_API_0)
-	    nft_run_cmd_from_buffer(nft, buf, strlen(buf)))
-#elif defined(CONFIG_HAS_NFTABLES_LIB_API_1)
-	    nft_run_cmd_from_buffer(nft, buf))
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	if (!do_restore_nftables(img))
+		exit_code = 0;
 #else
-	{
-		BUILD_BUG_ON(1);
-	}
+	pr_err("Unable to restore nftables. CRIU was built without libnftables support\n");
 #endif
-		goto nft_ctx_free_out;
 
-	ret = 0;
-
-nft_ctx_free_out:
-	nft_ctx_free(nft);
-buf_free_out:
-	xfree(buf);
 image_close_out:
 	close_image(img);
 
-	return ret;
+	return exit_code;
 }
-#endif
 
 int read_net_ns_img(void)
 {
@@ -2786,10 +2839,8 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 			ret = restore_rule(nsid);
 		if (!ret)
 			ret = restore_iptables(nsid);
-#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 		if (!ret)
 			ret = restore_nftables(nsid);
-#endif
 	}
 
 	if (!ret)
@@ -3096,6 +3147,9 @@ int network_lock_internal(void)
 {
 	int ret = 0, nsret;
 
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
+
 	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
 
@@ -3137,19 +3191,53 @@ static inline int nftables_network_unlock(void)
 #endif
 }
 
+static bool iptables_has_criu_jump_target(void)
+{
+	int fd, ret;
+	char *argv[4] = { "sh", "-c", "iptables -C INPUT -j CRIU", NULL };
+
+	fd = open("/dev/null", O_RDWR);
+	if (fd < 0) {
+		fd = -1;
+		pr_perror("failed to open /dev/null, using log fd");
+	}
+
+	ret = cr_system(fd, fd, fd, "sh", argv, CRS_CAN_FAIL);
+	close_safe(&fd);
+	return !ret;
+}
+
 static int iptables_network_unlock_internal(void)
 {
-	char conf[] = "*filter\n"
-		      ":CRIU - [0:0]\n"
-		      "-D INPUT -j CRIU\n"
-		      "-D OUTPUT -j CRIU\n"
-		      "-X CRIU\n"
-		      "COMMIT\n";
+	char delete_jump_targets[] = "*filter\n"
+				     ":CRIU - [0:0]\n"
+				     "-D INPUT -j CRIU\n"
+				     "-D OUTPUT -j CRIU\n"
+				     "COMMIT\n";
+
+	char delete_criu_chain[] = "*filter\n"
+				   ":CRIU - [0:0]\n"
+				   "-X CRIU\n"
+				   "COMMIT\n";
+
 	int ret = 0;
 
-	ret |= iptables_restore(false, conf, sizeof(conf) - 1);
+	ret |= iptables_restore(false, delete_jump_targets, sizeof(delete_jump_targets) - 1);
 	if (kdat.ipv6)
-		ret |= iptables_restore(true, conf, sizeof(conf) - 1);
+		ret |= iptables_restore(true, delete_jump_targets, sizeof(delete_jump_targets) - 1);
+
+	/* For compatibility with iptables-nft backend, we need to make sure that all jump
+	 * targets have been removed before deleting the CRIU chain.
+	 */
+	if (iptables_has_criu_jump_target()) {
+		ret |= iptables_restore(false, delete_jump_targets, sizeof(delete_jump_targets) - 1);
+		if (kdat.ipv6)
+			ret |= iptables_restore(true, delete_jump_targets, sizeof(delete_jump_targets) - 1);
+	}
+
+	ret |= iptables_restore(false, delete_criu_chain, sizeof(delete_criu_chain) - 1);
+	if (kdat.ipv6)
+		ret |= iptables_restore(true, delete_criu_chain, sizeof(delete_criu_chain) - 1);
 
 	return ret;
 }
@@ -3157,6 +3245,9 @@ static int iptables_network_unlock_internal(void)
 static int network_unlock_internal(void)
 {
 	int ret = 0, nsret;
+
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
 
 	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
@@ -3207,7 +3298,7 @@ void network_unlock(void)
 
 int veth_pair_add(char *in, char *out)
 {
-	char *e_str;
+	cleanup_free char *e_str = NULL;
 
 	e_str = xmalloc(200); /* For 3 IFNAMSIZ + 8 service characters */
 	if (!e_str)
@@ -3230,7 +3321,7 @@ int macvlan_ext_add(struct external *ext)
 /*
  * The setns() syscall (called by switch_ns()) can be extremely
  * slow. If we call it two or more times from the same task the
- * kernel will synchonously go on a very slow routine called
+ * kernel will synchronously go on a very slow routine called
  * synchronize_rcu() trying to put a reference on old namespaces.
  *
  * To avoid doing this more than once we pre-create all the
@@ -3381,7 +3472,7 @@ int collect_net_namespaces(bool for_dump)
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");
 
-struct ns_id *net_get_root_ns()
+struct ns_id *net_get_root_ns(void)
 {
 	static struct ns_id *root_netns = NULL;
 
@@ -3398,7 +3489,7 @@ struct ns_id *net_get_root_ns()
 
 /*
  * socket_diag doesn't report unbound and unconnected sockets,
- * so we have to get their network namesapces explicitly
+ * so we have to get their network namespaces explicitly
  */
 struct ns_id *get_socket_ns(int lfd)
 {
@@ -3498,7 +3589,7 @@ static int move_to_bridge(struct external *ext, void *arg)
 			ret = -1;
 			goto out;
 		}
-		strlcpy(ifr.ifr_name, br, IFNAMSIZ);
+		__strlcpy(ifr.ifr_name, br, IFNAMSIZ);
 		ret = ioctl(s, SIOCBRADDIF, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't add interface %s to bridge %s", out, br);
@@ -3510,7 +3601,7 @@ static int move_to_bridge(struct external *ext, void *arg)
 		 * $ ip link set dev <device> up
 		 */
 		ifr.ifr_ifindex = 0;
-		strlcpy(ifr.ifr_name, out, IFNAMSIZ);
+		__strlcpy(ifr.ifr_name, out, IFNAMSIZ);
 		ret = ioctl(s, SIOCGIFFLAGS, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't get flags of interface %s", out);

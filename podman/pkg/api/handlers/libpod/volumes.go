@@ -1,3 +1,5 @@
+//go:build !remote
+
 package libpod
 
 import (
@@ -8,16 +10,16 @@ import (
 
 	"errors"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/containers/podman/v4/pkg/domain/filters"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi/parse"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/domain/filters"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi/parse"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/gorilla/schema"
 )
 
@@ -119,33 +121,13 @@ func ListVolumes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	volumeFilters := []libpod.VolumeFilter{}
-	for filter, filterValues := range *filterMap {
-		filterFunc, err := filters.GenerateVolumeFilters(filter, filterValues, runtime)
-		if err != nil {
-			utils.InternalServerError(w, err)
-			return
-		}
-		volumeFilters = append(volumeFilters, filterFunc)
-	}
-
-	vols, err := runtime.Volumes(volumeFilters...)
+	ic := abi.ContainerEngine{Libpod: runtime}
+	volumeConfigs, err := ic.VolumeList(r.Context(), entities.VolumeListOptions{Filter: *filterMap})
 	if err != nil {
 		utils.InternalServerError(w, err)
 		return
 	}
-	volumeConfigs := make([]*entities.VolumeListReport, 0, len(vols))
-	for _, v := range vols {
-		inspectOut, err := v.Inspect()
-		if err != nil {
-			utils.InternalServerError(w, err)
-			return
-		}
-		config := entities.VolumeConfigResponse{
-			InspectVolumeData: *inspectOut,
-		}
-		volumeConfigs = append(volumeConfigs, &entities.VolumeListReport{VolumeConfigResponse: config})
-	}
+
 	utils.WriteResponse(w, http.StatusOK, volumeConfigs)
 }
 

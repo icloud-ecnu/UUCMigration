@@ -25,7 +25,6 @@ type linuxSetnsInit struct {
 	pidfdSocket   *os.File
 	config        *initConfig
 	logPipe       *os.File
-	dmzExe        *os.File
 }
 
 func (l *linuxSetnsInit) getSessionRingName() string {
@@ -49,6 +48,7 @@ func (l *linuxSetnsInit) Init() error {
 			}
 		}
 	}
+
 	if l.config.CreateConsole {
 		if err := setupConsole(l.consoleSocket, l.config, false); err != nil {
 			return err
@@ -75,6 +75,13 @@ func (l *linuxSetnsInit) Init() error {
 		if err := setupScheduler(l.config.Config); err != nil {
 			return err
 		}
+	}
+
+	// Tell our parent that we're ready to exec. This must be done before the
+	// Seccomp rules have been applied, because we need to be able to read and
+	// write to a socket.
+	if err := syncParentReady(l.pipe); err != nil {
+		return fmt.Errorf("sync ready: %w", err)
 	}
 
 	if err := selinux.SetExecLabel(l.config.ProcessLabel); err != nil {
@@ -109,13 +116,6 @@ func (l *linuxSetnsInit) Init() error {
 	if err != nil {
 		return err
 	}
-	// exec.LookPath in Go < 1.20 might return no error for an executable
-	// residing on a file system mounted with noexec flag, so perform this
-	// extra check now while we can still return a proper error.
-	// TODO: remove this once go < 1.20 is not supported.
-	if err := eaccess(name); err != nil {
-		return &os.PathError{Op: "eaccess", Path: name, Err: err}
-	}
 	// Set seccomp as close to execve as possible, so as few syscalls take
 	// place afterward (reducing the amount of syscalls that users need to
 	// enable in their seccomp profiles).
@@ -140,10 +140,6 @@ func (l *linuxSetnsInit) Init() error {
 		return fmt.Errorf("close log pipe: %w", err)
 	}
 
-	if l.dmzExe != nil {
-		l.config.Args[0] = name
-		return system.Fexecve(l.dmzExe.Fd(), l.config.Args, os.Environ())
-	}
 	// Close all file descriptors we are not passing to the container. This is
 	// necessary because the execve target could use internal runc fds as the
 	// execve path, potentially giving access to binary files from the host
@@ -154,11 +150,6 @@ func (l *linuxSetnsInit) Init() error {
 	// (otherwise the (*os.File) finaliser could close the wrong file). See
 	// CVE-2024-21626 for more information as to why this protection is
 	// necessary.
-	//
-	// This is not needed for runc-dmz, because the extra execve(2) step means
-	// that all O_CLOEXEC file descriptors have already been closed and thus
-	// the second execve(2) from runc-dmz cannot access internal file
-	// descriptors from runc.
 	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
 		return err
 	}

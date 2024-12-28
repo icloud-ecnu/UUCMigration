@@ -1,14 +1,15 @@
 package manifest
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/containers/common/pkg/auth"
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -55,10 +56,14 @@ func inspect(cmd *cobra.Command, args []string) error {
 		insecure, _ := cmd.Flags().GetBool("insecure")
 		inspectOptions.SkipTLSVerify = types.NewOptionalBool(insecure)
 	}
-	buf, err := registry.ImageEngine().ManifestInspect(registry.Context(), args[0], inspectOptions)
+	list, err := registry.ImageEngine().ManifestInspect(registry.Context(), args[0], inspectOptions)
 	if err != nil {
 		return err
 	}
-	fmt.Println(string(buf))
+	prettyJSON, err := json.MarshalIndent(list, "", "    ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(prettyJSON))
 	return nil
 }

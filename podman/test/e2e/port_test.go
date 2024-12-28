@@ -1,10 +1,12 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"fmt"
 	"strings"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -14,13 +16,17 @@ var _ = Describe("Podman port", func() {
 	It("podman port all and latest", func() {
 		result := podmanTest.Podman([]string{"port", "-a", "-l"})
 		result.WaitWithDefaultTimeout()
-		Expect(result).To(ExitWithError())
+		if IsRemote() {
+			Expect(result).To(ExitWithError(125, "unknown shorthand flag: 'l' in -l"))
+		} else {
+			Expect(result).To(ExitWithError(125, "--all and --latest cannot be used together"))
+		}
 	})
 
 	It("podman port all and extra", func() {
 		result := podmanTest.Podman([]string{"port", "-a", "foobar"})
 		result.WaitWithDefaultTimeout()
-		Expect(result).To(ExitWithError())
+		Expect(result).To(ExitWithError(125, "no arguments are needed with --all"))
 	})
 
 	It("podman port -l nginx", func() {
@@ -106,12 +112,12 @@ var _ = Describe("Podman port", func() {
 
 	It("podman port multiple ports", func() {
 		// Acquire and release locks
-		lock1 := GetPortLock("5000")
+		lock1 := GetPortLock("5010")
 		defer lock1.Unlock()
-		lock2 := GetPortLock("5001")
+		lock2 := GetPortLock("5011")
 		defer lock2.Unlock()
 
-		setup := podmanTest.Podman([]string{"run", "--name", "test", "-dt", "-p", "5000:5000", "-p", "5001:5001", ALPINE, "top"})
+		setup := podmanTest.Podman([]string{"run", "--name", "test", "-dt", "-p", "5010:5000", "-p", "5011:5001", ALPINE, "top"})
 		setup.WaitWithDefaultTimeout()
 		Expect(setup).Should(ExitCleanly())
 
@@ -119,12 +125,12 @@ var _ = Describe("Podman port", func() {
 		result1 := podmanTest.Podman([]string{"port", "test", "5000"})
 		result1.WaitWithDefaultTimeout()
 		Expect(result1).Should(ExitCleanly())
-		Expect(result1.OutputToStringArray()).To(ContainElement(HavePrefix("0.0.0.0:5000")))
+		Expect(result1.OutputToStringArray()).To(ContainElement(HavePrefix("0.0.0.0:5010")))
 
 		// Check that the second port was honored
 		result2 := podmanTest.Podman([]string{"port", "test", "5001"})
 		result2.WaitWithDefaultTimeout()
 		Expect(result2).Should(ExitCleanly())
-		Expect(result2.OutputToStringArray()).To(ContainElement(HavePrefix("0.0.0.0:5001")))
+		Expect(result2.OutputToStringArray()).To(ContainElement(HavePrefix("0.0.0.0:5011")))
 	})
 })

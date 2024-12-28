@@ -5,12 +5,12 @@ import (
 	"fmt"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/specgenutil"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/specgenutil"
 	"github.com/spf13/cobra"
 )
 
@@ -40,7 +40,6 @@ var (
 		},
 		ValidArgsFunction: common.AutocompletePodsRunning,
 		Example: `podman pod stop mywebserverpod
-  podman pod stop --latest
   podman pod stop --time 0 490eb 3557fb`,
 	}
 )
@@ -72,9 +71,7 @@ func init() {
 }
 
 func stop(cmd *cobra.Command, args []string) error {
-	var (
-		errs utils.OutputErrors
-	)
+	var errs utils.OutputErrors
 	if cmd.Flag("time").Changed {
 		stopOptions.Timeout = stopOptions.timeoutCLI
 	}
@@ -92,7 +89,7 @@ func stop(cmd *cobra.Command, args []string) error {
 	// in the cli, first we print out all the successful attempts
 	for _, r := range responses {
 		if len(r.Errs) == 0 {
-			fmt.Println(r.Id)
+			fmt.Println(r.RawInput)
 		} else {
 			errs = append(errs, r.Errs...)
 		}

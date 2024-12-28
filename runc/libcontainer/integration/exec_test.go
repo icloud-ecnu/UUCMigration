@@ -18,7 +18,7 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
 	"github.com/opencontainers/runc/libcontainer/configs"
-	"github.com/opencontainers/runc/libcontainer/userns"
+	"github.com/opencontainers/runc/libcontainer/internal/userns"
 	"github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
@@ -136,11 +136,13 @@ func testRlimit(t *testing.T, userns bool) {
 
 	config := newTemplateConfig(t, &tParam{userns: userns})
 
-	// ensure limit is lower than what the config requests to test that in a user namespace
+	// Ensure limit is lower than what the config requests to test that in a user namespace
 	// the Setrlimit call happens early enough that we still have permissions to raise the limit.
+	// Do not change the Cur value to be equal to the Max value, please see:
+	// https://github.com/opencontainers/runc/pull/4265#discussion_r1589666444
 	ok(t, unix.Setrlimit(unix.RLIMIT_NOFILE, &unix.Rlimit{
 		Max: 1024,
-		Cur: 1024,
+		Cur: 512,
 	}))
 
 	out := runContainerOk(t, config, "/bin/sh", "-c", "ulimit -n")
@@ -722,7 +724,7 @@ func TestContainerState(t *testing.T) {
 		{Type: configs.NEWNS},
 		{Type: configs.NEWUTS},
 		// host for IPC
-		//{Type: configs.NEWIPC},
+		// {Type: configs.NEWIPC},
 		{Type: configs.NEWPID},
 		{Type: configs.NEWNET},
 	})

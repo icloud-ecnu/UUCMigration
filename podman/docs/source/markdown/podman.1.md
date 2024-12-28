@@ -32,6 +32,9 @@ The CGroup manager to use for container cgroups. Supported values are __cgroupfs
 Note: Setting this flag can cause certain commands to break when called on containers previously created by the other CGroup manager type.
 Note: CGroup manager is not supported in rootless mode when using CGroups Version V1.
 
+#### **--config**
+Location of config file. Mainly for docker compatibility, only the authentication parts of the config are supported.
+
 #### **--conmon**
 Path of the conmon binary (Default path is configured in `containers.conf`)
 
@@ -98,7 +101,7 @@ Further note that the flag is a root-level flag and must be specified before any
 #### **--network-cmd-path**=*path*
 Path to the `slirp4netns(1)` command binary to use for setting up a slirp4netns network.
 If "" is used, then the binary will first be searched using the `helper_binaries_dir` option in `containers.conf`, and second using the `$PATH` environment variable.
-**Note:** This option is deprecated and will be removed with Podman 5.0. Use the `helper_binaries_dir` option in `containers.conf` instead.
+**Note:** This option is deprecated and will be removed with Podman 6.0. Use the `helper_binaries_dir` option in `containers.conf` instead.
 
 #### **--network-config-dir**=*directory*
 
@@ -239,15 +242,20 @@ Set default location of the storage.conf file.
 
 #### **CONTAINER_CONNECTION**
 
-Override default `--connection` value to access Podman service. Also enabled --remote option.
+Override default `--connection` value to access Podman service. Automatically enables the --remote option.
 
 #### **CONTAINER_HOST**
 
-Set default `--url` value to access Podman service. Also enabled --remote option.
+Set default `--url` value to access Podman service. Automatically enables --remote option.
 
 #### **CONTAINER_SSHKEY**
 
 Set default `--identity` path to ssh key file value used to access Podman service.
+
+#### **PODMAN_CONNECTIONS_CONF**
+
+The path to the file where the system connections and farms created with `podman system connection add`
+and `podman farm add` are stored, by default it uses `~/.config/containers/podman-connections.json`.
 
 #### **STORAGE_DRIVER**
 
@@ -255,7 +263,7 @@ Set default `--storage-driver` value.
 
 #### **STORAGE_OPTS**
 
-Set default `--storage-opts` value.
+Set default `--storage-opt` value.
 
 #### **TMPDIR**
 
@@ -376,7 +384,7 @@ the exit codes follow the `chroot` standard, see below:
 | [podman-unpause(1)](podman-unpause.1.md)         | Unpause one or more containers.                                             |
 | [podman-unshare(1)](podman-unshare.1.md)         | Run a command inside of a modified user namespace.                          |
 | [podman-untag(1)](podman-untag.1.md)             | Remove one or more names from a locally-stored image.                       |
-| [podman-update(1)](podman-update.1.md)           | Update the cgroup configuration of a given container.                       |
+| [podman-update(1)](podman-update.1.md)           | Update the configuration of a given container.                              |
 | [podman-version(1)](podman-version.1.md)         | Display the Podman version information.                                     |
 | [podman-volume(1)](podman-volume.1.md)           | Simple management tool for volumes.                                         |
 | [podman-wait(1)](podman-wait.1.md)               | Wait on one or more containers to stop and print their exit codes.          |
@@ -399,9 +407,9 @@ The mounts.conf file specifies volume mount directories that are automatically m
 
 When Podman runs in rootless mode, the file `$HOME/.config/containers/mounts.conf` overrides the default if it exists. For details, see containers-mounts.conf(5).
 
-**policy.json** (`/etc/containers/policy.json`)
+**policy.json** (`/etc/containers/policy.json`, `$HOME/.config/containers/policy.json`)
 
-Signature verification policy files are used to specify policy, e.g. trusted keys, applicable when deciding whether to accept an image, or individual signatures of that image, as valid.
+Signature verification policy files are used to specify policy, e.g. trusted keys, applicable when deciding whether to accept an image, or individual signatures of that image, as valid. For details, see containers-policy.json(5).
 
 **registries.conf** (`/etc/containers/registries.conf`, `$HOME/.config/containers/registries.conf`)
 
@@ -440,6 +448,10 @@ Or just add the content manually.
 
 See the `subuid(5)` and `subgid(5)` man pages for more information.
 
+
+
+Note: whitespace in any row of /etc/subuid or /etc/subgid, including trailing blanks, may result in no entry failures.
+
 Images are pulled under `XDG_DATA_HOME` when specified, otherwise in the home directory of the user under `.local/share/containers/storage`.
 
 Currently slirp4netns or pasta is required to be installed to create a network
@@ -454,10 +466,16 @@ The Overlay file system (OverlayFS) is not supported with kernels prior to 5.12.
 
 The Network File System (NFS) and other distributed file systems (for example: Lustre, Spectrum Scale, the General Parallel File System (GPFS)) are not supported when running in rootless mode as these file systems do not understand user namespace.  However, rootless Podman can make use of an NFS Homedir by modifying the `$HOME/.config/containers/storage.conf` to have the `graphroot` option point to a directory stored on local (Non NFS) storage.
 
-For more information, see the [Podman Troubleshooting Page](https://github.com/containers/podman/blob/main/troubleshooting.md).
-
 ## SEE ALSO
 **[containers-mounts.conf(5)](https://github.com/containers/common/blob/main/docs/containers-mounts.conf.5.md)**, **[containers.conf(5)](https://github.com/containers/common/blob/main/docs/containers.conf.5.md)**, **[containers-registries.conf(5)](https://github.com/containers/image/blob/main/docs/containers-registries.conf.5.md)**, **[containers-storage.conf(5)](https://github.com/containers/storage/blob/main/docs/containers-storage.conf.5.md)**, **[buildah(1)](https://github.com/containers/buildah/blob/main/docs/buildah.1.md)**, **oci-hooks(5)**, **[containers-policy.json(5)](https://github.com/containers/image/blob/main/docs/containers-policy.json.5.md)**, **[crun(1)](https://github.com/containers/crun/blob/main/crun.1.md)**, **[runc(8)](https://github.com/opencontainers/runc/blob/main/man/runc.8.md)**, **[subuid(5)](https://www.unix.com/man-page/linux/5/subuid)**, **[subgid(5)](https://www.unix.com/man-page/linux/5/subgid)**, **[slirp4netns(1)](https://github.com/rootless-containers/slirp4netns/blob/master/slirp4netns.1.md)**, **[pasta(1)](https://passt.top/builds/latest/web/passt.1.html)**, **[conmon(8)](https://github.com/containers/conmon/blob/main/docs/conmon.8.md)**
+
+### Troubleshooting
+
+See [podman-troubleshooting(7)](https://github.com/containers/podman/blob/main/troubleshooting.md)
+for solutions to common issues.
+
+See [podman-rootless(7)](https://github.com/containers/podman/blob/main/rootless.md)
+for rootless issues.
 
 ## HISTORY
 Dec 2016, Originally compiled by Dan Walsh <dwalsh@redhat.com>

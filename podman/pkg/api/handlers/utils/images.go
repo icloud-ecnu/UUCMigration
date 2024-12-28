@@ -1,3 +1,5 @@
+//go:build !remote
+
 package utils
 
 import (
@@ -14,10 +16,9 @@ import (
 	storageTransport "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/errorhandling"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/errorhandling"
 	"github.com/containers/storage"
 	"github.com/docker/distribution/registry/api/errcode"
 	"github.com/docker/docker/pkg/jsonmessage"
@@ -28,7 +29,11 @@ import (
 // request is for the compat API and if containers.conf set the specific mode.
 // If nameOrID is a (short) ID for a local image, the full ID will be returned.
 func NormalizeToDockerHub(r *http.Request, nameOrID string) (string, error) {
-	if IsLibpodRequest(r) || !util.DefaultContainerConfig().Engine.CompatAPIEnforceDockerHub {
+	cfg, err := config.Default()
+	if err != nil {
+		return "", err
+	}
+	if IsLibpodRequest(r) || !cfg.Engine.CompatAPIEnforceDockerHub {
 		return nameOrID, nil
 	}
 
@@ -60,11 +65,16 @@ func NormalizeToDockerHub(r *http.Request, nameOrID string) (string, error) {
 // PossiblyEnforceDockerHub sets fields in the system context to enforce
 // resolving short names to Docker Hub if the request is for the compat API and
 // if containers.conf set the specific mode.
-func PossiblyEnforceDockerHub(r *http.Request, sys *types.SystemContext) {
-	if IsLibpodRequest(r) || !util.DefaultContainerConfig().Engine.CompatAPIEnforceDockerHub {
-		return
+func PossiblyEnforceDockerHub(r *http.Request, sys *types.SystemContext) error {
+	cfg, err := config.Default()
+	if err != nil {
+		return err
+	}
+	if IsLibpodRequest(r) || !cfg.Engine.CompatAPIEnforceDockerHub {
+		return nil
 	}
 	sys.PodmanOnlyShortNamesIgnoreRegistriesConfAndForceDockerHub = true
+	return nil
 }
 
 // IsRegistryReference checks if the specified name points to the "docker://"

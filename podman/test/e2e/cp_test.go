@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -6,7 +8,7 @@ import (
 	"os/user"
 	"path/filepath"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -40,7 +42,7 @@ var _ = Describe("Podman cp", func() {
 		// Cannot copy to a nonexistent path (note the trailing "/").
 		session = podmanTest.Podman([]string{"cp", srcFile.Name(), name + ":foo/"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, `"foo/" could not be found on container`))
 
 		// The file will now be created (and written to).
 		session = podmanTest.Podman([]string{"cp", srcFile.Name(), name + ":foo"})

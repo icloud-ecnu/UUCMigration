@@ -18,7 +18,6 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink/nl"
-	"golang.org/x/sys/execabs"
 	"golang.org/x/sys/unix"
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
@@ -26,7 +25,6 @@ import (
 	"github.com/opencontainers/runc/libcontainer/dmz"
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
 	"github.com/opencontainers/runc/libcontainer/system"
-	"github.com/opencontainers/runc/libcontainer/system/kernelversion"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
@@ -98,7 +96,7 @@ func (c *Container) Status() (Status, error) {
 func (c *Container) State() (*State, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
-	return c.currentState()
+	return c.currentState(), nil
 }
 
 // OCIState returns the current container's state information.
@@ -203,28 +201,16 @@ func (c *Container) Set(config configs.Config) error {
 func (c *Container) Start(process *Process) error {
 	c.m.Lock()
 	defer c.m.Unlock()
-	if c.config.Cgroups.Resources.SkipDevices {
-		return errors.New("can't start container with SkipDevices set")
-	}
-	if process.Init {
-		if err := c.createExecFifo(); err != nil {
-			return err
-		}
-	}
-	if err := c.start(process); err != nil {
-		if process.Init {
-			c.deleteExecFifo()
-		}
-		return err
-	}
-	return nil
+	return c.start(process)
 }
 
 // Run immediately starts the process inside the container. Returns an error if
 // the process fails to start. It does not block waiting for the exec fifo
 // after start returns but opens the fifo after start returns.
 func (c *Container) Run(process *Process) error {
-	if err := c.Start(process); err != nil {
+	c.m.Lock()
+	defer c.m.Unlock()
+	if err := c.start(process); err != nil {
 		return err
 	}
 	if process.Init {
@@ -313,6 +299,23 @@ type openResult struct {
 }
 
 func (c *Container) start(process *Process) (retErr error) {
+	if c.config.Cgroups.Resources.SkipDevices {
+		return errors.New("can't start container with SkipDevices set")
+	}
+	if process.Init {
+		if c.initProcessStartTime != 0 {
+			return errors.New("container already has init process")
+		}
+		if err := c.createExecFifo(); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil {
+				c.deleteExecFifo()
+			}
+		}()
+	}
+
 	parent, err := c.newParentProcess(process)
 	if err != nil {
 		return fmt.Errorf("unable to create new parent process: %w", err)
@@ -382,11 +385,26 @@ func (c *Container) Signal(s os.Signal) error {
 	// leftover processes. Handle this special case here.
 	if s == unix.SIGKILL && !c.config.Namespaces.IsPrivate(configs.NEWPID) {
 		if err := signalAllProcesses(c.cgroupManager, unix.SIGKILL); err != nil {
+			if c.config.RootlessCgroups { // may not have an access to cgroup
+				logrus.WithError(err).Warn("failed to kill all processes, possibly due to lack of cgroup (Hint: enable cgroup v2 delegation)")
+				// Some processes may leak when cgroup is not delegated
+				// https://github.com/opencontainers/runc/pull/4395#pullrequestreview-2291179652
+				return c.signal(s)
+			}
+			// For not rootless container, if there is no init process and no cgroup,
+			// it means that the container is not running.
+			if errors.Is(err, ErrCgroupNotExist) && !c.hasInit() {
+				err = ErrNotRunning
+			}
 			return fmt.Errorf("unable to kill all processes: %w", err)
 		}
 		return nil
 	}
 
+	return c.signal(s)
+}
+
+func (c *Container) signal(s os.Signal) error {
 	// To avoid a PID reuse attack, don't kill non-running container.
 	if !c.hasInit() {
 		return ErrNotRunning
@@ -405,7 +423,7 @@ func (c *Container) Signal(s os.Signal) error {
 	return nil
 }
 
-func (c *Container) createExecFifo() error {
+func (c *Container) createExecFifo() (retErr error) {
 	rootuid, err := c.Config().HostRootUID()
 	if err != nil {
 		return err
@@ -416,12 +434,14 @@ func (c *Container) createExecFifo() error {
 	}
 
 	fifoName := filepath.Join(c.stateDir, execFifoFilename)
-	if _, err := os.Stat(fifoName); err == nil {
-		return fmt.Errorf("exec fifo %s already exists", fifoName)
-	}
 	if err := unix.Mkfifo(fifoName, 0o622); err != nil {
 		return &os.PathError{Op: "mkfifo", Path: fifoName, Err: err}
 	}
+	defer func() {
+		if retErr != nil {
+			os.Remove(fifoName)
+		}
+	}()
 	// Ensure permission bits (can be different because of umask).
 	if err := os.Chmod(fifoName, 0o622); err != nil {
 		return err
@@ -452,68 +472,21 @@ func (c *Container) includeExecFifo(cmd *exec.Cmd) error {
 	return nil
 }
 
-// No longer needed in Go 1.21.
-func slicesContains[S ~[]E, E comparable](slice S, needle E) bool {
-	for _, val := range slice {
-		if val == needle {
-			return true
-		}
-	}
-	return false
-}
-
-func isDmzBinarySafe(c *configs.Config) bool {
-	if !dmz.WorksWithSELinux(c) {
-		return false
-	}
-
-	// Because we set the dumpable flag in nsexec, the only time when it is
-	// unsafe to use runc-dmz is when the container process would be able to
-	// race against "runc init" and bypass the ptrace_may_access() checks.
-	//
-	// This is only the case if the container processes could have
-	// CAP_SYS_PTRACE somehow (i.e. the capability is present in the bounding,
-	// inheritable, or ambient sets). Luckily, most containers do not have this
-	// capability.
-	if c.Capabilities == nil ||
-		(!slicesContains(c.Capabilities.Bounding, "CAP_SYS_PTRACE") &&
-			!slicesContains(c.Capabilities.Inheritable, "CAP_SYS_PTRACE") &&
-			!slicesContains(c.Capabilities.Ambient, "CAP_SYS_PTRACE")) {
-		return true
-	}
-
-	// Since Linux 4.10 (see bfedb589252c0) user namespaced containers cannot
-	// access /proc/$pid/exe of runc after it joins the namespace (until it
-	// does an exec), regardless of the capability set. This has been
-	// backported to other distribution kernels, but there's no way of checking
-	// this cheaply -- better to be safe than sorry here.
-	linux410 := kernelversion.KernelVersion{Kernel: 4, Major: 10}
-	if ok, err := kernelversion.GreaterEqualThan(linux410); ok && err == nil {
-		if c.Namespaces.Contains(configs.NEWUSER) {
-			return true
-		}
-	}
-
-	// Assume it's unsafe otherwise.
-	return false
-}
-
 func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	comm, err := newProcessComm()
 	if err != nil {
 		return nil, err
 	}
 
-	// Make sure we use a new safe copy of /proc/self/exe or the runc-dmz
-	// binary each time this is called, to make sure that if a container
-	// manages to overwrite the file it cannot affect other containers on the
-	// system. For runc, this code will only ever be called once, but
-	// libcontainer users might call this more than once.
+	// Make sure we use a new safe copy of /proc/self/exe binary each time, this
+	// is called to make sure that if a container manages to overwrite the file,
+	// it cannot affect other containers on the system. For runc, this code will
+	// only ever be called once, but libcontainer users might call this more than
+	// once.
 	p.closeClonedExes()
 	var (
 		exePath string
-		// only one of dmzExe or safeExe are used at a time
-		dmzExe, safeExe *os.File
+		safeExe *os.File
 	)
 	if dmz.IsSelfExeCloned() {
 		// /proc/self/exe is already a cloned binary -- no need to do anything
@@ -524,42 +497,13 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		exePath = "/proc/self/exe"
 	} else {
 		var err error
-		if isDmzBinarySafe(c.config) {
-			dmzExe, err = dmz.Binary(c.stateDir)
-			if err == nil {
-				// We can use our own executable without cloning if we are
-				// using runc-dmz. We don't need to use /proc/thread-self here
-				// because the exe mm of a thread-group is guaranteed to be the
-				// same for all threads by definition. This lets us avoid
-				// having to do runtime.LockOSThread.
-				exePath = "/proc/self/exe"
-				p.clonedExes = append(p.clonedExes, dmzExe)
-				logrus.Debug("runc-dmz: using runc-dmz") // used for tests
-			} else if errors.Is(err, dmz.ErrNoDmzBinary) {
-				logrus.Debug("runc-dmz binary not embedded in runc binary, falling back to /proc/self/exe clone")
-			} else if err != nil {
-				return nil, fmt.Errorf("failed to create runc-dmz binary clone: %w", err)
-			}
-		} else {
-			// If the configuration makes it unsafe to use runc-dmz, pretend we
-			// don't have it embedded so we do /proc/self/exe cloning.
-			logrus.Debug("container configuration unsafe for runc-dmz, falling back to /proc/self/exe clone")
-			err = dmz.ErrNoDmzBinary
+		safeExe, err = dmz.CloneSelfExe(c.stateDir)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create safe /proc/self/exe clone for runc init: %w", err)
 		}
-		if errors.Is(err, dmz.ErrNoDmzBinary) {
-			safeExe, err = dmz.CloneSelfExe(c.stateDir)
-			if err != nil {
-				return nil, fmt.Errorf("unable to create safe /proc/self/exe clone for runc init: %w", err)
-			}
-			exePath = "/proc/self/fd/" + strconv.Itoa(int(safeExe.Fd()))
-			p.clonedExes = append(p.clonedExes, safeExe)
-			logrus.Debug("runc-dmz: using /proc/self/exe clone") // used for tests
-		}
-		// Just to make sure we don't run without protection.
-		if dmzExe == nil && safeExe == nil {
-			// This should never happen.
-			return nil, fmt.Errorf("[internal error] attempted to spawn a container with no /proc/self/exe protection")
-		}
+		exePath = "/proc/self/fd/" + strconv.Itoa(int(safeExe.Fd()))
+		p.clonedExes = append(p.clonedExes, safeExe)
+		logrus.Debug("runc-dmz: using /proc/self/exe clone") // used for tests
 	}
 
 	cmd := exec.Command(exePath, "init")
@@ -589,12 +533,6 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		"_LIBCONTAINER_SYNCPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
 	)
 
-	if dmzExe != nil {
-		cmd.ExtraFiles = append(cmd.ExtraFiles, dmzExe)
-		cmd.Env = append(cmd.Env,
-			"_LIBCONTAINER_DMZEXEFD="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
-	}
-
 	cmd.ExtraFiles = append(cmd.ExtraFiles, comm.logPipeChild)
 	cmd.Env = append(cmd.Env,
 		"_LIBCONTAINER_LOGPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
@@ -609,6 +547,8 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		)
 	}
 
+	// TODO: After https://go-review.googlesource.com/c/go/+/515799 included
+	// in go versions supported by us, we can remove this logic.
 	if safeExe != nil {
 		// Due to a Go stdlib bug, we need to add safeExe to the set of
 		// ExtraFiles otherwise it is possible for the stdlib to clobber the fd
@@ -619,6 +559,18 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		//
 		// See <https://github.com/golang/go/issues/61751>.
 		cmd.ExtraFiles = append(cmd.ExtraFiles, safeExe)
+
+		// There is a race situation when we are opening a file, if there is a
+		// small fd was closed at that time, maybe it will be reused by safeExe.
+		// Because of Go stdlib fds shuffling bug, if the fd of safeExe is too
+		// small, go stdlib will dup3 it to another fd, or dup3 a other fd to this
+		// fd, then it will cause the fd type cmd.Path refers to a random path,
+		// and it can lead to an error "permission denied" when starting the process.
+		// Please see #4294.
+		// So we should not use the original fd of safeExe, but use the fd after
+		// shuffled by Go stdlib. Because Go stdlib will guarantee this fd refers to
+		// the correct file.
+		cmd.Path = "/proc/self/fd/" + strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1)
 	}
 
 	// NOTE: when running a container with no PID namespace and the parent
@@ -672,10 +624,7 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 
 func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, comm *processComm) (*setnsProcess, error) {
 	cmd.Env = append(cmd.Env, "_LIBCONTAINER_INITTYPE="+string(initSetns))
-	state, err := c.currentState()
-	if err != nil {
-		return nil, fmt.Errorf("unable to get container state: %w", err)
-	}
+	state := c.currentState()
 	// for setns process, we don't have to set cloneflags as the process namespaces
 	// will only be set via setns syscall
 	data, err := c.bootstrapData(0, state.NamespacePaths)
@@ -853,12 +802,8 @@ func (c *Container) updateState(process parentProcess) (*State, error) {
 	if process != nil {
 		c.initProcess = process
 	}
-	state, err := c.currentState()
-	if err != nil {
-		return nil, err
-	}
-	err = c.saveState(state)
-	if err != nil {
+	state := c.currentState()
+	if err := c.saveState(state); err != nil {
 		return nil, err
 	}
 	return state, nil
@@ -944,7 +889,7 @@ func (c *Container) isPaused() (bool, error) {
 	return state == configs.Frozen, nil
 }
 
-func (c *Container) currentState() (*State, error) {
+func (c *Container) currentState() *State {
 	var (
 		startTime           uint64
 		externalDescriptors []string
@@ -988,7 +933,7 @@ func (c *Container) currentState() (*State, error) {
 			}
 		}
 	}
-	return state, nil
+	return state
 }
 
 func (c *Container) currentOCIState() (*specs.State, error) {
@@ -1111,7 +1056,7 @@ func (c *Container) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Namespa
 				// We resolve the paths for new{u,g}idmap from
 				// the context of runc to avoid doing a path
 				// lookup in the nsexec context.
-				if path, err := execabs.LookPath("newuidmap"); err == nil {
+				if path, err := exec.LookPath("newuidmap"); err == nil {
 					r.AddData(&Bytemsg{
 						Type:  UidmapPathAttr,
 						Value: []byte(path),
@@ -1139,7 +1084,7 @@ func (c *Container) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Namespa
 				Value: b,
 			})
 			if c.config.RootlessEUID {
-				if path, err := execabs.LookPath("newgidmap"); err == nil {
+				if path, err := exec.LookPath("newgidmap"); err == nil {
 					r.AddData(&Bytemsg{
 						Type:  GidmapPathAttr,
 						Value: []byte(path),

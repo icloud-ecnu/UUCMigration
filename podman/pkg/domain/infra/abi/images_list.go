@@ -1,13 +1,15 @@
+//go:build !remote
+
 package abi
 
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/containers/common/libimage"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 )
 
 func (ir *ImageEngine) List(ctx context.Context, opts entities.ImageListOptions) ([]*entities.ImageSummary, error) {
@@ -15,14 +17,14 @@ func (ir *ImageEngine) List(ctx context.Context, opts entities.ImageListOptions)
 		Filters:     opts.Filter,
 		SetListData: true,
 	}
-	if !opts.All && !util.StringInSlice("intermediate=true", listImagesOptions.Filters) {
+	if !opts.All && !slices.Contains(listImagesOptions.Filters, "intermediate=true") {
 		// Filter intermediate images unless we want to list *all*.
 		// NOTE: it's a positive filter, so `intermediate=false` means
 		// to display non-intermediate images.
 		listImagesOptions.Filters = append(listImagesOptions.Filters, "intermediate=false")
 	}
 
-	images, err := ir.Libpod.LibimageRuntime().ListImages(ctx, nil, listImagesOptions)
+	images, err := ir.Libpod.LibimageRuntime().ListImages(ctx, listImagesOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -56,6 +58,21 @@ func (ir *ImageEngine) List(ctx context.Context, opts entities.ImageListOptions)
 				SharedSize:  0,
 				RepoTags:    img.Names(), // may include tags and digests
 				ParentId:    parentID,
+			}
+			if opts.ExtendedAttributes {
+				iml, err := img.IsManifestList(ctx)
+				if err != nil {
+					return nil, err
+				}
+				s.IsManifestList = &iml
+				if !iml {
+					imgData, err := img.Inspect(ctx, nil)
+					if err != nil {
+						return nil, err
+					}
+					s.Arch = imgData.Architecture
+					s.Os = imgData.Os
+				}
 			}
 			s.Labels, err = img.Labels(ctx)
 			if err != nil {

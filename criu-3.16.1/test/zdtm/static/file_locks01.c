@@ -107,7 +107,7 @@ static int check_file_lock(int fd, char *expected_type, char *expected_option, u
 		memset(fl_type, 0, sizeof(fl_type));
 		memset(fl_option, 0, sizeof(fl_option));
 
-		num = sscanf(buf, "%*s %*d:%s %s %s %d %x:%x:%ld %*d %*s", fl_flag, fl_type, fl_option, &fl_owner, &maj,
+		num = sscanf(buf, "%*s %*d:%15s %15s %15s %d %x:%x:%ld %*d %*s", fl_flag, fl_type, fl_option, &fl_owner, &maj,
 			     &min, &i_no);
 		if (num < 7) {
 			pr_err("Invalid lock info\n");
@@ -159,7 +159,6 @@ int main(int argc, char **argv)
 
 	flock(fd_0, LOCK_SH);
 	flock(fd_1, LOCK_EX);
-	flock(fd_2, LOCK_MAND | LOCK_READ);
 
 	test_daemon();
 	test_waitsig();
@@ -172,11 +171,6 @@ int main(int argc, char **argv)
 		fail("Failed on fd %d", fd_1);
 		ret |= 1;
 	}
-	if (check_file_lock(fd_2, "MSNFS", "READ", dev, inodes[2])) {
-		fail("Failed on fd %d", fd_2);
-		ret |= 1;
-	}
-
 	if (!ret)
 		pass();
 

@@ -1,5 +1,4 @@
 //go:build linux && !remote
-// +build linux,!remote
 
 package kube
 
@@ -10,11 +9,12 @@ import (
 	"testing"
 
 	"github.com/containers/common/pkg/secrets"
-	v1 "github.com/containers/podman/v4/pkg/k8s.io/api/core/v1"
-	"github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/api/resource"
-	v12 "github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/apis/meta/v1"
-	"github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/util/intstr"
-	"github.com/containers/podman/v4/pkg/specgen"
+	"github.com/containers/podman/v5/libpod/define"
+	v1 "github.com/containers/podman/v5/pkg/k8s.io/api/core/v1"
+	"github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/api/resource"
+	v12 "github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/util/intstr"
+	"github.com/containers/podman/v5/pkg/specgen"
 	"github.com/docker/docker/pkg/meminfo"
 	"github.com/stretchr/testify/assert"
 	"sigs.k8s.io/yaml"
@@ -224,7 +224,6 @@ func TestConfigMapVolumes(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			result, err := VolumeFromConfigMap(test.volume.ConfigMap, test.configmaps)
 			if test.errorMessage == "" {
@@ -434,7 +433,6 @@ func TestEnvVarsFrom(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			result, err := envVarsFrom(test.envFrom, &test.options)
 			assert.Equal(t, err == nil, test.succeed)
@@ -1027,7 +1025,6 @@ func TestEnvVarValue(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			result, err := envVarValue(test.envVar, &test.options)
 			assert.Equal(t, err == nil, test.succeed)
@@ -1270,7 +1267,6 @@ func TestHttpLivenessProbe(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			err := setupLivenessProbe(&test.specGenerator, test.container, test.restartPolicy)
 			if err == nil {
@@ -1372,14 +1368,32 @@ func TestTCPLivenessProbe(t *testing.T) {
 			"myservice.domain.com",
 			"4000",
 		},
+		{
+			"TCPLivenessProbeNormalWithOnFailureRestartPolicy",
+			specgen.SpecGenerator{},
+			v1.Container{
+				LivenessProbe: &v1.Probe{
+					Handler: v1.Handler{
+						TCPSocket: &v1.TCPSocketAction{
+							Host: "127.0.0.1",
+							Port: intstr.FromInt(8080),
+						},
+					},
+				},
+			},
+			"on-failure",
+			true,
+			"127.0.0.1",
+			"8080",
+		},
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			err := setupLivenessProbe(&test.specGenerator, test.container, test.restartPolicy)
 			assert.Equal(t, err == nil, test.succeed)
 			if err == nil {
+				assert.Equal(t, int(test.specGenerator.ContainerHealthCheckConfig.HealthCheckOnFailureAction), define.HealthCheckOnFailureActionRestart)
 				assert.Contains(t, test.specGenerator.ContainerHealthCheckConfig.HealthConfig.Test, test.expectedHost)
 				assert.Contains(t, test.specGenerator.ContainerHealthCheckConfig.HealthConfig.Test, test.expectedPort)
 			}

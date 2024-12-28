@@ -1,7 +1,9 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -16,13 +18,21 @@ var _ = Describe("Podman pod pause", func() {
 	It("podman pod pause bogus pod", func() {
 		session := podmanTest.Podman([]string{"pod", "pause", "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		expect := "no pod with name or ID foobar found: no such pod"
+		if IsRemote() {
+			expect = `unable to find pod "foobar": no such pod`
+		}
+		Expect(session).To(ExitWithError(125, expect))
 	})
 
 	It("podman unpause bogus pod", func() {
 		session := podmanTest.Podman([]string{"pod", "unpause", "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		expect := "no pod with name or ID foobar found: no such pod"
+		if IsRemote() {
+			expect = `unable to find pod "foobar": no such pod`
+		}
+		Expect(session).To(ExitWithError(125, expect))
 	})
 
 	It("podman pod pause a created pod by id", func() {

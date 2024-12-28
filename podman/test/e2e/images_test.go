@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -5,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	"github.com/docker/go-units"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -148,7 +150,7 @@ var _ = Describe("Podman images", func() {
 		result := podmanTest.Podman([]string{"images", "-q", "-f", "reference=quay.io/libpod/*"})
 		result.WaitWithDefaultTimeout()
 		Expect(result).Should(ExitCleanly())
-		Expect(result.OutputToStringArray()).To(HaveLen(10))
+		Expect(result.OutputToStringArray()).To(HaveLen(9))
 
 		retalpine := podmanTest.Podman([]string{"images", "-f", "reference=*lpine*"})
 		retalpine.WaitWithDefaultTimeout()
@@ -217,8 +219,8 @@ WORKDIR /test
 		podmanTest.BuildImage(dockerfile, "foobar.com/before:latest", "false")
 		result := podmanTest.Podman([]string{"images", "-q", "-f", "dangling=true"})
 		result.WaitWithDefaultTimeout()
-		Expect(result).Should(Exit(0), "dangling image output: %q", result.OutputToString())
-		Expect(result.OutputToStringArray()).Should(BeEmpty(), "dangling image output: %q", result.OutputToString())
+		Expect(result).Should(ExitCleanly())
+		Expect(result.OutputToStringArray()).Should(BeEmpty(), "dangling image output")
 	})
 
 	It("podman images filter intermediate", func() {
@@ -494,6 +496,55 @@ RUN > file2
 		result = podmanTest.Podman([]string{"image", "list", "--filter", "label=abc"})
 		Expect(result.OutputToStringArray()).To(BeEmpty())
 
+	})
+
+	It("podman images filter should be AND logic", func() {
+		dockerfile := `FROM quay.io/libpod/alpine:latest
+LABEL abc=""
+LABEL xyz=""
+`
+		podmanTest.BuildImage(dockerfile, "test-abc-xyz", "true")
+
+		dockerfile2 := `FROM quay.io/libpod/alpine:latest
+LABEL xyz="bar"
+`
+		podmanTest.BuildImage(dockerfile2, "test-xyz", "true")
+
+		session := podmanTest.Podman([]string{"images", "-f", "label=xyz"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToStringArray()).To(HaveLen(3))
+		Expect(session.OutputToString()).To(ContainSubstring("test-abc-xyz"))
+		Expect(session.OutputToString()).To(ContainSubstring("test-xyz"))
+
+		session = podmanTest.Podman([]string{"images", "-f", "label=xyz=bar"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToStringArray()).To(HaveLen(2))
+		Expect(session.OutputToString()).To(ContainSubstring("test-xyz"))
+
+		session = podmanTest.Podman([]string{"images", "-f", "label=abc"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToStringArray()).To(HaveLen(2))
+		Expect(session.OutputToString()).To(ContainSubstring("test-abc-xyz"))
+
+		session = podmanTest.Podman([]string{"images", "-f", "label=abc", "-f", "label=xyz"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToStringArray()).To(HaveLen(2))
+		Expect(session.OutputToString()).To(ContainSubstring("test-abc-xyz"))
+
+		session = podmanTest.Podman([]string{"images", "-f", "label=xyz=bar", "-f", "label=abc"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToStringArray()).To(HaveLen(1))
+
+		session = podmanTest.Podman([]string{"images", "-f", "label=xyz", "-f", "reference=test-abc-xyz"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToStringArray()).To(HaveLen(2))
+		Expect(session.OutputToString()).To(ContainSubstring("test-abc-xyz"))
 	})
 
 })

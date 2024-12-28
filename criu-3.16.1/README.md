@@ -1,6 +1,11 @@
-![X86_64 GCC Test](https://github.com/checkpoint-restore/criu/workflows/X86_64%20GCC%20Test/badge.svg)
-![Podman Test](https://github.com/checkpoint-restore/criu/workflows/Podman%20Test/badge.svg)
-[![CircleCI](https://circleci.com/gh/checkpoint-restore/criu.svg?style=svg)](https://circleci.com/gh/checkpoint-restore/criu)
+[![X86_64 GCC Test](https://github.com/checkpoint-restore/criu/workflows/X86_64%20GCC%20Test/badge.svg)](
+    https://github.com/checkpoint-restore/criu/actions/workflows/x86-64-gcc-test.yml)
+[![Docker Test](https://github.com/checkpoint-restore/criu/actions/workflows/docker-test.yml/badge.svg)](
+    https://github.com/checkpoint-restore/criu/actions/workflows/docker-test.yml)
+[![Podman Test](https://github.com/checkpoint-restore/criu/actions/workflows/podman-test.yml/badge.svg)](
+    https://github.com/checkpoint-restore/criu/actions/workflows/podman-test.yml)
+[![CircleCI](https://circleci.com/gh/checkpoint-restore/criu.svg?style=svg)](
+    https://circleci.com/gh/checkpoint-restore/criu)
 
 <p align="center"><img src="https://criu.org/w/images/1/1c/CRIU.svg" width="256px"/></p>
 
@@ -30,10 +35,10 @@ Pages worth starting with are:
 - [Installation instructions](http://criu.org/Installation)
 - [A simple example of usage](http://criu.org/Simple_loop)
 - [Examples of more advanced usage](https://criu.org/Category:HOWTO)
-- Troubleshooting can be hard, some help can be found [here](https://criu.org/When_C/R_fails), [here](https://criu.org/What_cannot_be_checkpointed) and [here](https://criu.org/FAQ)
+- Troubleshooting can be hard, some help can be found [here](https://criu.org/When_C/R_fails), [here](https://criu.org/What_cannot_be_checkpointed) and [here](https://criu.org/index.php?title=FAQ)
 
 ### Checkpoint and restore of simple loop process
-[<p align="center"><img src="https://asciinema.org/a/232445.png" width="572px" height="412px"/></p>](https://asciinema.org/a/232445)
+<p align="center"><a href="https://asciinema.org/a/232445"><img src="https://asciinema.org/a/232445.png" width="572px" height="412px"/></a></p>
 
 ## Advanced features
 

@@ -1,9 +1,11 @@
+//go:build !remote
+
 package server
 
 import (
 	"net/http"
 
-	"github.com/containers/podman/v4/pkg/api/handlers/libpod"
+	"github.com/containers/podman/v5/pkg/api/handlers/libpod"
 	"github.com/gorilla/mux"
 )
 
@@ -14,8 +16,52 @@ func (s *APIServer) registerKubeHandlers(r *mux.Router) error {
 	//  - containers
 	//  - pods
 	// summary: Play a Kubernetes YAML file.
-	// description: Create and run pods based on a Kubernetes YAML file (pod or service kind).
+	// description: |
+	//   Create and run pods based on a Kubernetes YAML file.
+	//
+	//   ### Content-Type
+	//
+	//   Then endpoint support two Content-Type
+	//    - `plain/text` for yaml format
+	//    - `application/x-tar` for sending context(s) required for building images
+	//
+	//   #### Tar format
+	//
+	//   The tar format must contain a `play.yaml` file at the root that will be used.
+	//   If the file format requires context to build an image, it uses the image name and
+	//   check for corresponding folder.
+	//
+	//   For example, the client sends a tar file with the following structure:
+	//
+	//   ```
+	//   └── content.tar
+	//    ├── play.yaml
+	//    └── foobar/
+	//        └── Containerfile
+	//   ```
+	//
+	//   The `play.yaml` is the following, the `foobar` image means we are looking for a context with this name.
+	//   ```
+	//   apiVersion: v1
+	//   kind: Pod
+	//   metadata:
+	//   name: demo-build-remote
+	//   spec:
+	//   containers:
+	//    - name: container
+	//      image: foobar
+	//   ```
+	//
 	// parameters:
+	//  - in: header
+	//    name: Content-Type
+	//    type: string
+	//    default: plain/text
+	//    enum: ["plain/text", "application/x-tar"]
+	//  - in: query
+	//    name: annotations
+	//    type: string
+	//    description: JSON encoded value of annotations (a map[string]string).
 	//  - in: query
 	//    name: logDriver
 	//    type: string
@@ -48,6 +94,10 @@ func (s *APIServer) registerKubeHandlers(r *mux.Router) error {
 	//    description: publish a container's port, or a range of ports, to the host
 	//    items:
 	//         type: string
+	//  - in: query
+	//    name: publishAllPorts
+	//    type: boolean
+	//    description: Whether to publish all ports defined in the K8S YAML file (containerPort, hostPort), if false only hostPort will be published
 	//  - in: query
 	//    name: replace
 	//    type: boolean
@@ -89,6 +139,10 @@ func (s *APIServer) registerKubeHandlers(r *mux.Router) error {
 	//    type: boolean
 	//    default: false
 	//    description: Clean up all objects created when a SIGTERM is received or pods exit.
+	//  - in: query
+	//    name: build
+	//    type: boolean
+	//    description: Build the images with corresponding context.
 	//  - in: body
 	//    name: request
 	//    description: Kubernetes YAML file.

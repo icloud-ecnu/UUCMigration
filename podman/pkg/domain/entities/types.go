@@ -2,13 +2,12 @@ package entities
 
 import (
 	"net"
-	"os"
 
-	buildahDefine "github.com/containers/buildah/define"
 	"github.com/containers/common/libnetwork/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/pkg/specgen"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	entitiesTypes "github.com/containers/podman/v5/pkg/domain/entities/types"
+	"github.com/containers/podman/v5/pkg/specgen"
 	"github.com/containers/storage/pkg/archive"
 	dockerAPI "github.com/docker/docker/api/types"
 )
@@ -56,6 +55,7 @@ type NetOptions struct {
 	DNSOptions         []string                           `json:"dns_option,omitempty"`
 	DNSSearch          []string                           `json:"dns_search,omitempty"`
 	DNSServers         []net.IP                           `json:"dns_server,omitempty"`
+	HostsFile          string                             `json:"hosts_file,omitempty"`
 	Network            specgen.Namespace                  `json:"netns,omitempty"`
 	NoHosts            bool                               `json:"no_manage_hosts,omitempty"`
 	PublishPorts       []types.PortMapping                `json:"portmappings,omitempty"`
@@ -91,7 +91,7 @@ type DiffReport struct {
 
 type EventsOptions struct {
 	FromStart bool
-	EventChan chan *events.Event
+	EventChan chan events.ReadResult
 	Filter    []string
 	Stream    bool
 	Since     string
@@ -99,43 +99,16 @@ type EventsOptions struct {
 }
 
 // ContainerCreateResponse is the response struct for creating a container
-type ContainerCreateResponse struct {
-	// ID of the container created
-	// required: true
-	ID string `json:"Id"`
-	// Warnings during container creation
-	// required: true
-	Warnings []string `json:"Warnings"`
-}
+type ContainerCreateResponse = entitiesTypes.ContainerCreateResponse
 
 // BuildOptions describe the options for building container images.
-type BuildOptions struct {
-	buildahDefine.BuildOptions
-	ContainerFiles []string
-	FarmBuildOptions
-	// Files that need to be closed after the build
-	// so need to pass this to the main build functions
-	LogFileToClose *os.File
-	TmpDirToClose  string
-}
+type BuildOptions = entitiesTypes.BuildOptions
 
 // BuildReport is the image-build report.
-type BuildReport struct {
-	// ID of the image.
-	ID string
-	// Format to save the image in
-	SaveFormat string
-}
+type BuildReport = entitiesTypes.BuildReport
 
 // FarmBuildOptions describes the options for building container images on farm nodes
-type FarmBuildOptions struct {
-	// Cleanup removes built images from farm nodes on success
-	Cleanup bool
-	// Authfile is the path to the file holding registry credentials
-	Authfile string
-	// SkipTLSVerify skips tls verification when set to true
-	SkipTLSVerify bool
-}
+type FarmBuildOptions = entitiesTypes.FarmBuildOptions
 
 type IDOrNameResponse struct {
 	// The Id or Name of an object

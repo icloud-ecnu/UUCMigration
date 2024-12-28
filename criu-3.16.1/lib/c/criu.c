@@ -238,6 +238,7 @@ void criu_local_free_opts(criu_opts *opts)
 	free(opts->rpc->freeze_cgroup);
 	free(opts->rpc->log_file);
 	free(opts->rpc->lsm_profile);
+	free(opts->rpc->lsm_mount_context);
 	free(opts->rpc);
 	criu_free_service(opts);
 	free(opts);
@@ -554,6 +555,28 @@ void criu_set_shell_job(bool shell_job)
 	criu_local_set_shell_job(global_opts, shell_job);
 }
 
+void criu_local_set_skip_file_rwx_check(criu_opts *opts, bool skip_file_rwx_check)
+{
+	opts->rpc->has_skip_file_rwx_check = true;
+	opts->rpc->skip_file_rwx_check = skip_file_rwx_check;
+}
+
+void criu_set_skip_file_rwx_check(bool skip_file_rwx_check)
+{
+	criu_local_set_skip_file_rwx_check(global_opts, skip_file_rwx_check);
+}
+
+void criu_local_set_unprivileged(criu_opts *opts, bool unprivileged)
+{
+	opts->rpc->has_unprivileged = true;
+	opts->rpc->unprivileged = unprivileged;
+}
+
+void criu_set_unprivileged(bool unprivileged)
+{
+	criu_local_set_unprivileged(global_opts, unprivileged);
+}
+
 void criu_local_set_orphan_pts_master(criu_opts *opts, bool orphan_pts_master)
 {
 	opts->rpc->has_orphan_pts_master = true;
@@ -649,6 +672,20 @@ int criu_local_set_lsm_profile(criu_opts *opts, const char *name)
 int criu_set_lsm_profile(const char *name)
 {
 	return criu_local_set_lsm_profile(global_opts, name);
+}
+
+int criu_local_set_lsm_mount_context(criu_opts *opts, const char *name)
+{
+	opts->rpc->lsm_mount_context = strdup(name);
+	if (opts->rpc->lsm_mount_context == NULL) {
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+int criu_set_lsm_mount_context(const char *name)
+{
+	return criu_local_set_lsm_mount_context(global_opts, name);
 }
 
 void criu_local_set_timeout(criu_opts *opts, unsigned int timeout)
@@ -1155,6 +1192,17 @@ int criu_set_page_server_address_port(const char *address, int port)
 	return criu_local_set_page_server_address_port(global_opts, address, port);
 }
 
+void criu_local_set_mntns_compat_mode(criu_opts *opts, bool val)
+{
+	opts->rpc->has_mntns_compat_mode = true;
+	opts->rpc->mntns_compat_mode = val;
+}
+
+void criu_set_mntns_compat_mode(bool val)
+{
+	criu_local_set_mntns_compat_mode(global_opts, val);
+}
+
 static CriuResp *recv_resp(int socket_fd)
 {
 	struct msghdr msg_hdr = { 0 };
@@ -1512,7 +1560,7 @@ int criu_check(void)
 	return criu_local_check(global_opts);
 }
 
-int criu_local_dump(criu_opts *opts)
+static int dump(bool pre_dump, criu_opts *opts)
 {
 	int ret = -1;
 	CriuReq req = CRIU_REQ__INIT;
@@ -1520,7 +1568,7 @@ int criu_local_dump(criu_opts *opts)
 
 	saved_errno = 0;
 
-	req.type = CRIU_REQ_TYPE__DUMP;
+	req.type = pre_dump ? CRIU_REQ_TYPE__SINGLE_PRE_DUMP : CRIU_REQ_TYPE__DUMP;
 	req.opts = opts->rpc;
 
 	ret = send_req_and_recv_resp(opts, &req, &resp);
@@ -1528,7 +1576,7 @@ int criu_local_dump(criu_opts *opts)
 		goto exit;
 
 	if (resp->success) {
-		if (resp->dump->has_restored && resp->dump->restored)
+		if (!pre_dump && resp->dump->has_restored && resp->dump->restored)
 			ret = 1;
 		else
 			ret = 0;
@@ -1546,9 +1594,24 @@ exit:
 	return ret;
 }
 
+int criu_local_dump(criu_opts *opts)
+{
+	return dump(false, opts);
+}
+
 int criu_dump(void)
 {
 	return criu_local_dump(global_opts);
+}
+
+int criu_local_pre_dump(criu_opts *opts)
+{
+	return dump(true, opts);
+}
+
+int criu_pre_dump(void)
+{
+	return criu_local_pre_dump(global_opts);
 }
 
 int criu_local_dump_iters(criu_opts *opts, int (*more)(criu_predump_info pi))
@@ -1805,7 +1868,7 @@ void criu_set_pidfd_store_sk(int sk)
 int criu_local_set_network_lock(criu_opts *opts, enum criu_network_lock_method method)
 {
 	opts->rpc->has_network_lock = true;
-	if (method == CRIU_NETWORK_LOCK_IPTABLES || method == CRIU_NETWORK_LOCK_NFTABLES) {
+	if (method == CRIU_NETWORK_LOCK_IPTABLES || method == CRIU_NETWORK_LOCK_NFTABLES || method == CRIU_NETWORK_LOCK_SKIP) {
 		opts->rpc->network_lock = (CriuNetworkLockMethod)method;
 		return 0;
 	}
@@ -1894,4 +1957,87 @@ err:
 int criu_join_ns_add(const char *ns, const char *ns_file, const char *extra_opt)
 {
 	return criu_local_join_ns_add(global_opts, ns, ns_file, extra_opt);
+}
+
+int criu_local_feature_check(criu_opts *opts, struct criu_feature_check *features, size_t size)
+{
+	CriuFeatures criu_features = CRIU_FEATURES__INIT;
+	struct criu_feature_check features_copy = { 0 };
+	CriuReq req = CRIU_REQ__INIT;
+	CriuResp *resp = NULL;
+	int ret = -1;
+
+	saved_errno = 0;
+
+	if (!features)
+		goto exit;
+
+	if (size > sizeof(struct criu_feature_check))
+		goto exit;
+
+	memcpy(&features_copy, features, size);
+
+	req.type = CRIU_REQ_TYPE__FEATURE_CHECK;
+	req.opts = opts->rpc;
+
+	if (features_copy.mem_track) {
+		criu_features.has_mem_track = true;
+		criu_features.mem_track = true;
+	}
+	if (features_copy.lazy_pages) {
+		criu_features.has_lazy_pages = true;
+		criu_features.lazy_pages = true;
+	}
+	if (features_copy.pidfd_store) {
+		criu_features.has_pidfd_store = true;
+		criu_features.pidfd_store = true;
+	}
+	req.features = &criu_features;
+
+	ret = send_req_and_recv_resp(opts, &req, &resp);
+	if (ret)
+		goto exit;
+
+	memset(&features_copy, 0, sizeof(struct criu_feature_check));
+
+	if (resp->success) {
+		if (resp->features->has_mem_track) {
+			features_copy.mem_track = resp->features->mem_track;
+		}
+		if (resp->features->has_lazy_pages) {
+			features_copy.lazy_pages = resp->features->lazy_pages;
+		}
+		if (resp->features->has_pidfd_store) {
+			features_copy.pidfd_store = resp->features->pidfd_store;
+		}
+		memcpy(features, &features_copy, size);
+	} else {
+		ret = -EBADE;
+	}
+
+exit:
+	if (resp)
+		criu_resp__free_unpacked(resp, NULL);
+
+	swrk_wait(opts);
+
+	errno = saved_errno;
+
+	return ret;
+}
+
+int criu_feature_check(struct criu_feature_check *features, size_t size)
+{
+	return criu_local_feature_check(global_opts, features, size);
+}
+
+void criu_local_set_empty_ns(criu_opts *opts, int namespaces)
+{
+	opts->rpc->has_empty_ns = true;
+	opts->rpc->empty_ns = namespaces;
+}
+
+void criu_set_empty_ns(int namespaces)
+{
+	criu_local_set_empty_ns(global_opts, namespaces);
 }

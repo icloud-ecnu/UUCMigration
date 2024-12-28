@@ -1,3 +1,5 @@
+//go:build !remote
+
 package apiutil
 
 import (
@@ -8,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/blang/semver/v4"
-	"github.com/containers/podman/v4/version"
+	"github.com/containers/podman/v5/version"
 	"github.com/gorilla/mux"
 )
 

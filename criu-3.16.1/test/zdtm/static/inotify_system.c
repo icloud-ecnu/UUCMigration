@@ -14,14 +14,14 @@
 #include "zdtmtst.h"
 
 const char *test_doc = "Inotify on symlink should be checked";
-#ifndef NODEL
+#ifndef NO_DEL
 char filename[] = "file";
 char linkname[] = "file.lnk";
 const char *inot_dir = "./inotify";
 #else
-char filename[] = "file.nodel";
-char linkname[] = "file.nodel.lnk";
-const char *inot_dir = "./inotify.nodel";
+char filename[] = "file.no_del";
+char linkname[] = "file.no_del.lnk";
+const char *inot_dir = "./inotify.no_del";
 #endif
 
 #ifdef __NR_inotify_init
@@ -57,13 +57,13 @@ const char *inot_dir = "./inotify.nodel";
 	(MASK == IN_UNMOUNT)	   ? "IN_UNMOUNT" :       \
 	(MASK == IN_Q_OVERFLOW)	   ? "IN_Q_OVERFLOW" :    \
 	(MASK == IN_IGNORED)	   ? "IN_IGNORED" :       \
-					   "UNKNOWN"
+				     "UNKNOWN"
 
 #include <unistd.h>
 #include <fcntl.h>
 
 typedef struct {
-	int inot;
+	int infd;
 	int file;
 	int link;
 	int dir;
@@ -165,8 +165,8 @@ desc init_env(const char *dir, char *file_path, char *link_path)
 		pr_perror("mkdir(%s)", dir);
 		return in_desc;
 	}
-	in_desc.inot = inotify_init();
-	if (in_desc.inot < 0) {
+	in_desc.infd = inotify_init();
+	if (in_desc.infd < 0) {
 		pr_perror("inotify_init() failed");
 		rmdir(dir);
 		return in_desc;
@@ -184,12 +184,12 @@ desc init_env(const char *dir, char *file_path, char *link_path)
 		return in_desc;
 	}
 
-	in_desc.dir = addWatcher(in_desc.inot, dir);
+	in_desc.dir = addWatcher(in_desc.infd, dir);
 	if (createFiles(file_path, filename, link_path)) {
 		return in_desc;
 	}
-	in_desc.link = addWatcher(in_desc.inot, link_path);
-	in_desc.file = addWatcher(in_desc.inot, file_path);
+	in_desc.link = addWatcher(in_desc.infd, link_path);
+	in_desc.file = addWatcher(in_desc.infd, file_path);
 
 	return in_desc;
 }
@@ -216,7 +216,7 @@ int test_actions(const char *dir, char *file_path, char *link_path)
 {
 	if (fChmod(link_path) == 0 && fWriteClose(link_path) == 0 && fNoWriteClose(link_path) == 0 &&
 	    fMove(file_path, filename) == 0 && fMove(filename, file_path) == 0
-#ifndef NODEL
+#ifndef NO_DEL
 	    && fDelete(file_path) == 0 && fDelete(link_path) == 0 && fRemDir(dir) == 0
 #endif
 	) {
@@ -299,9 +299,9 @@ int read_set(int inot_fd, char *event_set)
 
 void common_close(desc *descr)
 {
-	if (descr->inot > 0) {
-		close(descr->inot);
-		descr->inot = -1;
+	if (descr->infd > 0) {
+		close(descr->infd);
+		descr->infd = -1;
 		descr->file = -1;
 		descr->dir = -1;
 		descr->link = -1;
@@ -316,7 +316,7 @@ int get_event_set(char *event_set, int wait)
 	desc common_desc;
 
 	common_desc = init_env(inot_dir, file_path, link_path);
-	if ((common_desc.inot < 0) || (common_desc.file < 0) || (common_desc.dir < 0) || (common_desc.link < 0)) {
+	if ((common_desc.infd < 0) || (common_desc.file < 0) || (common_desc.dir < 0) || (common_desc.link < 0)) {
 		common_close(&common_desc);
 		return -1;
 	}
@@ -327,9 +327,9 @@ int get_event_set(char *event_set, int wait)
 	if (wait) {
 		do_wait();
 	}
-	len = read_set(common_desc.inot, event_set);
+	len = read_set(common_desc.infd, event_set);
 	common_close(&common_desc);
-#ifdef NODEL
+#ifdef NO_DEL
 	if (!(fDelete(file_path) == 0 && fDelete(link_path) == 0 && fRemDir(inot_dir) == 0))
 		return -1;
 #endif

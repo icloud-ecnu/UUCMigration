@@ -14,9 +14,24 @@ For installing Podman, see the [installation instructions](https://podman.io/get
 
 For building Podman, see the [build instructions](https://podman.io/getting-started/installation#building-from-scratch).
 
-### Install `slirp4netns`
+### Networking configuration
 
-The [slirp4netns](https://github.com/rootless-containers/slirp4netns) package provides user-mode networking for unprivileged network namespaces and must be installed on the machine in order for Podman to run in a rootless environment.  The package is available on most Linux distributions via their package distribution software such as `yum`, `dnf`, `apt`, `zypper`, etc.  If the package is not available, you can build and install `slirp4netns` from [GitHub](https://github.com/rootless-containers/slirp4netns).
+A user-mode networking tool for unprivileged network namespaces must be installed on the machine in order for Podman to run in a rootless environment.
+
+Podman supports two rootless networking tools: [pasta](https://passt.top/passt/about/#pasta) (provided by [passt](https://passt.top/passt/about/)) and [slirp4netns](https://github.com/rootless-containers/slirp4netns).
+
+pasta is the default since Podman 5.0, while slirp4netns was the default for previous versions. Passt is a more modern replacement for SLIRP that amongst other things fully supports IPv6 and is more secure architecturally (runs in a separate process, uses modern Linux mechanisms for isolation etc).
+
+Passt is [available on most Linux distributions](https://passt.top/passt/about/#availability) via their package distribution software such as `yum`, `dnf`, `apt`, `zypper`, etc. under the name `passt`.  If the package is not available, you can build and install `passt` from [its upstream](https://passt.top/passt/about/#try-it).
+
+Alternatively, slirp4netns can be installed in the same fashion either from your distribution's repositories or by following [the instructions](https://github.com/rootless-containers/slirp4netns?tab=readme-ov-file#install) provided on its GitHub.
+
+The major user-facing difference between the two is outlined in [Shortcomings of Rootless Podman](https://github.com/containers/podman/blob/main/rootless.md?plain=1#L11) and expanded upon in **[podman-network(1)](https://github.com/containers/podman/blob/main/docs/source/markdown/podman-network.1.md#pasta)**.
+
+> [!note]
+> pasta's default situation of not being being able to communicate between the container and the host has been fixed in Podman 5.3: see [Podman 5.3 changes for improved networking experience with pasta](https://blog.podman.io/2024/10/podman-5-3-changes-for-improved-networking-experience-with-pasta/).
+
+The default rootless networking tool can be selected in **[containers.conf(5)](https://github.com/containers/common/blob/main/docs/containers.conf.5.md)** under the `[network]` section with `default_rootless_network_cmd`, which can be set to `pasta` (default) or `slirp4netns`.
 
 ### `/etc/subuid` and `/etc/subgid` configuration
 
@@ -98,22 +113,32 @@ Once the Administrator has completed the setup on the machine and then the confi
 
 ### User Configuration Files
 
-The Podman configuration files for root reside in `/usr/share/containers` with overrides in `/etc/containers`.  In the rootless environment they reside in `${XDG_CONFIG_HOME}/containers` (usually `~/.config/containers`) and are owned by each individual user.
+The Podman configuration files for root reside in `/usr/share/containers` with overrides in `/etc/containers`.  In the rootless environment they reside in `${XDG_CONFIG_HOME}/containers` and are owned by each individual user.
+
+Note: in environments without `XDG` environment variables, Podman internally sets the following defaults:
+
+- `$XDG_CONFIG_HOME` = `$HOME/.config`
+- `$XDG_DATA_HOME` = `$HOME/.local/share`
+- `$XDG_RUNTIME_DIR` =
+  - `/run/user/$UID` on `systemd` environments
+  - `$TMPDIR/podman-run-$UID` otherwise
 
 The three main configuration files are [containers.conf](https://github.com/containers/common/blob/main/docs/containers.conf.5.md), [storage.conf](https://github.com/containers/storage/blob/main/docs/containers-storage.conf.5.md) and [registries.conf](https://github.com/containers/image/blob/main/docs/containers-registries.conf.5.md). The user can modify these files as they wish.
 
 #### containers.conf
 Podman reads
+
 1. `/usr/share/containers/containers.conf`
 2. `/etc/containers/containers.conf`
-3. `${XDG_CONFIG_HOME}/containers.conf`
+3. `${XDG_CONFIG_HOME}/containers/containers.conf`
 
 if they exist, in that order. Each file can override the previous for particular fields.
 
 #### storage.conf
 For `storage.conf` the order is
+
 1. `/etc/containers/storage.conf`
-2. `${XDG_CONFIG_HOME}/storage.conf`
+2. `${XDG_CONFIG_HOME}/containers/storage.conf`
 
 In rootless Podman, certain fields in `/etc/containers/storage.conf` are ignored. These fields are:
 ```
@@ -130,13 +155,14 @@ In rootless Podman these fields default to
 graphroot="${XDG_DATA_HOME}/containers/storage"
 runroot="${XDG_RUNTIME_DIR}/containers"
 ```
-[$XDG_RUNTIME_DIR](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html#variables) defaults on most systems to `/run/user/$UID`.
+[\$XDG_RUNTIME_DIR](https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html#variables) defaults on most systems to `/run/user/$UID`.
 
 #### registries
 Registry configuration is read in this order
+
 1. `/etc/containers/registries.conf`
 2. `/etc/containers/registries.d/*`
-3. `${XDG_CONFIG_HOME}/registries.conf`
+3. `${XDG_CONFIG_HOME}/containers/registries.conf`
 
 The files in the home directory should be used to configure rootless Podman for personal needs. These files are not created by default. Users can copy the files from `/usr/share/containers` or `/etc/containers` and modify them.
 

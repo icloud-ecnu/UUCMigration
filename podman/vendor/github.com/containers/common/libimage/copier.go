@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libimage
 
@@ -13,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/common/libimage/manifests"
 	"github.com/containers/common/libimage/platform"
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/common/pkg/retry"
@@ -32,12 +30,6 @@ const (
 	defaultMaxRetries = 3
 	defaultRetryDelay = time.Second
 )
-
-// LookupReferenceFunc return an image reference based on the specified one.
-// The returned reference can return custom ImageSource or ImageDestination
-// objects which intercept or filter blobs, manifests, and signatures as
-// they are read and written.
-type LookupReferenceFunc = manifests.LookupReferenceFunc
 
 // CopyOptions allow for customizing image-copy operations.
 type CopyOptions struct {
@@ -68,6 +60,13 @@ type CopyOptions struct {
 	CertDirPath string
 	// Force layer compression when copying to a `dir` transport destination.
 	DirForceCompress bool
+
+	// ImageListSelection is one of CopySystemImage, CopyAllImages, or
+	// CopySpecificImages, to control whether, when the source reference is a list,
+	// copy.Image() copies only an image which matches the current runtime
+	// environment, or all images which match the supplied reference, or only
+	// specific images from the source reference.
+	ImageListSelection copy.ImageListSelection
 	// Allow contacting registries over HTTP, or HTTPS with failed TLS
 	// verification. Note that this does not affect other TLS connections.
 	InsecureSkipTLSVerify types.OptionalBool
@@ -161,8 +160,8 @@ type CopyOptions struct {
 	extendTimeoutSocket string
 }
 
-// copier is an internal helper to conveniently copy images.
-type copier struct {
+// Copier is a helper to conveniently copy images.
+type Copier struct {
 	extendTimeoutSocket string
 	imageCopyOptions    copy.Options
 	retryOptions        retry.Options
@@ -171,6 +170,13 @@ type copier struct {
 
 	sourceLookup      LookupReferenceFunc
 	destinationLookup LookupReferenceFunc
+}
+
+// newCopier creates a Copier based on a runtime's system context.
+// Note that fields in options *may* overwrite the counterparts of
+// the specified system context.  Please make sure to call `(*Copier).Close()`.
+func (r *Runtime) newCopier(options *CopyOptions, reportResolvedReference *types.ImageReference) (*Copier, error) {
+	return NewCopier(options, r.SystemContext(), reportResolvedReference)
 }
 
 // storageAllowedPolicyScopes overrides the policy for local storage
@@ -214,12 +220,13 @@ func getDockerAuthConfig(name, passwd, creds, idToken string) (*types.DockerAuth
 	}
 }
 
-// newCopier creates a copier.  Note that fields in options *may* overwrite the
-// counterparts of the specified system context.  Please make sure to call
-// `(*copier).close()`.
-func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
-	c := copier{extendTimeoutSocket: options.extendTimeoutSocket}
-	c.systemContext = r.systemContextCopy()
+// NewCopier creates a Copier based on a provided system context.
+// Note that fields in options *may* overwrite the counterparts of
+// the specified system context.  Please make sure to call `(*Copier).Close()`.
+func NewCopier(options *CopyOptions, sc *types.SystemContext, reportResolvedReference *types.ImageReference) (*Copier, error) {
+	c := Copier{extendTimeoutSocket: options.extendTimeoutSocket}
+	sysContextCopy := *sc
+	c.systemContext = &sysContextCopy
 
 	if options.SourceLookupReferenceFunc != nil {
 		c.sourceLookup = options.SourceLookupReferenceFunc
@@ -308,6 +315,7 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 		c.imageCopyOptions.ProgressInterval = time.Second
 	}
 
+	c.imageCopyOptions.ImageListSelection = options.ImageListSelection
 	c.imageCopyOptions.ForceCompressionFormat = options.ForceCompressionFormat
 	c.imageCopyOptions.ForceManifestMIMEType = options.ManifestMIMEType
 	c.imageCopyOptions.SourceCtx = c.systemContext
@@ -322,6 +330,7 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 	c.imageCopyOptions.SignBySigstorePrivateKeyFile = options.SignBySigstorePrivateKeyFile
 	c.imageCopyOptions.SignSigstorePrivateKeyPassphrase = options.SignSigstorePrivateKeyPassphrase
 	c.imageCopyOptions.ReportWriter = options.Writer
+	c.imageCopyOptions.ReportResolvedReference = reportResolvedReference
 
 	defaultContainerConfig, err := config.Default()
 	if err != nil {
@@ -333,14 +342,14 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 	return &c, nil
 }
 
-// close open resources.
-func (c *copier) close() error {
+// Close open resources.
+func (c *Copier) Close() error {
 	return c.policyContext.Destroy()
 }
 
-// copy the source to the destination.  Returns the bytes of the copied
+// Copy the source to the destination.  Returns the bytes of the copied
 // manifest which may be used for digest computation.
-func (c *copier) copy(ctx context.Context, source, destination types.ImageReference) ([]byte, error) {
+func (c *Copier) Copy(ctx context.Context, source, destination types.ImageReference) ([]byte, error) {
 	logrus.Debugf("Copying source image %s to destination image %s", source.StringWithinTransport(), destination.StringWithinTransport())
 
 	// Avoid running out of time when running inside a systemd unit by
@@ -364,11 +373,13 @@ func (c *copier) copy(ctx context.Context, source, destination types.ImageRefere
 		defer cancel()
 		defer timer.Stop()
 
-		fmt.Fprintf(c.imageCopyOptions.ReportWriter,
-			"Pulling image %s inside systemd: setting pull timeout to %s\n",
-			source.StringWithinTransport(),
-			time.Duration(numExtensions)*extension,
-		)
+		if c.imageCopyOptions.ReportWriter != nil {
+			fmt.Fprintf(c.imageCopyOptions.ReportWriter,
+				"Pulling image %s inside systemd: setting pull timeout to %s\n",
+				source.StringWithinTransport(),
+				time.Duration(numExtensions)*extension,
+			)
+		}
 
 		// From `man systemd.service(5)`:
 		//
@@ -431,12 +442,12 @@ func (c *copier) copy(ctx context.Context, source, destination types.ImageRefere
 	// Sanity checks for Buildah.
 	if sourceInsecure != nil && *sourceInsecure {
 		if c.systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
-			return nil, fmt.Errorf("can't require tls verification on an insecured registry")
+			return nil, errors.New("can't require tls verification on an insecured registry")
 		}
 	}
 	if destinationInsecure != nil && *destinationInsecure {
 		if c.systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
-			return nil, fmt.Errorf("can't require tls verification on an insecured registry")
+			return nil, errors.New("can't require tls verification on an insecured registry")
 		}
 	}
 
@@ -516,8 +527,8 @@ func checkRegistrySourcesAllows(dest types.ImageReference) (insecure *bool, err 
 		return nil, fmt.Errorf("registry %q denied by policy: not in allowed registries list (%s)", reference.Domain(dref), registrySources)
 	}
 
-	for _, inseureDomain := range sources.InsecureRegistries {
-		if inseureDomain == reference.Domain(dref) {
+	for _, insecureDomain := range sources.InsecureRegistries {
+		if insecureDomain == reference.Domain(dref) {
 			insecure := true
 			return &insecure, nil
 		}

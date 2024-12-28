@@ -1,7 +1,9 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -25,7 +27,7 @@ var _ = Describe("Podman run dns", func() {
 	It("podman run add bad dns server", func() {
 		session := podmanTest.Podman([]string{"run", "--dns=foobar", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "foobar is not an ip address"))
 	})
 
 	It("podman run add dns server", func() {
@@ -46,7 +48,7 @@ var _ = Describe("Podman run dns", func() {
 	It("podman run add bad host", func() {
 		session := podmanTest.Podman([]string{"run", "--add-host=foo:1.2", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, `invalid IP address in add-host: "1.2"`))
 	})
 
 	It("podman run add host", func() {
@@ -60,7 +62,7 @@ var _ = Describe("Podman run dns", func() {
 		session := podmanTest.Podman([]string{"run", "--hostname=foobar", ALPINE, "cat", "/etc/hostname"})
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
-		Expect(session.OutputToString()).To(Equal("foobar"))
+		Expect(string(session.Out.Contents())).To(Equal("foobar\n"))
 
 		session = podmanTest.Podman([]string{"run", "--hostname=foobar", ALPINE, "hostname"})
 		session.WaitWithDefaultTimeout()
@@ -78,15 +80,15 @@ var _ = Describe("Podman run dns", func() {
 	It("podman run mutually excludes --dns* and --network", func() {
 		session := podmanTest.Podman([]string{"run", "--dns=1.2.3.4", "--network", "container:ALPINE", ALPINE})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "conflicting options: dns and the network mode: container"))
 
 		session = podmanTest.Podman([]string{"run", "--dns-opt=1.2.3.4", "--network", "container:ALPINE", ALPINE})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "conflicting options: dns and the network mode: container"))
 
 		session = podmanTest.Podman([]string{"run", "--dns-search=foobar.com", "--network", "none", ALPINE})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "conflicting options: dns and the network mode: none"))
 
 		session = podmanTest.Podman([]string{"run", "--dns=1.2.3.4", "--network", "host", ALPINE})
 		session.WaitWithDefaultTimeout()

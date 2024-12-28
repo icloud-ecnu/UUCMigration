@@ -11,22 +11,14 @@ ifdef CLANG
 	target-suffix = -clang
 endif
 
-TARGETS := alpine fedora-rawhide centos7 centos8 archlinux
-ZDTM_OPTIONS :=
+TARGETS := alpine fedora-rawhide centos8 archlinux
+ZDTM_OPTS :=
 UNAME := $(shell uname -m)
 export UNAME
 CONTAINER_RUNTIME := docker
 export CONTAINER_RUNTIME
 
-alpine: ZDTM_OPTIONS=-x zdtm/static/binfmt_misc -x zdtm/static/netns-nf -x zdtm/static/sched_policy00 -x zdtm/static/seccomp_strict -x zdtm/static/sigaltstack -x zdtm/static/signalfd00 -x zdtm/static/config_inotify_irmap
-
-define DOCKER_JSON
-{
-	"storage-driver": "devicemapper"
-}
-endef
-
-export DOCKER_JSON
+alpine: ZDTM_OPTS=-x zdtm/static/binfmt_misc -x zdtm/static/sched_policy00
 
 ifeq ($(GITHUB_ACTIONS),true)
 	# GitHub Actions does not give us a real TTY and errors out with
@@ -41,38 +33,26 @@ export CONTAINER_TERMINAL
 ifeq ($(UNAME),x86_64)
 	# On anything besides x86_64 Travis is running unprivileged LXD
 	# containers which do not support running docker with '--privileged'.
-	CONTAINER_OPTS := --rm $(CONTAINER_TERMINAL) --privileged -v /lib/modules:/lib/modules --tmpfs /run
+	CONTAINER_OPTS := --rm $(CONTAINER_TERMINAL) --privileged --userns=host --cgroupns=host -v /lib/modules:/lib/modules --tmpfs /run
 else
 	CONTAINER_OPTS := --rm -v /lib/modules:/lib/modules --tmpfs /run
 endif
 
 ifeq ($(CONTAINER_RUNTIME),podman)
-	# Just as Docker needs to use devicemapper Podman needs vfs
-	# as graphdriver as overlayfs does not support all test cases
-	STORAGE_DRIVER := vfs
 	# Podman limits the number of processes in a container using cgroups.
 	# Disable it as it breaks the thread-bomb test
 	CONTAINER_OPTS += --pids-limit=0
 endif
 
-export STORAGE_DRIVER
+export ZDTM_OPTS
 
-restart-docker:
-	if [ "$$UNAME" = "x86_64" ] && [ "$$CONTAINER_RUNTIME" = "docker" ]; then \
-		echo "$$DOCKER_JSON" > /etc/docker/daemon.json; \
-		cat /etc/docker/daemon.json; \
-		systemctl status docker; \
-		systemctl restart docker; \
-		systemctl status docker; \
-	fi
-
-$(TARGETS): restart-docker
+$(TARGETS):
 	$(MAKE) -C ../build $@$(target-suffix)
-	$(CONTAINER_RUNTIME) run --env-file docker.env $(CONTAINER_OPTS) criu-$@ scripts/ci/run-ci-tests.sh
+	$(CONTAINER_RUNTIME) run --env-file docker.env -v `pwd`/../../:/criu $(if $(ZDTM_OPTS),-e ZDTM_OPTS) $(CONTAINER_OPTS) criu-$@ scripts/ci/run-ci-tests.sh
 
-fedora-asan: restart-docker
+fedora-asan:
 	$(MAKE) -C ../build $@$(target-suffix)
-	$(CONTAINER_RUNTIME) run $(CONTAINER_OPTS) criu-$@ ./scripts/ci/asan.sh $(ZDTM_OPTIONS)
+	$(CONTAINER_RUNTIME) run $(CONTAINER_OPTS) -v `pwd`/../../:/criu criu-$@ ./scripts/ci/asan.sh $(ZDTM_OPTS)
 
 docker-test:
 	./docker-test.sh
@@ -80,11 +60,8 @@ docker-test:
 podman-test:
 	./podman-test.sh
 
-# overlayfs behaves differently on Ubuntu and breaks CRIU
-# https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1857257
-# Switch to devicemapper
-openj9-test: restart-docker
-	./openj9-test.sh
+java-test:
+	./java-test.sh
 
 setup-vagrant:
 	./vagrant.sh setup
@@ -92,7 +69,26 @@ setup-vagrant:
 vagrant-fedora-no-vdso: setup-vagrant
 	./vagrant.sh fedora-no-vdso
 
-.PHONY: setup-vagrant vagrant-fedora-no-vdso
+vagrant-fedora-rawhide: setup-vagrant
+	./vagrant.sh fedora-rawhide
+
+vagrant-fedora-non-root: setup-vagrant
+	./vagrant.sh fedora-non-root
+
+.PHONY: setup-vagrant vagrant-fedora-no-vdso vagrant-fedora-rawhide vagrant-fedora-non-root
+
+check-commit:
+	($(MAKE) -j $$(nproc) -C ../.. && \
+		echo "Commit $$(git rev-parse --short HEAD) built successfully") || \
+		(echo "Build failed for $$(git rev-list -n 1 --pretty HEAD)" && \
+		exit 1)
+
+.PHONY: check-commit
+
+loongarch64-qemu-test:
+	./loongarch64-qemu-test.sh
+
+.PHONY: loongarch64-qemu-test
 
 %:
 	$(MAKE) -C ../build $@$(target-suffix)

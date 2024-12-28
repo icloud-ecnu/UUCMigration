@@ -13,25 +13,23 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/common/pkg/util"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/errorhandling"
-	"github.com/containers/podman/v4/pkg/namespaces"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/signal"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/errorhandling"
+	"github.com/containers/podman/v5/pkg/namespaces"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/signal"
 	"github.com/containers/storage/pkg/directory"
-	"github.com/containers/storage/pkg/homedir"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/idtools"
+	"github.com/containers/storage/pkg/unshare"
 	stypes "github.com/containers/storage/types"
 	securejoin "github.com/cyphar/filepath-securejoin"
-	ruser "github.com/opencontainers/runc/libcontainer/user"
+	ruser "github.com/moby/sys/user"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
@@ -44,28 +42,11 @@ type idMapFlags struct {
 	GroupMap bool // The "g" flag
 }
 
-var containerConfig *config.Config
-
-func init() {
-	var err error
-	containerConfig, err = config.Default()
-	if err != nil {
-		logrus.Error(err)
-		os.Exit(1)
-	}
-}
-
 // Helper function to determine the username/password passed
 // in the creds string.  It could be either or both.
 func parseCreds(creds string) (string, string) {
-	if creds == "" {
-		return "", ""
-	}
-	up := strings.SplitN(creds, ":", 2)
-	if len(up) == 1 {
-		return up[0], ""
-	}
-	return up[0], up[1]
+	username, password, _ := strings.Cut(creds, ":")
+	return username, password
 }
 
 // Takes build context and validates `.containerignore` or `.dockerignore`
@@ -91,7 +72,7 @@ func ParseDockerignore(containerfiles []string, root string) ([]string, string, 
 		// does not attempts to re-resolve it
 		ignoreFile = path
 		ignore, dockerIgnoreErr = os.ReadFile(path)
-		if os.IsNotExist(dockerIgnoreErr) {
+		if errors.Is(dockerIgnoreErr, fs.ErrNotExist) {
 			// In this case either ignorefile was not found
 			// or it is a symlink to unexpected file in such
 			// case manually set ignorefile to `/dev/null` so
@@ -105,14 +86,14 @@ func ParseDockerignore(containerfiles []string, root string) ([]string, string, 
 		if dockerIgnoreErr != nil {
 			for _, containerfile := range containerfiles {
 				containerfile = strings.TrimPrefix(containerfile, root)
-				if _, err := os.Stat(filepath.Join(root, containerfile+".containerignore")); err == nil {
+				if err := fileutils.Exists(filepath.Join(root, containerfile+".containerignore")); err == nil {
 					path, symlinkErr = securejoin.SecureJoin(root, containerfile+".containerignore")
 					if symlinkErr == nil {
 						ignoreFile = path
 						ignore, dockerIgnoreErr = os.ReadFile(path)
 					}
 				}
-				if _, err := os.Stat(filepath.Join(root, containerfile+".dockerignore")); err == nil {
+				if err := fileutils.Exists(filepath.Join(root, containerfile+".dockerignore")); err == nil {
 					path, symlinkErr = securejoin.SecureJoin(root, containerfile+".dockerignore")
 					if symlinkErr == nil {
 						ignoreFile = path
@@ -145,7 +126,10 @@ func ParseRegistryCreds(creds string) (*types.DockerAuthConfig, error) {
 	username, password := parseCreds(creds)
 	if username == "" {
 		fmt.Print("Username: ")
-		fmt.Scanln(&username)
+		_, err := fmt.Scanln(&username)
+		if err != nil {
+			return nil, fmt.Errorf("could not read username: %w", err)
+		}
 	}
 	if password == "" {
 		fmt.Print("Password: ")
@@ -162,11 +146,6 @@ func ParseRegistryCreds(creds string) (*types.DockerAuthConfig, error) {
 	}, nil
 }
 
-// StringInSlice is deprecated, use containers/common/pkg/util/StringInSlice
-func StringInSlice(s string, sl []string) bool {
-	return util.StringInSlice(s, sl)
-}
-
 // StringMatchRegexSlice determines if a given string matches one of the given regexes, returns bool
 func StringMatchRegexSlice(s string, re []string) bool {
 	for _, r := range re {
@@ -176,17 +155,6 @@ func StringMatchRegexSlice(s string, re []string) bool {
 		}
 	}
 	return false
-}
-
-// IndexOfStringInSlice returns the index if a string is in a slice, otherwise
-// it returns -1 if the string is not found
-func IndexOfStringInSlice(s string, sl []string) int {
-	for i := range sl {
-		if sl[i] == s {
-			return i
-		}
-	}
-	return -1
 }
 
 // ParseSignal parses and validates a signal name or number.
@@ -205,24 +173,53 @@ func ParseSignal(rawSignal string) (syscall.Signal, error) {
 	return sig, nil
 }
 
-// GetKeepIDMapping returns the mappings and the user to use when keep-id is used
-func GetKeepIDMapping(opts *namespaces.KeepIDUserNsOptions) (*stypes.IDMappingOptions, int, int, error) {
+func getRootlessKeepIDMapping(uid, gid int, uids, gids []idtools.IDMap) (*stypes.IDMappingOptions, int, int, error) {
 	options := stypes.IDMappingOptions{
 		HostUIDMapping: false,
 		HostGIDMapping: false,
 	}
+	maxUID, maxGID := 0, 0
+	for _, u := range uids {
+		maxUID += u.Size
+	}
+	for _, g := range gids {
+		maxGID += g.Size
+	}
 
+	options.UIDMap, options.GIDMap = nil, nil
+
+	if len(uids) > 0 && uid != 0 {
+		options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: min(uid, maxUID)})
+	}
+	options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid, HostID: 0, Size: 1})
+	if maxUID > uid {
+		options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid + 1, HostID: uid + 1, Size: maxUID - uid})
+	}
+
+	if len(gids) > 0 && gid != 0 {
+		options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: min(gid, maxGID)})
+	}
+	options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid, HostID: 0, Size: 1})
+	if maxGID > gid {
+		options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid + 1, HostID: gid + 1, Size: maxGID - gid})
+	}
+
+	return &options, uid, gid, nil
+}
+
+// GetKeepIDMapping returns the mappings and the user to use when keep-id is used
+func GetKeepIDMapping(opts *namespaces.KeepIDUserNsOptions) (*stypes.IDMappingOptions, int, int, error) {
 	if !rootless.IsRootless() {
-		uids, err := rootless.ReadMappingsProc("/proc/self/uid_map")
+		options := stypes.IDMappingOptions{
+			HostUIDMapping: false,
+			HostGIDMapping: false,
+		}
+		uids, gids, err := unshare.GetHostIDMappings("")
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		gids, err := rootless.ReadMappingsProc("/proc/self/gid_map")
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		options.UIDMap = uids
-		options.GIDMap = gids
+		options.UIDMap = RuntimeSpecToIDtools(uids)
+		options.GIDMap = RuntimeSpecToIDtools(gids)
 
 		uid, gid := 0, 0
 		if opts.UID != nil {
@@ -249,33 +246,7 @@ func GetKeepIDMapping(opts *namespaces.KeepIDUserNsOptions) (*stypes.IDMappingOp
 		return nil, -1, -1, fmt.Errorf("cannot read mappings: %w", err)
 	}
 
-	maxUID, maxGID := 0, 0
-	for _, u := range uids {
-		maxUID += u.Size
-	}
-	for _, g := range gids {
-		maxGID += g.Size
-	}
-
-	options.UIDMap, options.GIDMap = nil, nil
-
-	if len(uids) > 0 {
-		options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: min(uid, maxUID)})
-	}
-	options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid, HostID: 0, Size: 1})
-	if maxUID > uid {
-		options.UIDMap = append(options.UIDMap, idtools.IDMap{ContainerID: uid + 1, HostID: uid + 1, Size: maxUID - uid})
-	}
-
-	if len(gids) > 0 {
-		options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: 0, HostID: 1, Size: min(gid, maxGID)})
-	}
-	options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid, HostID: 0, Size: 1})
-	if maxGID > gid {
-		options.GIDMap = append(options.GIDMap, idtools.IDMap{ContainerID: gid + 1, HostID: gid + 1, Size: maxGID - gid})
-	}
-
-	return &options, uid, gid, nil
+	return getRootlessKeepIDMapping(uid, gid, uids, gids)
 }
 
 // GetNoMapMapping returns the mappings and the user to use when nomap is used
@@ -831,6 +802,162 @@ func sortAndMergeConsecutiveMappings(idmap []idtools.IDMap) (finalIDMap []idtool
 	return finalIDMap
 }
 
+// Extension of idTools.parseAutoTriple that parses idmap triples.
+// The triple should be a length 3 string array, containing:
+// - Flags and ContainerID
+// - HostID
+// - Size
+//
+// parseAutoTriple returns the parsed mapping and any possible error.
+// If the error is not-nil, the mapping is not well-defined.
+//
+// idTools.parseAutoTriple is extended here with the following enhancements:
+//
+// HostID @ syntax:
+// =================
+// HostID may use the "@" syntax: The "101001:@1001:1" mapping
+// means "take the 1001 id from the parent namespace and map it to 101001"
+func parseAutoTriple(spec []string, parentMapping []ruser.IDMap, mapSetting string) (mappings []idtools.IDMap, err error) {
+	if len(spec[0]) == 0 {
+		return mappings, fmt.Errorf("invalid empty container id at %s map: %v", mapSetting, spec)
+	}
+	var cids, hids, sizes []uint64
+	var cid, hid uint64
+	var hidIsParent bool
+	// Parse the container ID, which must be an integer:
+	cid, err = strconv.ParseUint(spec[0][0:], 10, 32)
+	if err != nil {
+		return mappings, fmt.Errorf("parsing id map value %q: %w", spec[0], err)
+	}
+	// Parse the host id, which may be integer or @<integer>
+	if len(spec[1]) == 0 {
+		return mappings, fmt.Errorf("invalid empty host id at %s map: %v", mapSetting, spec)
+	}
+	if spec[1][0] != '@' {
+		hidIsParent = false
+		hid, err = strconv.ParseUint(spec[1], 10, 32)
+	} else {
+		// Parse @<id>, where <id> is an integer corresponding to the parent mapping
+		hidIsParent = true
+		hid, err = strconv.ParseUint(spec[1][1:], 10, 32)
+	}
+	if err != nil {
+		return mappings, fmt.Errorf("parsing id map value %q: %w", spec[1], err)
+	}
+	// Parse the size of the mapping, which must be an integer
+	sz, err := strconv.ParseUint(spec[2], 10, 32)
+	if err != nil {
+		return mappings, fmt.Errorf("parsing id map value %q: %w", spec[2], err)
+	}
+
+	if hidIsParent {
+		for i := uint64(0); i < sz; i++ {
+			cids = append(cids, cid+i)
+			mappedID, err := mapIDwithMapping(hid+i, parentMapping, mapSetting)
+			if err != nil {
+				return mappings, err
+			}
+			hids = append(hids, mappedID)
+			sizes = append(sizes, 1)
+		}
+	} else {
+		cids = []uint64{cid}
+		hids = []uint64{hid}
+		sizes = []uint64{sz}
+	}
+
+	// Avoid possible integer overflow on 32bit builds
+	if bits.UintSize == 32 {
+		for i := range cids {
+			if cids[i] > math.MaxInt32 || hids[i] > math.MaxInt32 || sizes[i] > math.MaxInt32 {
+				return mappings, fmt.Errorf("initializing ID mappings: %s setting is malformed expected [\"[+ug]uint32:[@]uint32[:uint32]\"] : %q", mapSetting, spec)
+			}
+		}
+	}
+	for i := range cids {
+		mappings = append(mappings, idtools.IDMap{
+			ContainerID: int(cids[i]),
+			HostID:      int(hids[i]),
+			Size:        int(sizes[i]),
+		})
+	}
+	return mappings, nil
+}
+
+// Extension of idTools.ParseIDMap that parses idmap triples from string.
+// This extension accepts additional flags that control how the mapping is done
+func parseAutoIDMap(mapSpec string, mapSetting string, parentMapping []ruser.IDMap) (idmap []idtools.IDMap, err error) {
+	stdErr := fmt.Errorf("initializing ID mappings: %s setting is malformed expected [\"uint32:[@]uint32[:uint32]\"] : %q", mapSetting, mapSpec)
+	idSpec := strings.Split(mapSpec, ":")
+	// if it's a length-2 list assume the size is 1:
+	if len(idSpec) == 2 {
+		idSpec = append(idSpec, "1")
+	}
+	if len(idSpec) != 3 {
+		return nil, stdErr
+	}
+	// Parse this mapping:
+	mappings, err := parseAutoTriple(idSpec, parentMapping, mapSetting)
+	if err != nil {
+		return nil, err
+	}
+	idmap = sortAndMergeConsecutiveMappings(mappings)
+	return idmap, nil
+}
+
+// GetAutoOptions returns an AutoUserNsOptions with the settings to automatically set up
+// a user namespace.
+func GetAutoOptions(n namespaces.UsernsMode) (*stypes.AutoUserNsOptions, error) {
+	mode, opts, hasOpts := strings.Cut(string(n), ":")
+	if mode != "auto" {
+		return nil, fmt.Errorf("wrong user namespace mode")
+	}
+	options := stypes.AutoUserNsOptions{}
+	if !hasOpts {
+		return &options, nil
+	}
+
+	parentUIDMap, parentGIDMap, err := rootless.GetAvailableIDMaps()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// The kernel-provided files only exist if user namespaces are supported
+			logrus.Debugf("User or group ID mappings not available: %s", err)
+		} else {
+			return nil, err
+		}
+	}
+
+	for _, o := range strings.Split(opts, ",") {
+		key, val, hasVal := strings.Cut(o, "=")
+		if !hasVal {
+			return nil, fmt.Errorf("invalid option specified: %q", o)
+		}
+		switch key {
+		case "size":
+			s, err := strconv.ParseUint(val, 10, 32)
+			if err != nil {
+				return nil, err
+			}
+			options.Size = uint32(s)
+		case "uidmapping":
+			mapping, err := parseAutoIDMap(val, "UID", parentUIDMap)
+			if err != nil {
+				return nil, err
+			}
+			options.AdditionalUIDMappings = append(options.AdditionalUIDMappings, mapping...)
+		case "gidmapping":
+			mapping, err := parseAutoIDMap(val, "GID", parentGIDMap)
+			if err != nil {
+				return nil, err
+			}
+			options.AdditionalGIDMappings = append(options.AdditionalGIDMappings, mapping...)
+		default:
+			return nil, fmt.Errorf("unknown option specified: %q", key)
+		}
+	}
+	return &options, nil
+}
+
 // ParseIDMapping takes idmappings and subuid and subgid maps and returns a storage mapping
 func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []string, subUIDMap, subGIDMap string) (*stypes.IDMappingOptions, error) {
 	options := stypes.IDMappingOptions{
@@ -843,7 +970,7 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 		options.HostUIDMapping = false
 		options.HostGIDMapping = false
 		options.AutoUserNs = true
-		opts, err := mode.GetAutoOptions()
+		opts, err := GetAutoOptions(mode)
 		if err != nil {
 			return nil, err
 		}
@@ -920,13 +1047,6 @@ func ParseIDMapping(mode namespaces.UsernsMode, uidMapSlice, gidMapSlice []strin
 	return &options, nil
 }
 
-var (
-	rootlessConfigHomeDirOnce sync.Once
-	rootlessConfigHomeDir     string
-	rootlessRuntimeDirOnce    sync.Once
-	rootlessRuntimeDir        string
-)
-
 type tomlOptionsConfig struct {
 	MountProgram string `toml:"mount_program"`
 }
@@ -947,9 +1067,9 @@ func getTomlStorage(storeOptions *stypes.StoreOptions) *tomlConfig {
 	config.Storage.RunRoot = storeOptions.RunRoot
 	config.Storage.GraphRoot = storeOptions.GraphRoot
 	for _, i := range storeOptions.GraphDriverOptions {
-		s := strings.SplitN(i, "=", 2)
-		if s[0] == "overlay.mount_program" && len(s) == 2 {
-			config.Storage.Options.MountProgram = s[1]
+		program, hasPrefix := strings.CutPrefix(i, "overlay.mount_program=")
+		if hasPrefix {
+			config.Storage.Options.MountProgram = program
 		}
 	}
 
@@ -1012,7 +1132,7 @@ func ParseInputTime(inputTime string, since bool) (time.Time, error) {
 func OpenExclusiveFile(path string) (*os.File, error) {
 	baseDir := filepath.Dir(path)
 	if baseDir != "" {
-		if _, err := os.Stat(baseDir); err != nil {
+		if err := fileutils.Exists(baseDir); err != nil {
 			return nil, err
 		}
 	}
@@ -1033,10 +1153,6 @@ func ExitCode(err error) int {
 	}
 
 	return 126
-}
-
-func GetIdentityPath(name string) string {
-	return filepath.Join(homedir.Get(), ".ssh", name)
 }
 
 func Tmpdir() string {
@@ -1095,10 +1211,6 @@ func ValidateSysctls(strSlice []string) (map[string]string, error) {
 		}
 	}
 	return sysctl, nil
-}
-
-func DefaultContainerConfig() *config.Config {
-	return containerConfig
 }
 
 func CreateIDFile(path string, id string) error {
@@ -1212,10 +1324,10 @@ func ParseRestartPolicy(policy string) (string, uint, error) {
 	return policyType, retriesUint, nil
 }
 
-// ConvertTimeout converts negative timeout to MaxInt, which indicates approximately infinity, waiting to stop containers
+// ConvertTimeout converts negative timeout to MaxUint32, which indicates approximately infinity, waiting to stop containers
 func ConvertTimeout(timeout int) uint {
 	if timeout < 0 {
-		return math.MaxInt
+		return math.MaxUint32
 	}
 	return uint(timeout)
 }

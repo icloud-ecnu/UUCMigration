@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -9,7 +11,7 @@ import (
 	"runtime"
 	"strconv"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gexec"
@@ -83,10 +85,11 @@ var _ = Describe("Podman Info", func() {
 
 		rootlessStoragePath := `"/tmp/$HOME/$USER/$UID/storage"`
 		driver := `"overlay"`
-		storageOpt := `"/usr/bin/fuse-overlayfs"`
-		storageConf := []byte(fmt.Sprintf("[storage]\ndriver=%s\nrootless_storage_path=%s\n[storage.options]\nmount_program=%s", driver, rootlessStoragePath, storageOpt))
+		storageConf := []byte(fmt.Sprintf("[storage]\ndriver=%s\nrootless_storage_path=%s\n[storage.options]\n", driver, rootlessStoragePath))
 		err = os.WriteFile(configPath, storageConf, os.ModePerm)
 		Expect(err).ToNot(HaveOccurred())
+		// Failures in this test are impossible to debug without breadcrumbs
+		GinkgoWriter.Printf("CONTAINERS_STORAGE_CONF=%s:\n%s\n", configPath, storageConf)
 
 		u, err := user.Current()
 		Expect(err).ToNot(HaveOccurred())
@@ -96,8 +99,9 @@ var _ = Describe("Podman Info", func() {
 		podmanPath := podmanTest.PodmanTest.PodmanBinary
 		cmd := exec.Command(podmanPath, "info", "--format", "{{.Store.GraphRoot -}}")
 		out, err := cmd.CombinedOutput()
-		Expect(err).ToNot(HaveOccurred())
-		Expect(string(out)).To(Equal(expect))
+		GinkgoWriter.Printf("Running: podman info --format {{.Store.GraphRoot -}}\nOutput: %s\n", string(out))
+		Expect(err).ToNot(HaveOccurred(), "podman info")
+		Expect(string(out)).To(Equal(expect), "output from podman info")
 	})
 
 	It("check RemoteSocket ", func() {
@@ -115,13 +119,11 @@ var _ = Describe("Podman Info", func() {
 			Expect(session.OutputToString()).To(Equal("false"))
 		}
 
-		session = podmanTest.Podman([]string{"info", "--format", "{{.Host.RemoteSocket.Exists}}"})
-		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
 		if IsRemote() {
-			Expect(session.OutputToString()).To(ContainSubstring("true"))
-		} else {
-			Expect(session.OutputToString()).To(ContainSubstring("false"))
+			session = podmanTest.Podman([]string{"info", "--format", "{{.Host.RemoteSocket.Exists}}"})
+			session.WaitWithDefaultTimeout()
+			Expect(session).Should(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal("true"))
 		}
 
 	})
@@ -152,23 +154,15 @@ var _ = Describe("Podman Info", func() {
 	})
 
 	It("Podman info: check desired network backend", func() {
-		// defined in .cirrus.yml
-		want := os.Getenv("CI_DESIRED_NETWORK")
-		if want == "" {
-			if os.Getenv("CIRRUS_CI") == "" {
-				Skip("CI_DESIRED_NETWORK is not set--this is OK because we're not running under Cirrus")
-			}
-			Fail("CIRRUS_CI is set, but CI_DESIRED_NETWORK is not! See #16389")
-		}
 		session := podmanTest.Podman([]string{"info", "--format", "{{.Host.NetworkBackend}}"})
 		session.WaitWithDefaultTimeout()
 		Expect(session).To(ExitCleanly())
-		Expect(session.OutputToString()).To(Equal(want))
+		Expect(session.OutputToString()).To(Equal("netavark"))
 
 		session = podmanTest.Podman([]string{"info", "--format", "{{.Host.NetworkBackendInfo.Backend}}"})
 		session.WaitWithDefaultTimeout()
 		Expect(session).To(ExitCleanly())
-		Expect(session.OutputToString()).To(Equal(want))
+		Expect(session.OutputToString()).To(Equal("netavark"))
 	})
 
 	It("Podman info: check desired database backend", func() {
@@ -186,8 +180,11 @@ var _ = Describe("Podman Info", func() {
 		Expect(session.OutputToString()).To(Equal(want))
 	})
 
-	It("podman --db-backend info basic check", func() {
+	It("podman --db-backend info basic check", Serial, func() {
 		SkipIfRemote("--db-backend only supported on the local client")
+
+		const desiredDB = "CI_DESIRED_DATABASE"
+
 		type argWant struct {
 			arg  string
 			want string
@@ -199,21 +196,35 @@ var _ = Describe("Podman Info", func() {
 			// now because a boltdb exists it should use boltdb when default is requested
 			{arg: "", want: "boltdb"},
 			{arg: "sqlite", want: "sqlite"},
+			// just because we requested sqlite doesn't mean it stays that way.
+			// once a boltdb exists, podman will forevermore stick with it
+			{arg: "", want: "boltdb"},
 		}
 
 		for _, tt := range backends {
+			oldDesiredDB := os.Getenv(desiredDB)
+			if tt.arg == "boltdb" {
+				err := os.Setenv(desiredDB, "boltdb")
+				Expect(err).To(Not(HaveOccurred()))
+				defer os.Setenv(desiredDB, oldDesiredDB)
+			}
+
 			session := podmanTest.Podman([]string{"--db-backend", tt.arg, "--log-level=info", "info", "--format", "{{.Host.DatabaseBackend}}"})
 			session.WaitWithDefaultTimeout()
 			Expect(session).To(Exit(0))
 			Expect(session.OutputToString()).To(Equal(tt.want))
 			Expect(session.ErrorToString()).To(ContainSubstring("Using %s as database backend", tt.want))
+
+			if tt.arg == "boltdb" {
+				err := os.Setenv(desiredDB, oldDesiredDB)
+				Expect(err).To(Not(HaveOccurred()))
+			}
 		}
 
 		// make sure we get an error for bogus values
 		session := podmanTest.Podman([]string{"--db-backend", "bogus", "info", "--format", "{{.Host.DatabaseBackend}}"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(Exit(125))
-		Expect(session.ErrorToString()).To(Equal("Error: unsupported database backend: \"bogus\""))
+		Expect(session).To(ExitWithError(125, `Error: unsupported database backend: "bogus"`))
 	})
 
 	It("Podman info: check desired storage driver", func() {
@@ -229,6 +240,18 @@ var _ = Describe("Podman Info", func() {
 		session.WaitWithDefaultTimeout()
 		Expect(session).To(ExitCleanly())
 		Expect(session.OutputToString()).To(Equal(want), ".Store.GraphDriverName from podman info")
+
+		// Confirm desired setting of composefs
+		if want == "overlay" {
+			expect := "<no value>"
+			if os.Getenv("CI_DESIRED_COMPOSEFS") != "" {
+				expect = "true"
+			}
+			session = podmanTest.Podman([]string{"info", "--format", `{{index .Store.GraphOptions "overlay.use_composefs"}}`})
+			session.WaitWithDefaultTimeout()
+			Expect(session).To(ExitCleanly())
+			Expect(session.OutputToString()).To(Equal(expect), ".Store.GraphOptions -> overlay.use_composefs")
+		}
 	})
 
 	It("Podman info: check lock count", Serial, func() {

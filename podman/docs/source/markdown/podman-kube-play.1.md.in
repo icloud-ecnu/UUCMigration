@@ -14,7 +14,7 @@ Using the `--down` command line option, it is also capable of tearing down the p
 
 Using the `--replace` command line option, it tears down the pods(if any) created by a previous run of `podman kube play` and recreate the pods with the Kubernetes YAML file.
 
-Ideally the input file is created by Podman (see podman-kube-generate(1)).  This guarantees a smooth import and expected results.
+Ideally the input file is created by the Podman command (see podman-kube-generate(1)).  This guarantees a smooth import and expected results.
 
 Currently, the supported Kubernetes kinds are:
 
@@ -24,20 +24,26 @@ Currently, the supported Kubernetes kinds are:
 - ConfigMap
 - Secret
 - DaemonSet
+- Job
 
 `Kubernetes Pods or Deployments`
 
-Only three volume types are supported by kube play, the *hostPath*, *emptyDir*, and *persistentVolumeClaim* volume types.
+Only four volume types are supported by kube play, the *hostPath*, *emptyDir*, *persistentVolumeClaim*, and *image* volume types.
 
 - When using the *hostPath* volume type, only the  *default (empty)*, *DirectoryOrCreate*, *Directory*, *FileOrCreate*, *File*, *Socket*, *CharDevice* and *BlockDevice* subtypes are supported. Podman interprets the value of *hostPath* *path* as a file path when it contains at least one forward slash, otherwise Podman treats the value as the name of a named volume.
 - When using a *persistentVolumeClaim*, the value for *claimName* is the name for the Podman named volume.
 - When using an *emptyDir* volume, Podman creates an anonymous volume that is attached the containers running inside the pod and is deleted once the pod is removed.
+- When using an *image* volume, Podman creates a read-only image volume with an empty subpath (the whole image is mounted). The image must already exist locally. It is supported in rootful mode only.
 
 Note: The default restart policy for containers is `always`.  You can change the default by setting the `restartPolicy` field in the spec.
 
 Note: When playing a kube YAML with init containers, the init container is created with init type value `once`. To change the default type, use the `io.podman.annotations.init.container.type` annotation to set the type to `always`.
 
 Note: *hostPath* volume types created by kube play is given an SELinux shared label (z), bind mounts are not relabeled (use `chcon -t container_file_t -R <directory>`).
+
+Note: To set userns of a pod, use the **io.podman.annotations.userns** annotation in the pod/deployment definition. For example, **io.podman.annotations.userns=keep-id** annotation tells Podman to create a user namespace where the current rootless user's UID:GID are mapped to the same values in the container. This can be overridden with the `--userns` flag.
+
+Note: Use the **io.podman.annotations.volumes-from** annotation to bind mount volumes of one container to another. You can mount volumes from multiple source containers to a target container. The source containers that belong to the same pod must be defined before the source container in the kube YAML. The annotation format is `io.podman.annotations.volumes-from/targetContainer: "sourceContainer1:mountOpts1;sourceContainer2:mountOpts2"`.
 
 Note: If the `:latest` tag is used, Podman attempts to pull the image from a registry. If the image was built locally with Podman or Buildah, it has `localhost` as the domain, in that case, Podman uses the image from the local store even if it has the `:latest` tag.
 
@@ -59,6 +65,7 @@ A Kubernetes PersistentVolumeClaim represents a Podman named volume. Only the Pe
 - volume.podman.io/gid
 - volume.podman.io/mount-options
 - volume.podman.io/import-source
+- volume.podman.io/image
 
 Use `volume.podman.io/import-source` to import the contents of the tarball (.tar, .tar.gz, .tgz, .bzip, .tar.xz, .txz) specified in the annotation's value into the created Podman volume
 
@@ -153,6 +160,19 @@ spec:
 
 and as a result environment variable `FOO` is set to `bar` for container `container-1`.
 
+`Automounting Volumes (deprecated)`
+
+Note: The automounting annotation is deprecated. Kubernetes has [native support for image volumes](https://kubernetes.io/docs/tasks/configure-pod-container/image-volumes/) and that should be used rather than this podman-specific annotation.
+
+An image can be automatically mounted into a container if the annotation `io.podman.annotations.kube.image.automount/$ctrname` is given. The following rules apply:
+
+- The image must already exist locally.
+- The image must have at least 1 volume directive.
+- The path given by the volume directive will be mounted from the image into the container. For example, an image with a volume at `/test/test_dir` will have `/test/test_dir` in the image mounted to `/test/test_dir` in the container.
+- Multiple images can be specified. If multiple images have a volume at a specific path, the last image specified trumps.
+- The images are always mounted read-only.
+- Images to mount are defined in the annotation "io.podman.annotations.kube.image.automount/$ctrname" as a semicolon-separated list. They are mounted into a single container in the pod, not the whole pod. The annotation can be specified for additional containers if additional mounts are required.
+
 ## OPTIONS
 
 @@option annotation.container
@@ -212,10 +232,6 @@ When no network option is specified and *host* network mode is not configured in
 
 This option conflicts with host added in the Kubernetes YAML.
 
-#### **--no-trunc**
-
-Use annotations that are not truncated to the Kubernetes maximum length of 63 characters
-
 #### **--publish**=*[[ip:][hostPort]:]containerPort[/protocol]*
 
 Define or override a port definition in the YAML file.
@@ -268,19 +284,19 @@ upon exit.
 
 ## EXAMPLES
 
-Recreate the pod and containers as described in a file called `demo.yml`
+Recreate the pod and containers described in the specified host YAML file.
 ```
 $ podman kube play demo.yml
 52182811df2b1e73f36476003a66ec872101ea59034ac0d4d3a7b40903b955a6
 ```
 
-Recreate the pod and containers as described in a file `demo.yml` sent to stdin
+Recreate the pod and containers specified in a YAML file sent to stdin.
 ```
 $ cat demo.yml | podman kube play -
 52182811df2b1e73f36476003a66ec872101ea59034ac0d4d3a7b40903b955a6
-
 ```
-Teardown the pod and containers as described in a file `demo.yml`
+
+Tear down the pod and containers as described in the specified YAML file.
 ```
 $  podman kube play --down demo.yml
 Pods stopped:
@@ -289,7 +305,7 @@ Pods removed:
 52182811df2b1e73f36476003a66ec872101ea59034ac0d4d3a7b40903b955a6
 ```
 
-Provide `configmap-foo.yml` and `configmap-bar.yml` as sources for environment variables within the containers.
+Provide multiple configmap files as sources for environment variables within the specified pods and containers.
 ```
 $ podman kube play demo.yml --configmap configmap-foo.yml,configmap-bar.yml
 52182811df2b1e73f36476003a66ec872101ea59034ac0d4d3a7b40903b955a6
@@ -298,14 +314,14 @@ $ podman kube play demo.yml --configmap configmap-foo.yml --configmap configmap-
 52182811df2b1e73f36476003a66ec872101ea59034ac0d4d3a7b40903b955a6
 ```
 
-Create a pod connected to two networks (called net1 and net2) with a static ip
+Create a pod connected to two networks with a static ip on each.
 ```
 $ podman kube play demo.yml --network net1:ip=10.89.1.5 --network net2:ip=10.89.10.10
 52182811df2b1e73f36476003a66ec872101ea59034ac0d4d3a7b40903b955a6
 ```
 Please take into account that networks must be created first using podman-network-create(1).
 
-Create and teardown from a URL pointing to a YAML file
+Create and teardown from a URL pointing to a YAML file.
 ```
 $ podman kube play https://podman.io/demo.yml
 52182811df2b1e73f36476003a66ec872101ea59034ac0d4d3a7b40903b955a6

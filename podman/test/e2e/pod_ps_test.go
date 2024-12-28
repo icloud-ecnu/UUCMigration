@@ -1,10 +1,12 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"fmt"
 	"sort"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	"github.com/containers/storage/pkg/stringid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -130,7 +132,7 @@ var _ = Describe("Podman ps", func() {
 	It("podman pod ps mutually exclusive flags", func() {
 		session := podmanTest.Podman([]string{"pod", "ps", "-q", "--format", "{{.ID}}"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "quiet and format cannot be used together"))
 
 	})
 

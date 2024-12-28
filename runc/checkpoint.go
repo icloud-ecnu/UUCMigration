@@ -9,12 +9,13 @@ import (
 	"strconv"
 
 	criu "github.com/checkpoint-restore/go-criu/v6/rpc"
-	"github.com/opencontainers/runc/libcontainer"
-	"github.com/opencontainers/runc/libcontainer/userns"
+	"github.com/moby/sys/userns"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/unix"
+
+	"github.com/opencontainers/runc/libcontainer"
 )
 
 var checkpointCommand = cli.Command{
@@ -29,6 +30,10 @@ checkpointed.`,
 		cli.StringFlag{Name: "image-path", Value: "", Usage: "path for saving criu image files"},
 		cli.StringFlag{Name: "work-path", Value: "", Usage: "path for saving work files and logs"},
 		cli.StringFlag{Name: "parent-path", Value: "", Usage: "path for previous criu image files in pre-dump"},
+		cli.StringFlag{Name: "dirty-file", Value: "", Usage: "dirty file path"},
+		cli.StringFlag{Name: "ip-address", Value: "", Usage: "ip address"},
+		cli.StringFlag{Name: "predict-mode", Value: "", Usage: "set predict mode"},
+		cli.BoolFlag{Name: "live-migration", Usage: "live migration"},
 		cli.BoolFlag{Name: "leave-running", Usage: "leave the process running after checkpointing"},
 		cli.BoolFlag{Name: "tcp-established", Usage: "allow open tcp connections"},
 		cli.BoolFlag{Name: "ext-unix-sk", Usage: "allow external unix sockets"},
@@ -41,9 +46,9 @@ checkpointed.`,
 		cli.StringFlag{Name: "manage-cgroups-mode", Value: "", Usage: "cgroups mode: soft|full|strict|ignore (default: soft)"},
 		cli.StringSliceFlag{Name: "empty-ns", Usage: "create a namespace, but don't restore its properties"},
 		cli.BoolFlag{Name: "auto-dedup", Usage: "enable auto deduplication of memory images"},
-		cli.StringFlag{Name: "page-state-dir", Value: "", Usage: "path for saving criu image files"},
 	},
 	Action: func(context *cli.Context) error {
+
 		if err := checkArgs(context, 1, exactArgs); err != nil {
 			return err
 		}
@@ -52,7 +57,6 @@ checkpointed.`,
 			logrus.Warn("runc checkpoint is untested with rootless containers")
 		}
 
-		// 通过 getContainer 获取指定的容器对象，并检查其状态。如果容器处于 Created 或 Stopped 状态，则不能执行检查点操作
 		container, err := getContainer(context)
 		if err != nil {
 			return err
@@ -61,19 +65,15 @@ checkpointed.`,
 		if err != nil {
 			return err
 		}
-
 		if status == libcontainer.Created || status == libcontainer.Stopped {
 			return fmt.Errorf("Container cannot be checkpointed in %s state", status.String())
 		}
-		//使用 criuOptions 函数获取 CRIU 配置选项，这些选项包含路径设置、是否保持运行状态、TCP连接等配置。
 		options, err := criuOptions(context)
 		if err != nil {
 			return err
 		}
-		// 执行检查点保存
+
 		err = container.Checkpoint(options)
-		fmt.Println("hello 2024")
-		// 成功并且 LeaveRunning 和 PreDump 未启用，则销毁容器
 		if err == nil && !(options.LeaveRunning || options.PreDump) {
 			// Destroy the container unless we tell CRIU to keep it.
 			if err := container.Destroy(); err != nil {
@@ -84,7 +84,6 @@ checkpointed.`,
 	},
 }
 
-// 负责准备 CRIU 镜像保存的路径。
 func prepareImagePaths(context *cli.Context) (string, string, error) {
 	imagePath := context.String("image-path")
 	if imagePath == "" {
@@ -117,25 +116,20 @@ func prepareImagePaths(context *cli.Context) (string, string, error) {
 	return imagePath, parentPath, nil
 }
 
-// 构建并返回 libcontainer.CriuOpts，用于指定执行 CRIU 检查点时的配置
 func criuOptions(context *cli.Context) (*libcontainer.CriuOpts, error) {
 	imagePath, parentPath, err := prepareImagePaths(context)
 	if err != nil {
 		return nil, err
-	}
-	pageStatePath := context.String("page-state-dir")
-	if pageStatePath == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			panic(err)
-		}
-		pageStatePath = filepath.Join(cwd, "pageStateDir")
 	}
 
 	opts := &libcontainer.CriuOpts{
 		ImagesDirectory:         imagePath,
 		WorkDirectory:           context.String("work-path"),
 		ParentImage:             parentPath,
+		DirtyFile:               context.String("dirty-file"),
+		IPAddress:               context.String("ip-address"),
+		PredictMode:             context.String("predict-mode"),
+		LiveMigration:           context.Bool("live-migration"),
 		LeaveRunning:            context.Bool("leave-running"),
 		TcpEstablished:          context.Bool("tcp-established"),
 		ExternalUnixConnections: context.Bool("ext-unix-sk"),
@@ -147,7 +141,6 @@ func criuOptions(context *cli.Context) (*libcontainer.CriuOpts, error) {
 		StatusFd:                context.Int("status-fd"),
 		LsmProfile:              context.String("lsm-profile"),
 		LsmMountContext:         context.String("lsm-mount-context"),
-		PageStateDir:            pageStatePath,
 	}
 
 	// CRIU options below may or may not be set.

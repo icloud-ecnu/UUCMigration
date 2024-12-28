@@ -104,7 +104,7 @@ Note: **N/A** means that the option cannot be supported in a single-node Podman 
 | volumeMounts\.name                                  | ✅      |
 | volumeMounts\.mountPropagation                      | no      |
 | volumeMounts\.readOnly                              | ✅      |
-| volumeMounts\.subPath                               | no      |
+| volumeMounts\.subPath                               | ✅      |
 | volumeMounts\.subPathExpr                           | no      |
 | volumeDevices\.devicePath                           | no      |
 | volumeDevices\.name                                 | no      |
@@ -176,12 +176,28 @@ Note: **N/A** means that the option cannot be supported in a single-node Podman 
 
 ## DaemonSet Fields
 
-| Field                                   | Support                                               |
-|-----------------------------------------|-------------------------------------------------------|
-| selector                                | ✅                                                    |
-| template                                | ✅                                                    |
-| minReadySeconds                         | no                                                    |
-| strategy\.type                          | no                                                    |
-| strategy\.rollingUpdate\.maxSurge       | no                                                    |
-| strategy\.rollingUpdate\.maxUnavailable | no                                                    |
-| revisionHistoryLimit                    | no                                                    |
+| Field                                   | Support |
+|-----------------------------------------|---------|
+| selector                                | ✅      |
+| template                                | ✅      |
+| minReadySeconds                         | no      |
+| strategy\.type                          | no      |
+| strategy\.rollingUpdate\.maxSurge       | no      |
+| strategy\.rollingUpdate\.maxUnavailable | no      |
+| revisionHistoryLimit                    | no      |
+
+## Job Fields
+
+| Field                   | Support                          |
+|-------------------------|----------------------------------|
+| activeDeadlineSeconds   | no                               |
+| selector                | no (automatically set by k8s)    |
+| template                | ✅                               |
+| backoffLimit            | no                               |
+| completionMode          | no                               |
+| completions             | no (set to 1 with kube generate) |
+| manualSelector          | no                               |
+| parallelism             | no (set to 1 with kube generate) |
+| podFailurePolicy        | no                               |
+| suspend                 | no                               |
+| ttlSecondsAfterFinished | no                               |

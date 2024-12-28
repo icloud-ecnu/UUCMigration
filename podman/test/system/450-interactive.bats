@@ -5,16 +5,18 @@
 
 load helpers
 
+# bats file_tags=ci:parallel
+
 ###############################################################################
 # BEGIN setup/teardown
 
-# Each test runs with its own PTY, managed by socat.
-PODMAN_TEST_PTY=$(mktemp -u --tmpdir=${BATS_TMPDIR:-/tmp} podman_pty.XXXXXX)
-PODMAN_DUMMY=$(mktemp -u --tmpdir=${BATS_TMPDIR:-/tmp} podman_dummy.XXXXXX)
-PODMAN_SOCAT_PID=
-
 function setup() {
     basic_setup
+
+    # Each test runs with its own PTY, managed by socat.
+    PODMAN_TEST_PTY=$PODMAN_TMPDIR/podman_pty
+    PODMAN_DUMMY=$PODMAN_TMPDIR/podman_dummy
+    PODMAN_SOCAT_PID=
 
     # Create a pty. Run under 'timeout' because BATS reaps child processes
     # and if we exit before killing socat, bats will hang forever.
@@ -100,6 +102,26 @@ function teardown() {
 
     run_podman run --tty -i=false --rm $IMAGE echo hello < /dev/null
     is "$output" "hello$CR" "-i=false: no warning"
+}
+
+
+@test "podman run -l passthrough-tty" {
+    skip_if_remote
+
+    # Requires conmon 2.1.10 or greater
+    want=2.1.10
+    run_podman info --format '{{.Host.Conmon.Path}}'
+    conmon_path="$output"
+    conmon_version=$($conmon_path --version | sed -ne 's/^.* version //p')
+    if ! printf "%s\n%s\n" "$want" "$conmon_version" | sort --check=quiet --version-sort; then
+        skip "need conmon >= $want; have $conmon_version"
+    fi
+
+    run tty <$PODMAN_TEST_PTY
+    expected_tty="$output"
+
+    run_podman run --rm -v/dev:/dev --log-driver=passthrough-tty $IMAGE tty <$PODMAN_TEST_PTY
+    is "$output" "$expected_tty" "passthrough-tty: tty matches"
 }
 
 # vim: filetype=sh

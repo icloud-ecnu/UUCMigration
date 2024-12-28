@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -9,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"golang.org/x/sys/unix"
@@ -90,10 +92,6 @@ var _ = Describe("Podman run with --sig-proxy", func() {
 
 	Specify("signals are not forwarded to container with sig-proxy false", func() {
 		signal := syscall.SIGFPE
-		if isRootless() {
-			err = podmanTest.RestoreArtifact(fedoraMinimal)
-			Expect(err).ToNot(HaveOccurred())
-		}
 		session, pid := podmanTest.PodmanPID([]string{"run", "--name", "test2", "--sig-proxy=false", fedoraMinimal, "bash", "-c", sigCatch2})
 
 		Expect(WaitForContainer(podmanTest)).To(BeTrue(), "WaitForContainer()")
@@ -110,7 +108,11 @@ var _ = Describe("Podman run with --sig-proxy", func() {
 		Expect(killSession).Should(ExitCleanly())
 
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		// Exit code is normally 2, however with GOTRACEBACK=crash (default in
+		// Fedora/RHEL rpm builds) it will be 134 thus allow both.
+		// https://github.com/containers/podman/issues/24213
+		errorMsg := "SIGFPE: floating-point exception"
+		Expect(session).To(Or(ExitWithError(2, errorMsg), ExitWithError(134, errorMsg)))
 		Expect(session.OutputToString()).To(Not(ContainSubstring("Received")))
 	})
 

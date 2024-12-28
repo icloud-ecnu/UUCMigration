@@ -8,26 +8,23 @@
 
 #include <sys/mman.h>
 #include <string.h>
-
+struct vma_file_info {
+	int dev_maj;
+	int dev_min;
+	unsigned long ino;
+	struct vma_area *vma;
+};
 struct vm_area_list {
-	struct list_head h; /* list of VMAs */
-	unsigned nr; /* nr of all VMAs in the list */
+	struct list_head h;   /* list of VMAs */
+	unsigned nr;	      /* nr of all VMAs in the list */
 	unsigned int nr_aios; /* nr of AIOs VMAs in the list */
 	union {
 		unsigned long nr_priv_pages; /* dmp: nr of pages in private VMAs */
 		unsigned long rst_priv_size; /* rst: size of private VMAs */
 	};
-	unsigned long nr_priv_pages_longest; /* nr of pages in longest private VMA */
+	unsigned long nr_priv_pages_longest;   /* nr of pages in longest private VMA */
 	unsigned long nr_shared_pages_longest; /* nr of pages in longest shared VMA */
 };
-struct VM_LIST {
-    struct list_head h; /* VMA链表头，用于链接所有的虚拟内存区域（VMA） */
-    unsigned num; /* 链表中所有VMA的数量 */
-    unsigned int aio_num; /* 链表中所有异步IO（AIO）VMA的数量 */
-    unsigned long num_priv_pages_longest; /* 最长的私有VMA中的页面数量 */
-    unsigned long num_shared_pages_longest; /* 最长的共享VMA中的页面数量 */
-};
-
 
 static inline void vm_area_list_init(struct vm_area_list *vml)
 {
@@ -61,8 +58,8 @@ struct vma_area {
 		struct /* for restore */ {
 			int (*vm_open)(int pid, struct vma_area *vma);
 			struct file_desc *vmfd;
-			struct vma_area *pvma; /* parent for inherited VMAs */
-			unsigned long *page_bitmap; /* existent pages */
+			struct vma_area *pvma;	      /* parent for inherited VMAs */
+			unsigned long *page_bitmap;   /* existent pages */
 			unsigned long premmaped_addr; /* restore only */
 
 			/*
@@ -114,6 +111,7 @@ static inline bool vma_entry_is_private(VmaEntry *entry, unsigned long task_size
 	return (vma_entry_is(entry, VMA_AREA_REGULAR) &&
 		(vma_entry_is(entry, VMA_ANON_PRIVATE) || vma_entry_is(entry, VMA_FILE_PRIVATE)) &&
 		(entry->end <= task_size)) ||
+	       vma_entry_is(entry, VMA_AREA_SHSTK) ||
 	       vma_entry_is(entry, VMA_AREA_AIORING);
 }
 
@@ -130,7 +128,8 @@ static inline struct vma_area *vma_next(struct vma_area *vma)
 static inline bool vma_entry_can_be_lazy(VmaEntry *e)
 {
 	return ((e->flags & MAP_ANONYMOUS) && (e->flags & MAP_PRIVATE) && !(e->flags & MAP_LOCKED) &&
-		!(vma_entry_is(e, VMA_AREA_VDSO)) && !(vma_entry_is(e, VMA_AREA_VSYSCALL)));
+		!(vma_entry_is(e, VMA_AREA_VDSO)) && !(vma_entry_is(e, VMA_AREA_VVAR)) &&
+		!(vma_entry_is(e, VMA_AREA_VSYSCALL)) && !(e->flags & MAP_HUGETLB));
 }
 
 #endif /* __CR_VMA_H__ */

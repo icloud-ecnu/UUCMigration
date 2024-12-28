@@ -5,6 +5,8 @@ import (
 	"path"
 	"testing"
 
+	"github.com/moby/sys/userns"
+
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fscommon"
 	"github.com/opencontainers/runc/libcontainer/configs"
@@ -17,6 +19,9 @@ func init() {
 }
 
 func TestSetV1Allow(t *testing.T) {
+	if userns.RunningInUserNS() {
+		t.Skip("userns detected; setV1 does nothing")
+	}
 	dir := t.TempDir()
 
 	for file, contents := range map[string]string{

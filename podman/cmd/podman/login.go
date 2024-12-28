@@ -9,9 +9,9 @@ import (
 	"github.com/containers/common/pkg/auth"
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/spf13/cobra"
 )
 
@@ -98,24 +98,7 @@ func login(cmd *cobra.Command, args []string) error {
 	sysCtx := &types.SystemContext{
 		DockerInsecureSkipTLSVerify: skipTLS,
 	}
-	setRegistriesConfPath(sysCtx)
+	common.SetRegistriesConfPath(sysCtx)
 	loginOptions.GetLoginSet = cmd.Flag("get-login").Changed
 	return auth.Login(context.Background(), sysCtx, &loginOptions.LoginOptions, args)
-}
-
-// setRegistriesConfPath sets the registries.conf path for the specified context.
-// NOTE: this is a verbatim copy from c/common/libimage which we're not using
-// to prevent leaking c/storage into this file.  Maybe this should go into c/image?
-func setRegistriesConfPath(systemContext *types.SystemContext) {
-	if systemContext.SystemRegistriesConfPath != "" {
-		return
-	}
-	if envOverride, ok := os.LookupEnv("CONTAINERS_REGISTRIES_CONF"); ok {
-		systemContext.SystemRegistriesConfPath = envOverride
-		return
-	}
-	if envOverride, ok := os.LookupEnv("REGISTRIES_CONFIG_PATH"); ok {
-		systemContext.SystemRegistriesConfPath = envOverride
-		return
-	}
 }

@@ -1,5 +1,4 @@
-//go:build !remote_testing
-// +build !remote_testing
+//go:build !remote_testing && (linux || freebsd)
 
 package integration
 
@@ -9,7 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/containers/common/pkg/apparmor"
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -99,7 +98,7 @@ profile aa-test-profile flags=(attach_disconnected,mediate_deleted) {
 		skipIfAppArmorDisabled()
 		session := podmanTest.Podman([]string{"run", "--security-opt", "apparmor=invalid", ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(126, `AppArmor profile "invalid" specified but not loaded`))
 	})
 
 	It("podman run apparmor unconfined", func() {
@@ -119,7 +118,7 @@ profile aa-test-profile flags=(attach_disconnected,mediate_deleted) {
 		// Should fail if user specifies apparmor on disabled system
 		session := podmanTest.Podman([]string{"create", "--security-opt", fmt.Sprintf("apparmor=%s", apparmor.Profile), ALPINE, "ls"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, fmt.Sprintf(`apparmor profile "%s" specified, but Apparmor is not enabled on this system`, apparmor.Profile)))
 	})
 
 	It("podman run apparmor disabled no default", func() {

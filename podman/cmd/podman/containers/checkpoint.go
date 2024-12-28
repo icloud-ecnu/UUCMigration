@@ -8,13 +8,13 @@ import (
 	"time"
 
 	"github.com/containers/common/pkg/completion"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/cmd/podman/validate"
-	"github.com/containers/podman/v4/pkg/criu"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/cmd/podman/validate"
+	"github.com/containers/podman/v5/pkg/criu"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/rootless"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/spf13/cobra"
 )
@@ -36,7 +36,7 @@ var (
 		ValidArgsFunction: common.AutocompleteContainersRunning,
 		Example: `podman container checkpoint --keep ctrID
   podman container checkpoint --all
-  podman container checkpoint --leave-running --latest`,
+  podman container checkpoint --leave-running ctrID`,
 	}
 )
 
@@ -68,6 +68,10 @@ func init() {
 	flags.BoolVarP(&checkpointOptions.PreCheckPoint, "pre-checkpoint", "P", false, "Dump container's memory information only, leave the container running")
 	flags.BoolVar(&checkpointOptions.WithPrevious, "with-previous", false, "Checkpoint container with pre-checkpoint images")
 
+	flags.BoolVar(&checkpointOptions.LiveMigration, "live-migration", false, "Migrate the container lively")
+	flags.StringVar(&checkpointOptions.DirtyFile, "dirty-file", "", "dirty-file path")
+	flags.StringVar(&checkpointOptions.PredictMode, "predict-mode", "", "set predict mode")
+	flags.StringVar(&checkpointOptions.IPAddress, "ip", "", "set ip address")
 	createImageFlagName := "create-image"
 	flags.StringVarP(&checkpointOptions.CreateImage, createImageFlagName, "", "", "Create checkpoint image with specified name")
 	_ = checkpointCommand.RegisterFlagCompletionFunc(createImageFlagName, completion.AutocompleteNone)

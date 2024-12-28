@@ -40,22 +40,22 @@ enum {
 static struct testcase *testcases;
 static futex_t *fstate;
 static struct testcase __testcases[] = {
-	{ 2, 1, 2, 1, 2, 1 }, /* session00			*/
-	{ 4, 2, 4, 2, 4, 1 }, /*  |\_session00		*/
-	{ 15, 4, 4, 4, 15, 1 }, /*  |  |\_session00		*/
-	{ 16, 4, 4, 4, 15, 1 }, /*  |   \_session00		*/
-	{ 17, 4, 4, 4, 17, 0 }, /*  |  |\_session00		*/
-	{ 18, 4, 4, 4, 17, 1 }, /*  |   \_session00		*/
-	{ 5, 2, 2, 2, 2, 1 }, /*  |\_session00		*/
-	{ 8, 2, 8, 2, 8, 1 }, /*  |\_session00		*/
-	{ 9, 8, 2, 2, 2, 1 }, /*  |   \_session00		*/
-	{ 10, 2, 10, 2, 10, 1 }, /*  |\_session00		*/
+	{ 2, 1, 2, 1, 2, 1 },	  /* session00			*/
+	{ 4, 2, 4, 2, 4, 1 },	  /*  |\_session00		*/
+	{ 15, 4, 4, 4, 15, 1 },	  /*  |  |\_session00		*/
+	{ 16, 4, 4, 4, 15, 1 },	  /*  |   \_session00		*/
+	{ 17, 4, 4, 4, 17, 0 },	  /*  |  |\_session00		*/
+	{ 18, 4, 4, 4, 17, 1 },	  /*  |   \_session00		*/
+	{ 5, 2, 2, 2, 2, 1 },	  /*  |\_session00		*/
+	{ 8, 2, 8, 2, 8, 1 },	  /*  |\_session00		*/
+	{ 9, 8, 2, 2, 2, 1 },	  /*  |   \_session00		*/
+	{ 10, 2, 10, 2, 10, 1 },  /*  |\_session00		*/
 	{ 11, 10, 11, 2, 11, 1 }, /*  |    \_session00		*/
-	{ 12, 11, 2, 2, 2, 1 }, /*  |        \_session00	*/
-	{ 13, 2, 2, 2, 2, 0 }, /*   \_session00		*/
-	{ 3, 13, 2, 2, 2, 1 }, /* session00			*/
-	{ 6, 2, 6, 2, 6, 0 }, /*   \_session00		*/
-	{ 14, 6, 6, 6, 6, 1 }, /* session00			*/
+	{ 12, 11, 2, 2, 2, 1 },	  /*  |        \_session00	*/
+	{ 13, 2, 2, 2, 2, 0 },	  /*   \_session00		*/
+	{ 3, 13, 2, 2, 2, 1 },	  /* session00			*/
+	{ 6, 2, 6, 2, 6, 0 },	  /*   \_session00		*/
+	{ 14, 6, 6, 6, 6, 1 },	  /* session00			*/
 };
 
 #define TESTS (sizeof(__testcases) / sizeof(struct testcase))
@@ -154,7 +154,7 @@ static int child(const int c)
 			continue;
 		if (testcases[i].alive)
 			continue;
-		test_msg("Wait porcess %d (pid %d)\n", i, testcases[i].master.pid);
+		test_msg("Wait process %d (pid %d)\n", i, testcases[i].master.pid);
 		waitpid(testcases[i].master.pid, NULL, 0);
 	}
 
@@ -244,7 +244,7 @@ int main(int argc, char **argv)
 			continue;
 		if (testcases[i].alive)
 			continue;
-		test_msg("Wait porcess %d (pid %d)\n", i, testcases[i].master.pid);
+		test_msg("Wait process %d (pid %d)\n", i, testcases[i].master.pid);
 		waitpid(testcases[i].master.pid, NULL, 0);
 	}
 

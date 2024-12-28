@@ -21,13 +21,13 @@ typedef struct {
 	unsigned long xer;
 	unsigned long ccr;
 	unsigned long softe; /* Soft enabled/disabled */
-	unsigned long trap; /* Reason for being here */
+	unsigned long trap;  /* Reason for being here */
 	/*
 	 * N.B. for critical exceptions on 4xx, the dar and dsisr
 	 * fields are overloaded to hold srr0 and srr1.
 	 */
-	unsigned long dar; /* Fault registers */
-	unsigned long dsisr; /* on 4xx/Book-E used for ESR */
+	unsigned long dar;    /* Fault registers */
+	unsigned long dsisr;  /* on 4xx/Book-E used for ESR */
 	unsigned long result; /* Result of a system call */
 } user_regs_struct_t;
 
@@ -72,10 +72,11 @@ typedef struct {
 	} tm;
 } user_fpregs_struct_t;
 
-#define REG_RES(regs)	     ((uint64_t)(regs).gpr[3])
-#define REG_IP(regs)	     ((uint64_t)(regs).nip)
-#define REG_SP(regs)	     ((uint64_t)(regs).gpr[1])
-#define REG_SYSCALL_NR(regs) ((uint64_t)(regs).gpr[0])
+#define REG_RES(regs)	      ((uint64_t)(regs).gpr[3])
+#define REG_IP(regs)	      ((uint64_t)(regs).nip)
+#define SET_REG_IP(regs, val) ((regs).nip = (val))
+#define REG_SP(regs)	      ((uint64_t)(regs).gpr[1])
+#define REG_SYSCALL_NR(regs)  ((uint64_t)(regs).gpr[0])
 
 #define user_regs_native(pregs) true
 

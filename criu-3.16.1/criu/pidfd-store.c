@@ -13,6 +13,7 @@
 #include "log.h"
 #include "util.h"
 #include "pidfd-store.h"
+#include "sockets.h"
 
 struct pidfd_entry {
 	pid_t pid;
@@ -94,13 +95,12 @@ int init_pidfd_store_sk(pid_t pid, int sk)
 	 * This is similar to how fdstore_init() works.
 	 */
 	if (addrlen == sizeof(sa_family_t)) {
-		if (setsockopt(pidfd_store_sk, SOL_SOCKET, SO_SNDBUFFORCE, &buf[0], sizeof(buf[0])) < 0 ||
-		    setsockopt(pidfd_store_sk, SOL_SOCKET, SO_RCVBUFFORCE, &buf[1], sizeof(buf[1])) < 0) {
-			pr_perror("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE");
+		if (sk_setbufs(pidfd_store_sk, buf)) {
 			goto err;
 		}
 
-		addrlen = snprintf(addr.sun_path, sizeof(addr.sun_path), "X/criu-pidfd-store-%d-%d", pid, sk);
+		addrlen = snprintf(addr.sun_path, sizeof(addr.sun_path), "X/criu-pidfd-store-%d-%d-%" PRIx64, pid, sk,
+				   criu_run_id);
 		addrlen += sizeof(addr.sun_family);
 
 		addr.sun_path[0] = 0;

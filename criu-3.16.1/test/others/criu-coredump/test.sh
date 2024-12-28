@@ -1,7 +1,11 @@
-source ../env.sh
+#!/bin/bash
+
+set -x
+# shellcheck source=test/others/env.sh
+source ../env.sh || exit 1
 
 function gen_imgs {
-	PID=$(../loop)
+	PID=$(../loop with a very very very very very very very very very very very very long cmdline)
 	if ! $CRIU dump -v4 -o dump.log -D ./ -t "$PID"; then
 		echo "Failed to checkpoint process $PID"
 		cat dump.log
@@ -9,7 +13,7 @@ function gen_imgs {
 		exit 1
 	fi
 
-	images_list=$(ls -1 *.img)
+	images_list=$(ls -1 ./*.img)
 	if [ -z "$images_list" ]; then
 		echo "Failed to generate images"
 		exit 1
@@ -32,12 +36,20 @@ function run_test {
 	for x in $cores
 	do
 		echo "=== try readelf $x"
-		readelf -a $x || exit $?
+		readelf -a "$x" || exit $?
 		echo "=== done"
 	done
 
 	echo "= done"
 }
+
+UNAME_M=$(uname -m)
+
+if [ "$UNAME_M" != "x86_64" ]; then
+	# the criu-coredump script is only x86_64 aware
+	echo "criu-coredump only support x86_64. skipping."
+	exit 0
+fi
 
 gen_imgs
 run_test

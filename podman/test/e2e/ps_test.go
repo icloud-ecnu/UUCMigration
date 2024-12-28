@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -6,7 +8,7 @@ import (
 	"sort"
 	"strconv"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	"github.com/containers/storage/pkg/stringid"
 	"github.com/docker/go-units"
 	. "github.com/onsi/ginkgo/v2"
@@ -406,11 +408,11 @@ var _ = Describe("Podman ps", func() {
 	It("podman ps mutually exclusive flags", func() {
 		session := podmanTest.Podman([]string{"ps", "-aqs"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "quiet conflicts with size and namespace"))
 
 		session = podmanTest.Podman([]string{"ps", "-a", "--ns", "-s"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "size and namespace options conflict"))
 	})
 
 	It("podman --format by size", func() {
@@ -540,8 +542,7 @@ var _ = Describe("Podman ps", func() {
 			"run", "-p", "1000-2000:2000-3000", "-p", "1999-2999:3001-4001", ALPINE,
 		})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(125))
-		Expect(session.ErrorToString()).To(ContainSubstring("conflicting port mappings for host port 1999"))
+		Expect(session).Should(ExitWithError(125, "conflicting port mappings for host port 1999 (protocol tcp)"))
 	})
 
 	It("podman ps test with multiple port range", func() {
@@ -666,7 +667,7 @@ var _ = Describe("Podman ps", func() {
 		session = podmanTest.Podman([]string{"run", "--name", "test2", "--label", "foo=1",
 			ALPINE, "ls", "/fail"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(1))
+		Expect(session).Should(ExitWithError(1, "ls: /fail: No such file or directory"))
 
 		session = podmanTest.Podman([]string{"create", "--name", "test3", ALPINE, cid1})
 		session.WaitWithDefaultTimeout()

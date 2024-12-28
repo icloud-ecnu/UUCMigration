@@ -1,10 +1,9 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	"encoding/json"
-
-	"github.com/containers/podman/v4/libpod/define"
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -14,7 +13,11 @@ var _ = Describe("Podman pod inspect", func() {
 	It("podman inspect bogus pod", func() {
 		session := podmanTest.Podman([]string{"pod", "inspect", "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitWithError())
+		expect := "no such pod foobar"
+		if IsRemote() {
+			expect = `no such pod "foobar"`
+		}
+		Expect(session).Should(ExitWithError(125, expect))
 	})
 
 	It("podman inspect a pod", func() {
@@ -69,9 +72,7 @@ var _ = Describe("Podman pod inspect", func() {
 		inspectOut.WaitWithDefaultTimeout()
 		Expect(inspectOut).Should(ExitCleanly())
 
-		inspectJSON := new(define.InspectPodData)
-		err := json.Unmarshal(inspectOut.Out.Contents(), inspectJSON)
-		Expect(err).ToNot(HaveOccurred())
+		inspectJSON := inspectOut.InspectPodToJSON()
 		Expect(inspectJSON.InfraConfig).To(Not(BeNil()))
 		Expect(inspectJSON.InfraConfig.PortBindings["80/tcp"]).To(HaveLen(1))
 		Expect(inspectJSON.InfraConfig.PortBindings["80/tcp"][0]).To(HaveField("HostPort", "8383"))

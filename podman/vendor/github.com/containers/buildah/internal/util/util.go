@@ -72,7 +72,7 @@ func ExportFromReader(input io.Reader, opts define.BuildOutputOption) error {
 			noLChown = true
 		}
 
-		err = os.MkdirAll(opts.Path, 0700)
+		err = os.MkdirAll(opts.Path, 0o700)
 		if err != nil {
 			return fmt.Errorf("failed while creating the destination path %q: %w", opts.Path, err)
 		}
@@ -96,4 +96,9 @@ func ExportFromReader(input io.Reader, opts define.BuildOutputOption) error {
 		}
 	}
 	return nil
+}
+
+func SetHas(m map[string]struct{}, k string) bool {
+	_, ok := m[k]
+	return ok
 }

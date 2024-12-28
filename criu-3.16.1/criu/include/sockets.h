@@ -27,6 +27,7 @@ struct socket_desc {
 extern int dump_socket(struct fd_parms *p, int lfd, FdinfoEntry *);
 extern int dump_socket_opts(int sk, SkOptsEntry *soe);
 extern int restore_socket_opts(int sk, SkOptsEntry *soe);
+extern int sk_setbufs(int sk, uint32_t *bufs);
 extern void release_skopts(SkOptsEntry *);
 extern int restore_prepare_socket(int sk);
 extern void preload_socket_modules(void);
@@ -122,5 +123,9 @@ extern const char *socket_proto_name(unsigned int proto, char *nm, size_t size);
 #define ___socket_type_name(type)     __socket_info_helper(socket_type_name, type)
 #define ___socket_family_name(family) __socket_info_helper(socket_family_name, family)
 #define ___socket_proto_name(proto)   __socket_info_helper(socket_proto_name, proto)
+
+#ifndef SO_BUF_LOCK
+#define SO_BUF_LOCK 72
+#endif
 
 #endif /* __CR_SOCKETS_H__ */

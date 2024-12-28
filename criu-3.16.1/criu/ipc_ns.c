@@ -15,6 +15,7 @@
 #include "sysctl.h"
 #include "ipc_ns.h"
 #include "shmem.h"
+#include "types.h"
 
 #include "protobuf.h"
 #include "images/ipc-var.pb-c.h"
@@ -291,6 +292,8 @@ static void pr_info_ipc_shm(const IpcShmEntry *shm)
 
 static int ipc_sysctl_req(IpcVarEntry *e, int op)
 {
+	int i;
+
 	struct sysctl_req req[] = {
 		{ "kernel/sem", e->sem_ctls, CTL_U32A(e->n_sem_ctls) },
 		{ "kernel/msgmax", &e->msg_ctlmax, CTL_U32 },
@@ -331,6 +334,9 @@ static int ipc_sysctl_req(IpcVarEntry *e, int op)
 	if (e->has_shm_next_id)
 		req[nr++] = req[16];
 
+	for (i = 0; i < nr; i++)
+		req[i].flags = CTL_FLAGS_IPC_EACCES_SKIP;
+
 	return sysctl_op(req, nr, op, CLONE_NEWIPC);
 }
 
@@ -354,6 +360,42 @@ static int dump_ipc_shm_pages(const IpcShmEntry *shm)
 	return ret;
 }
 
+static int dump_shm_hugetlb_flag(IpcShmEntry *shm, int id, unsigned long size)
+{
+	void *addr;
+	int ret, hugetlb_flag, exit_code = -1;
+	struct stat st;
+	char path[64];
+
+	addr = shmat(id, NULL, SHM_RDONLY);
+	if (addr == (void *)-1) {
+		pr_perror("Failed to attach shm");
+		return -1;
+	}
+
+	/* The shm segment size may not be aligned,
+	 * we need to align it up to next page size
+	 */
+	size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	snprintf(path, sizeof(path), "/proc/self/map_files/%lx-%lx", (unsigned long)addr, (unsigned long)addr + size);
+
+	ret = stat(path, &st);
+	if (ret < 0) {
+		pr_perror("Can't stat map_files");
+		goto detach;
+	}
+
+	if (is_hugetlb_dev(st.st_dev, &hugetlb_flag)) {
+		shm->has_hugetlb_flag = true;
+		shm->hugetlb_flag = hugetlb_flag | SHM_HUGETLB;
+	}
+
+	exit_code = 0;
+detach:
+	shmdt(addr);
+	return exit_code;
+}
+
 static int dump_ipc_shm_seg(struct cr_img *img, int id, const struct shmid_ds *ds)
 {
 	IpcShmEntry shm = IPC_SHM_ENTRY__INIT;
@@ -364,6 +406,10 @@ static int dump_ipc_shm_seg(struct cr_img *img, int id, const struct shmid_ds *d
 	shm.size = ds->shm_segsz;
 	shm.has_in_pagemaps = true;
 	shm.in_pagemaps = true;
+
+	if (dump_shm_hugetlb_flag(&shm, id, ds->shm_segsz))
+		return -1;
+
 	fill_ipc_desc(id, shm.desc, &ds->shm_perm);
 	pr_info_ipc_shm(&shm);
 
@@ -529,7 +575,7 @@ static int prepare_ipc_sem_desc(struct cr_img *img, const IpcSemEntry *sem)
 {
 	int ret, id;
 	struct sysctl_req req[] = {
-		{ "kernel/sem_next_id", &sem->desc->id, CTL_U32 },
+		{ "kernel/sem_next_id", &sem->desc->id, CTL_U32, CTL_FLAGS_IPC_EACCES_SKIP },
 	};
 	struct semid_ds semid;
 
@@ -662,7 +708,7 @@ static int prepare_ipc_msg_queue(struct cr_img *img, const IpcMsgEntry *msq)
 {
 	int ret, id;
 	struct sysctl_req req[] = {
-		{ "kernel/msg_next_id", &msq->desc->id, CTL_U32 },
+		{ "kernel/msg_next_id", &msq->desc->id, CTL_U32, CTL_FLAGS_IPC_EACCES_SKIP },
 	};
 	struct msqid_ds msqid;
 
@@ -798,9 +844,9 @@ static int prepare_ipc_shm_pages(struct cr_img *img, const IpcShmEntry *shm)
 
 static int prepare_ipc_shm_seg(struct cr_img *img, const IpcShmEntry *shm)
 {
-	int ret, id;
+	int ret, id, hugetlb_flag = 0;
 	struct sysctl_req req[] = {
-		{ "kernel/shm_next_id", &shm->desc->id, CTL_U32 },
+		{ "kernel/shm_next_id", &shm->desc->id, CTL_U32, CTL_FLAGS_IPC_EACCES_SKIP },
 	};
 	struct shmid_ds shmid;
 
@@ -813,7 +859,10 @@ static int prepare_ipc_shm_seg(struct cr_img *img, const IpcShmEntry *shm)
 		return ret;
 	}
 
-	id = shmget(shm->desc->key, shm->size, shm->desc->mode | IPC_CREAT | IPC_EXCL);
+	if (shm->has_hugetlb_flag)
+		hugetlb_flag = shm->hugetlb_flag;
+
+	id = shmget(shm->desc->key, shm->size, hugetlb_flag | shm->desc->mode | IPC_CREAT | IPC_EXCL);
 	if (id == -1) {
 		pr_perror("Failed to create shm set");
 		return -errno;

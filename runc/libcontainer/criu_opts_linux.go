@@ -13,6 +13,10 @@ type VethPairName struct {
 }
 
 type CriuOpts struct {
+	DirtyFile               string
+	IPAddress               string
+	PredictMode             string
+	LiveMigration           bool
 	ImagesDirectory         string             // directory for storing image files
 	WorkDirectory           string             // directory to cd and write logs/pidfiles/stats to
 	ParentImage             string             // directory for storing parent image files in pre-dump and dump
@@ -31,5 +35,4 @@ type CriuOpts struct {
 	StatusFd                int                // fd for feedback when lazy server is ready
 	LsmProfile              string             // LSM profile used to restore the container
 	LsmMountContext         string             // LSM mount context value to use during restore
-	PageStateDir            string             //live
 }

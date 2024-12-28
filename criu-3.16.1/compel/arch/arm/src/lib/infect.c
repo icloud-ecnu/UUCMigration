@@ -18,7 +18,7 @@
  */
 const char code_syscall[] = {
 	0x00, 0x00, 0x00, 0xef, /* SVC #0  */
-	0xf0, 0x01, 0xf0, 0xe7 /* UDF #32 */
+	0xf0, 0x01, 0xf0, 0xe7	/* UDF #32 */
 };
 
 static const int code_syscall_aligned = round_up(sizeof(code_syscall), sizeof(long));
@@ -65,10 +65,9 @@ int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *sigframe, struct rt_sigfr
 }
 
 #define PTRACE_GETVFPREGS 27
-int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *ext_regs, save_regs_t save,
+int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *vfp, save_regs_t save,
 			 void *arg, __maybe_unused unsigned long flags)
 {
-	user_fpregs_struct_t tmp, *vfp = ext_regs ? ext_regs : &tmp;
 	int ret = -1;
 
 	pr_info("Dumping GP/FPU registers for %d\n", pid);

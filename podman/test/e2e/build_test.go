@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -10,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/containers/buildah/define"
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gexec"
@@ -37,6 +39,37 @@ var _ = Describe("Podman build", func() {
 		session = podmanTest.Podman([]string{"rmi", ALPINE})
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
+	})
+
+	It("podman image prune should clean build cache", Serial, func() {
+		// try writing something to persistent cache
+		session := podmanTest.Podman([]string{"build", "-f", "build/buildkit-mount/Containerfilecachewrite"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+
+		// try reading something from persistent cache
+		session = podmanTest.Podman([]string{"build", "-f", "build/buildkit-mount/Containerfilecacheread"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToString()).To(ContainSubstring("hello"))
+
+		// Prune build cache
+		session = podmanTest.Podman([]string{"image", "prune", "-f", "--build-cache"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+
+		expectedErr := "open '/test/world': No such file or directory"
+		// try reading something from persistent cache should fail
+		session = podmanTest.Podman([]string{"build", "-f", "build/buildkit-mount/Containerfilecacheread"})
+		session.WaitWithDefaultTimeout()
+		if IsRemote() {
+			// In the case of podman remote the error from build is not being propagated to `stderr` instead it appears
+			// on the `stdout` this could be a potential bug in `remote build` which needs to be fixed and visited.
+			Expect(session.OutputToString()).To(ContainSubstring(expectedErr))
+			Expect(session).Should(ExitWithError(1, "exit status 1"))
+		} else {
+			Expect(session).Should(ExitWithError(1, expectedErr))
+		}
 	})
 
 	It("podman build and remove basic alpine with TMPDIR as relative", func() {
@@ -94,6 +127,25 @@ var _ = Describe("Podman build", func() {
 		Expect(session).Should(ExitCleanly())
 	})
 
+	It("podman build with not found Containerfile or Dockerfile", func() {
+		targetPath := filepath.Join(podmanTest.TempDir, "notfound")
+		err = os.Mkdir(targetPath, 0755)
+		Expect(err).ToNot(HaveOccurred())
+		defer func() {
+			Expect(os.RemoveAll(targetPath)).To(Succeed())
+		}()
+
+		session := podmanTest.Podman([]string{"build", targetPath})
+		session.WaitWithDefaultTimeout()
+		expectStderr := fmt.Sprintf("no Containerfile or Dockerfile specified or found in context directory, %s", targetPath)
+		Expect(session).Should(ExitWithError(125, expectStderr))
+
+		session = podmanTest.Podman([]string{"build", "-f", "foo", targetPath})
+		session.WaitWithDefaultTimeout()
+		expectStderr = fmt.Sprintf("the specified Containerfile or Dockerfile does not exist, %s", "foo")
+		Expect(session).Should(ExitWithError(125, expectStderr))
+	})
+
 	It("podman build with logfile", func() {
 		logfile := filepath.Join(podmanTest.TempDir, "logfile")
 		session := podmanTest.Podman([]string{"build", "--pull=never", "--tag", "test", "--logfile", logfile, "build/basicalpine"})
@@ -121,7 +173,7 @@ var _ = Describe("Podman build", func() {
 	It("podman build context directory a file", func() {
 		session := podmanTest.Podman([]string{"build", "--pull=never", "build/context_dir_a_file"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(125))
+		Expect(session).Should(ExitWithError(125, "context must be a directory:"))
 	})
 
 	// Check that builds with different values for the squash options
@@ -190,12 +242,11 @@ var _ = Describe("Podman build", func() {
 		// Test if entire build is used from cache
 		Expect(session.OutputToString()).To(ContainSubstring("Using cache"))
 
-		session = podmanTest.Podman([]string{"inspect", "--format", "{{.RootFS.Layers}}", "test-squash-d"})
+		session = podmanTest.Podman([]string{"inspect", "--format", "{{.RootFS.Layers}}", "test"})
 		session.WaitWithDefaultTimeout()
 		Expect(session).Should(ExitCleanly())
 		// Check for one layers
 		Expect(strings.Fields(session.OutputToString())).To(HaveLen(1))
-
 	})
 
 	It("podman build Containerfile locations", func() {
@@ -314,8 +365,7 @@ RUN printenv http_proxy`, CITEST_IMAGE)
 		// this tries to use the cache so we explicitly disable it
 		session = podmanTest.Podman([]string{"build", "--no-cache", "--pull-never", "--http-proxy=false", "--file", dockerfilePath, podmanTest.TempDir})
 		session.Wait(120)
-		Expect(session).Should(Exit(1))
-		Expect(session.ErrorToString()).To(ContainSubstring(`Error: building at STEP "RUN printenv http_proxy"`))
+		Expect(session).Should(ExitWithError(1, `Error: building at STEP "RUN printenv http_proxy"`))
 	})
 
 	It("podman build relay exit code to process", func() {
@@ -332,7 +382,7 @@ RUN exit 5`, CITEST_IMAGE)
 		Expect(err).ToNot(HaveOccurred())
 		session := podmanTest.Podman([]string{"build", "-t", "error-test", "--file", dockerfilePath, podmanTest.TempDir})
 		session.Wait(120)
-		Expect(session).Should(Exit(5))
+		Expect(session).Should(ExitWithError(5, `building at STEP "RUN exit 5": while running runtime: exit status 5`))
 	})
 
 	It("podman build and check identity", func() {
@@ -398,8 +448,7 @@ COPY /emptydir/* /dir`, CITEST_IMAGE)
 		// NOTE: Docker and buildah both should error when `COPY /* /dir` is done on emptydir
 		// as context. However buildkit simply ignores this so when buildah also starts ignoring
 		// for such case edit this test to return 0 and check that no `/dir` should be in the result.
-		Expect(session).Should(Exit(125))
-		Expect(session.ErrorToString()).To(ContainSubstring("can't make relative to"))
+		Expect(session).Should(ExitWithError(125, "can't make relative to"))
 	})
 
 	It("podman remote test container/docker file is not inside context dir", func() {
@@ -441,7 +490,7 @@ RUN find /test`, CITEST_IMAGE)
 	It("podman remote build must not allow symlink for ignore files", func() {
 		// Create a random file where symlink must be resolved
 		// but build should not be able to access it.
-		privateFile := filepath.Join("/tmp", "private_file")
+		privateFile := filepath.Join(podmanTest.TempDir, "private_file")
 		f, err := os.Create(privateFile)
 		Expect(err).ToNot(HaveOccurred())
 		// Mark hello to be ignored in outerfile, but it should not be ignored.
@@ -449,16 +498,14 @@ RUN find /test`, CITEST_IMAGE)
 		Expect(err).ToNot(HaveOccurred())
 		defer f.Close()
 
-		// Create .dockerignore which is a symlink to /tmp/private_file.
+		// Create .dockerignore which is a symlink to /tmp/.../private_file outside of the context dir.
 		currentDir, err := os.Getwd()
 		Expect(err).ToNot(HaveOccurred())
 		ignoreFile := filepath.Join(currentDir, "build/containerignore-symlink/.dockerignore")
 		err = os.Symlink(privateFile, ignoreFile)
 		Expect(err).ToNot(HaveOccurred())
 		// Remove created .dockerignore for this test when test ends.
-		defer func() {
-			os.Remove(ignoreFile)
-		}()
+		defer os.Remove(ignoreFile)
 
 		if IsRemote() {
 			podmanTest.StopRemoteService()
@@ -690,6 +737,31 @@ RUN [[ -L /test/dummy-symlink ]] && echo SYMLNKOK || echo SYMLNKERR`, CITEST_IMA
 		Expect(session.OutputToString()).To(ContainSubstring("SYMLNKOK"))
 	})
 
+	It("podman build --no-hosts", func() {
+		targetPath := podmanTest.TempDir
+
+		containerFile := filepath.Join(targetPath, "Containerfile")
+		content := `FROM scratch
+RUN echo '56.78.12.34 image.example.com' > /etc/hosts`
+
+		Expect(os.WriteFile(containerFile, []byte(content), 0755)).To(Succeed())
+
+		defer func() {
+			Expect(os.RemoveAll(containerFile)).To(Succeed())
+		}()
+
+		session := podmanTest.Podman([]string{
+			"build", "--pull-never", "-t", "hosts_test", "--no-hosts", "--from", CITEST_IMAGE, targetPath,
+		})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+
+		session = podmanTest.Podman([]string{"run", "--no-hosts", "--rm", "hosts_test", "cat", "/etc/hosts"})
+		session.WaitWithDefaultTimeout()
+		Expect(session).Should(ExitCleanly())
+		Expect(session.OutputToString()).To(Equal("56.78.12.34 image.example.com"))
+	})
+
 	It("podman build --from, --add-host, --cap-drop, --cap-add", func() {
 		targetPath := podmanTest.TempDir
 
@@ -759,7 +831,7 @@ RUN grep CapEff /proc/self/status`
 		})
 		session.WaitWithDefaultTimeout()
 		// Then
-		Expect(session).Should(Exit(125))
+		Expect(session).Should(ExitWithError(125, `unrecognized isolation type "bogus"`))
 	})
 
 	It("podman build --timestamp flag", func() {
@@ -843,7 +915,7 @@ RUN ls /dev/fuse`, CITEST_IMAGE)
 		Expect(err).ToNot(HaveOccurred())
 		session := podmanTest.Podman([]string{"build", "--pull-never", "-t", "test", "--file", containerfilePath, podmanTest.TempDir})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(1))
+		Expect(session).Should(ExitWithError(1, `building at STEP "RUN ls /dev/fuse": while running runtime: exit status 1`))
 
 		session = podmanTest.Podman([]string{"build", "--pull-never", "--device", "/dev/fuse", "-t", "test", "--file", containerfilePath, podmanTest.TempDir})
 		session.WaitWithDefaultTimeout()
@@ -859,7 +931,7 @@ RUN ls /dev/test1`, CITEST_IMAGE)
 		Expect(err).ToNot(HaveOccurred())
 		session := podmanTest.Podman([]string{"build", "--pull-never", "-t", "test", "--file", containerfilePath, podmanTest.TempDir})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(1))
+		Expect(session).Should(ExitWithError(1, `building at STEP "RUN ls /dev/test1": while running runtime: exit status 1`))
 
 		session = podmanTest.Podman([]string{"build", "--pull-never", "--device", "/dev/zero:/dev/test1", "-t", "test", "--file", containerfilePath, podmanTest.TempDir})
 		session.WaitWithDefaultTimeout()
@@ -898,6 +970,6 @@ RUN ls /dev/test1`, CITEST_IMAGE)
 
 		session = podmanTest.Podman([]string{"build", "--pull-never", "--file", "build/cache/Dockerfilecacheread", "build/cache/"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(1))
+		Expect(session).Should(ExitWithError(1, `building at STEP "RUN --mount=type=cache,target=/test,z cat /test/world": while running runtime: exit status 1`))
 	})
 })

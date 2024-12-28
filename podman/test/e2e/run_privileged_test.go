@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -5,10 +7,10 @@ import (
 	"strconv"
 	"strings"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
+	"github.com/moby/sys/capability"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/syndtr/gocapability/capability"
 )
 
 // helper function for confirming that container capabilities are equal
@@ -30,7 +32,7 @@ func containerCapMatchesHost(ctrCap string, hostCap string) {
 	// and host caps must always be a superset (inclusive) of container
 	Expect(hostCapN).To(BeNumerically(">", 0), "host cap %q should be nonzero", hostCap)
 	Expect(hostCapN).To(BeNumerically(">=", ctrCapN), "host cap %q should never be less than container cap %q", hostCap, ctrCap)
-	hostCapMasked := hostCapN & (1<<len(capability.List()) - 1)
+	hostCapMasked := hostCapN & (1<<len(capability.ListKnown()) - 1)
 	Expect(ctrCapN).To(Equal(hostCapMasked), "container cap %q is not a subset of host cap %q", ctrCap, hostCap)
 }
 
@@ -137,13 +139,6 @@ var _ = Describe("Podman privileged container tests", func() {
 	})
 
 	It("run no-new-privileges test", func() {
-		// Check if our kernel is new enough
-		k, err := IsKernelNewerThan("4.14")
-		Expect(err).ToNot(HaveOccurred())
-		if !k {
-			Skip("Kernel is not new enough to test this feature")
-		}
-
 		cap := SystemExec("grep", []string{"NoNewPrivs", "/proc/self/status"})
 		if cap.ExitCode() != 0 {
 			Skip("Can't determine NoNewPrivs")

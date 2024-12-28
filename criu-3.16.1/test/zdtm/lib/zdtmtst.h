@@ -126,11 +126,25 @@ extern int write_pidfile(int pid);
 /* message helpers */
 extern int test_log_init(const char *outfile, const char *suffix);
 extern int zdtm_seccomp;
-#define pr_err(format, arg...) test_msg("ERR: %s:%d: " format, __FILE__, __LINE__, ##arg)
-#define pr_perror(format, arg...) \
-	test_msg("ERR: %s:%d: " format " (errno = %d (%s))\n", __FILE__, __LINE__, ##arg, errno, strerror(errno))
-#define fail(format, arg...) \
-	test_msg("FAIL: %s:%d: " format " (errno = %d (%s))\n", __FILE__, __LINE__, ##arg, errno, strerror(errno))
+#define pr_err(format, arg...)                                              \
+	({                                                                  \
+		test_msg("ERR: %s:%d: " format, __FILE__, __LINE__, ##arg); \
+		1;                                                          \
+	})
+
+#define pr_perror(format, arg...)                                                                        \
+	({                                                                                               \
+		test_msg("ERR: %s:%d: " format " (errno = %d (%s))\n", __FILE__, __LINE__, ##arg, errno, \
+			 strerror(errno));                                                               \
+		1;                                                                                       \
+	})
+
+#define fail(format, arg...)                                                                              \
+	({                                                                                                \
+		test_msg("FAIL: %s:%d: " format " (errno = %d (%s))\n", __FILE__, __LINE__, ##arg, errno, \
+			 strerror(errno));                                                                \
+		1;                                                                                        \
+	})
 #define skip(format, arg...) test_msg("SKIP: %s:%d: " format "\n", __FILE__, __LINE__, ##arg)
 #define pass()		     test_msg("PASS\n")
 
@@ -164,6 +178,7 @@ extern const char *test_doc;
 extern int tcp_init_server_with_opts(int family, int *port, struct zdtm_tcp_opts *opts);
 extern pid_t sys_clone_unified(unsigned long flags, void *child_stack, void *parent_tid, void *child_tid,
 			       unsigned long newtls);
+extern dev_t get_mapping_dev(void *addr);
 
 #define ssprintf(s, fmt, ...)                                        \
 	({                                                           \
@@ -173,6 +188,41 @@ extern pid_t sys_clone_unified(unsigned long flags, void *child_stack, void *par
 		if (___ret >= sizeof(s))                             \
 			abort();                                     \
 		___ret;                                              \
+	})
+
+#ifndef TEMP_FAILURE_RETRY
+#define TEMP_FAILURE_RETRY(expression)                     \
+	(__extension__({                                   \
+		long int __result;                         \
+		do                                         \
+			__result = (long int)(expression); \
+		while (__result < 0 && errno == EINTR);    \
+		__result;                                  \
+	}))
+#endif
+
+#define cleanup_close __attribute__((cleanup(cleanup_closep)))
+#define cleanup_free  __attribute__((cleanup(cleanup_freep)))
+static inline void cleanup_freep(void *p)
+{
+	void **pp = (void **)p;
+	free(*pp);
+}
+
+static inline void cleanup_closep(void *p)
+{
+	int *pp = (int *)p;
+	if (*pp >= 0)
+		TEMP_FAILURE_RETRY(close(*pp));
+}
+
+extern int write_value(const char *path, const char *value);
+extern int read_value(const char *path, char *value, int size);
+
+#define container_of(ptr, type, member)                            \
+	({                                                         \
+		const typeof(((type *)0)->member) *__mptr = (ptr); \
+		(type *)((char *)__mptr - offsetof(type, member)); \
 	})
 
 #endif /* _VIMITESU_H_ */

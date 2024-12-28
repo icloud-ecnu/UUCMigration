@@ -17,8 +17,8 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
+	"github.com/opencontainers/runc/libcontainer/internal/userns"
 	"github.com/opencontainers/runc/libcontainer/seccomp"
-	"github.com/opencontainers/runc/libcontainer/userns"
 	libcontainerUtils "github.com/opencontainers/runc/libcontainer/utils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
@@ -415,7 +415,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 			}
 			config.Namespaces.Add(t, ns.Path)
 		}
-		if config.Namespaces.Contains(configs.NEWNET) && config.Namespaces.PathOf(configs.NEWNET) == "" {
+		if config.Namespaces.IsPrivate(configs.NEWNET) {
 			config.Networks = []*configs.Network{
 				{
 					Type: "loopback",
@@ -481,7 +481,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	// Only set it if the container will have its own cgroup
 	// namespace and the cgroupfs will be mounted read/write.
 	//
-	hasCgroupNS := config.Namespaces.Contains(configs.NEWCGROUP) && config.Namespaces.PathOf(configs.NEWCGROUP) == ""
+	hasCgroupNS := config.Namespaces.IsPrivate(configs.NEWCGROUP)
 	hasRwCgroupfs := false
 	if hasCgroupNS {
 		for _, m := range config.Mounts {
@@ -533,6 +533,11 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		if spec.Process.Scheduler != nil {
 			s := *spec.Process.Scheduler
 			config.Scheduler = &s
+		}
+
+		if spec.Process.IOPriority != nil {
+			ioPriority := *spec.Process.IOPriority
+			config.IOPriority = &ioPriority
 		}
 	}
 	createHooks(spec, config)
@@ -791,7 +796,7 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 				if r.Memory.Swap != nil {
 					c.Resources.MemorySwap = *r.Memory.Swap
 				}
-				if r.Memory.Kernel != nil || r.Memory.KernelTCP != nil {
+				if r.Memory.Kernel != nil || r.Memory.KernelTCP != nil { //nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
 					logrus.Warn("Kernel memory settings are ignored and will be removed")
 				}
 				if r.Memory.Swappiness != nil {
@@ -1207,7 +1212,7 @@ func SetupSeccomp(config *specs.LinuxSeccomp) (*configs.Seccomp, error) {
 func createHooks(rspec *specs.Spec, config *configs.Config) {
 	config.Hooks = configs.Hooks{}
 	if rspec.Hooks != nil {
-		for _, h := range rspec.Hooks.Prestart {
+		for _, h := range rspec.Hooks.Prestart { //nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
 			cmd := createCommandHook(h)
 			config.Hooks[configs.Prestart] = append(config.Hooks[configs.Prestart], configs.NewCommandHook(cmd))
 		}

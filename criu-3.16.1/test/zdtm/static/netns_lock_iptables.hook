@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import subprocess
 import socket
@@ -30,7 +30,7 @@ if sys.argv[1] == "--post-start":
     nsenter() # Enter test netns
     subprocess.Popen(["ip", "link", "set", "up", "dev", "lo"]).wait()
 
-    # Lets test know that the netns is initilized successfully
+    # Lets test know that the netns is initialized successfully
     # by checking the access of SYNCFILE
     create_sync_file()
 
@@ -67,7 +67,7 @@ if sys.argv[1] == "--post-start":
             cln, addr = srv.accept()
             cln.sendall(str.encode("--post-restore"))
             cln.close()
-        
+
         # Server will be closed when zdtm sends SIGKILL
 
 if sys.argv[1] == "--pre-dump":

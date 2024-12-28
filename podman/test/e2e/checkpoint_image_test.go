@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -6,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containers/podman/v4/pkg/criu"
-	. "github.com/containers/podman/v4/test/utils"
+	"github.com/containers/podman/v5/pkg/criu"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -35,8 +37,7 @@ var _ = Describe("Podman checkpoint", func() {
 		checkpointImage := "foobar-checkpoint"
 		session := podmanTest.Podman([]string{"container", "checkpoint", "--create-image", checkpointImage, "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
-		Expect(session.ErrorToString()).To(ContainSubstring("no container with name or ID \"foobar\" found"))
+		Expect(session).To(ExitWithError(125, `no container with name or ID "foobar" found: no such container`))
 	})
 
 	It("podman checkpoint --create-image with running container", func() {

@@ -23,6 +23,8 @@ runRoot:
 cgroupManager: \\\(systemd\\\|cgroupfs\\\)
 cgroupVersion: v[12]
 "
+    defer-assertion-failures
+
     while read expect; do
         is "$output" ".*$expect" "output includes '$expect'"
     done < <(parse_table "$expected_keys")
@@ -45,6 +47,7 @@ host.cgroupVersion        | v[12]
 host.networkBackendInfo   | .*dns.*package.*
 host.ociRuntime.path      | $expr_path
 host.pasta                | .*executable.*package.*
+host.rootlessNetworkCmd   | pasta
 store.configFile          | $expr_path
 store.graphDriverName     | [a-z0-9]\\\+\\\$
 store.graphRoot           | $expr_path
@@ -52,11 +55,13 @@ store.imageStore.number   | 1
 host.slirp4netns.executable | $expr_path
 "
 
-    parse_table "$tests" | while read field expect; do
+    defer-assertion-failures
+
+    while read field expect; do
         actual=$(echo "$output" | jq -r ".$field")
         dprint "# actual=<$actual> expect=<$expect>"
         is "$actual" "$expect" "jq .$field"
-    done
+    done < <(parse_table "$tests")
 }
 
 @test "podman info - confirm desired runtime" {
@@ -79,20 +84,23 @@ host.slirp4netns.executable | $expr_path
 
 @test "podman info - confirm desired network backend" {
     if [[ -z "$CI_DESIRED_NETWORK" ]]; then
-        # When running in Cirrus, CI_DESIRED_NETWORK *must* be defined
-        # in .cirrus.yml so we can double-check that all CI VMs are
-        # using netavark or cni as desired.
-        if [[ -n "$CIRRUS_CI" ]]; then
-            die "CIRRUS_CI is set, but CI_DESIRED_NETWORK is not! See #16389"
+        # When running on RHEL, CI_DESIRED_NETWORK *must* be defined
+        # in gating.yaml because some versions of RHEL use CNI, some
+        # use netavark.
+        local osrelease=/etc/os-release
+        if [[ -e $osrelease ]]; then
+            local osname=$(source $osrelease; echo $NAME)
+            if [[ $osname =~ Red.Hat ]]; then
+                die "CI_DESIRED_NETWORK must be set in gating.yaml for RHEL testing"
+            fi
         fi
 
-        # Not running under Cirrus (e.g., gating tests, or dev laptop).
-        # Totally OK to skip this test.
-        skip "CI_DESIRED_NETWORK is unset--OK, because we're not in Cirrus"
+        # Everywhere other than RHEL, the only supported network is netavark
+        CI_DESIRED_NETWORK="netavark"
     fi
 
     run_podman info --format '{{.Host.NetworkBackend}}'
-    is "$output" "$CI_DESIRED_NETWORK" "CI_DESIRED_NETWORK (from .cirrus.yml)"
+    is "$output" "$CI_DESIRED_NETWORK" ".Host.NetworkBackend"
 }
 
 @test "podman info - confirm desired database" {
@@ -132,6 +140,16 @@ host.slirp4netns.executable | $expr_path
     fi
 
     is "$(podman_storage_driver)" "$CI_DESIRED_STORAGE" "podman storage driver is not CI_DESIRED_STORAGE (from .cirrus.yml)"
+
+    # Confirm desired setting of composefs
+    if [[ "$CI_DESIRED_STORAGE" = "overlay" ]]; then
+        expect="<no value>"
+        if [[ -n "$CI_DESIRED_COMPOSEFS" ]]; then
+            expect="true"
+        fi
+        run_podman info --format '{{index .Store.GraphOptions "overlay.use_composefs"}}'
+        assert "$output" = "$expect" ".Store.GraphOptions -> overlay.use_composefs"
+    fi
 }
 
 # 2021-04-06 discussed in watercooler: RHEL must never use crun, even if
@@ -164,6 +182,19 @@ host.slirp4netns.executable | $expr_path
     is "$output" ".*graphOptions: {}" "output includes graphOptions: {}"
 }
 
+@test "podman info - additional image stores" {
+    skip_if_remote "--storage-opt flag is not supported for remote"
+    driver=$(podman_storage_driver)
+    store1=$PODMAN_TMPDIR/store1
+    store2=$PODMAN_TMPDIR/store2
+    mkdir -p $store1 $store2
+    run_podman info --storage-opt=$driver'.imagestore='$store1 \
+                    --storage-opt=$driver'.imagestore='$store2 \
+                    --format '{{index .Store.GraphOptions "'$driver'.additionalImageStores"}}\n{{index .Store.GraphOptions "'$driver'.imagestore"}}'
+    assert "${lines[0]}" == "["$store1" "$store2"]" "output includes additional image stores"
+    assert "${lines[1]}" == "$store2" "old imagestore output"
+}
+
 @test "podman info netavark " {
     # Confirm netavark in use when explicitly required by execution environment.
     if [[ "$NETWORK_BACKEND" == "netavark" ]]; then
@@ -191,6 +222,13 @@ host.slirp4netns.executable | $expr_path
     new_home=$PODMAN_TMPDIR/home
 
     ln -s /home $new_home
+
+    # Remove volume directory. This doesn't break Podman but can cause our DB
+    # validation to break if Podman misbehaves. Ref:
+    # https://github.com/containers/podman/issues/23515
+    # (Unfortunately, we can't just use a new directory, that will just trip DB
+    # validation that it doesn't match the path we were using before)
+    rm -rf $PODMAN_TMPDIR/$HOME/.local/share/containers/storage/volumes
 
     # Just need the command to run cleanly
     HOME=$PODMAN_TMPDIR/$HOME run_podman info
@@ -249,6 +287,22 @@ EOF
     assert "$output" =~ "volplugin1" "CONTAINERS_CONF_OVERRIDE does not clobber volume_plugins from CONTAINERS_CONF"
     assert "$output" =~ "volplugin2" "volume_plugins seen from CONTAINERS_CONF_OVERRIDE"
 
+}
+
+@test "podman - BoltDB cannot create new databases" {
+    skip_if_remote "DB checks only work for local Podman"
+
+    safe_opts=$(podman_isolation_opts ${PODMAN_TMPDIR})
+
+    CI_DESIRED_DATABASE= run_podman 125 $safe_opts --db-backend=boltdb info
+    assert "$output" =~ "deprecated, no new BoltDB databases can be created" \
+           "without CI_DESIRED_DATABASE"
+
+    CI_DESIRED_DATABASE=boltdb run_podman $safe_opts --log-level=debug --db-backend=boltdb info
+    assert "$output" =~ "Allowing deprecated database backend" \
+           "with CI_DESIRED_DATABASE"
+
+    run_podman $safe_opts system reset --force
 }
 
 # vim: filetype=sh

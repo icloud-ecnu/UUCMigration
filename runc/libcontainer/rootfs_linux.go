@@ -14,6 +14,7 @@ import (
 
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/moby/sys/mountinfo"
+	"github.com/moby/sys/userns"
 	"github.com/mrunalp/fileutils"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
@@ -24,7 +25,6 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups/fs2"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
-	"github.com/opencontainers/runc/libcontainer/userns"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
@@ -308,8 +308,12 @@ func mountCgroupV1(m *configs.Mount, c *mountConfig) error {
 
 	for _, b := range binds {
 		if c.cgroupns {
+			// We just created the tmpfs, and so we can just use filepath.Join
+			// here (not to mention we want to make sure we create the path
+			// inside the tmpfs, so we don't want to resolve symlinks).
 			subsystemPath := filepath.Join(c.root, b.Destination)
-			if err := os.MkdirAll(subsystemPath, 0o755); err != nil {
+			subsystemName := filepath.Base(b.Destination)
+			if err := utils.MkdirAllInRoot(c.root, subsystemPath, 0o755); err != nil {
 				return err
 			}
 			if err := utils.WithProcfd(c.root, b.Destination, func(dstFd string) error {
@@ -319,7 +323,7 @@ func mountCgroupV1(m *configs.Mount, c *mountConfig) error {
 				}
 				var (
 					source = "cgroup"
-					data   = filepath.Base(subsystemPath)
+					data   = subsystemName
 				)
 				if data == "systemd" {
 					data = cgroups.CgroupNamePrefix + data
@@ -349,14 +353,7 @@ func mountCgroupV1(m *configs.Mount, c *mountConfig) error {
 }
 
 func mountCgroupV2(m *configs.Mount, c *mountConfig) error {
-	dest, err := securejoin.SecureJoin(c.root, m.Destination)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return err
-	}
-	err = utils.WithProcfd(c.root, m.Destination, func(dstFd string) error {
+	err := utils.WithProcfd(c.root, m.Destination, func(dstFd string) error {
 		return mountViaFds(m.Source, nil, m.Destination, dstFd, "cgroup2", uintptr(m.Flags), m.Data)
 	})
 	if err == nil || !(errors.Is(err, unix.EPERM) || errors.Is(err, unix.EBUSY)) {
@@ -482,6 +479,76 @@ func statfsToMountFlags(st unix.Statfs_t) int {
 	return flags
 }
 
+var errRootfsToFile = errors.New("config tries to change rootfs to file")
+
+func createMountpoint(rootfs string, m mountEntry) (string, error) {
+	dest, err := securejoin.SecureJoin(rootfs, m.Destination)
+	if err != nil {
+		return "", err
+	}
+	if err := checkProcMount(rootfs, dest, m); err != nil {
+		return "", fmt.Errorf("check proc-safety of %s mount: %w", m.Destination, err)
+	}
+
+	switch m.Device {
+	case "bind":
+		fi, _, err := m.srcStat()
+		if err != nil {
+			// Error out if the source of a bind mount does not exist as we
+			// will be unable to bind anything to it.
+			return "", err
+		}
+		// If the original source is not a directory, make the target a file.
+		if !fi.IsDir() {
+			// Make sure we aren't tricked into trying to make the root a file.
+			if rootfs == dest {
+				return "", fmt.Errorf("%w: file bind mount over rootfs", errRootfsToFile)
+			}
+			// Make the parent directory.
+			destDir, destBase := filepath.Split(dest)
+			destDirFd, err := utils.MkdirAllInRootOpen(rootfs, destDir, 0o755)
+			if err != nil {
+				return "", fmt.Errorf("make parent dir of file bind-mount: %w", err)
+			}
+			defer destDirFd.Close()
+			// Make the target file. We want to avoid opening any file that is
+			// already there because it could be a "bad" file like an invalid
+			// device or hung tty that might cause a DoS, so we use mknodat.
+			// destBase does not contain any "/" components, and mknodat does
+			// not follow trailing symlinks, so we can safely just call mknodat
+			// here.
+			if err := unix.Mknodat(int(destDirFd.Fd()), destBase, unix.S_IFREG|0o644, 0); err != nil {
+				// If we get EEXIST, there was already an inode there and
+				// we can consider that a success.
+				if !errors.Is(err, unix.EEXIST) {
+					err = &os.PathError{Op: "mknod regular file", Path: dest, Err: err}
+					return "", fmt.Errorf("create target of file bind-mount: %w", err)
+				}
+			}
+			// Nothing left to do.
+			return dest, nil
+		}
+
+	case "tmpfs":
+		// If the original target exists, copy the mode for the tmpfs mount.
+		if stat, err := os.Stat(dest); err == nil {
+			dt := fmt.Sprintf("mode=%04o", syscallMode(stat.Mode()))
+			if m.Data != "" {
+				dt = dt + "," + m.Data
+			}
+			m.Data = dt
+
+			// Nothing left to do.
+			return dest, nil
+		}
+	}
+
+	if err := utils.MkdirAllInRoot(rootfs, dest, 0o755); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
 func mountToRootfs(c *mountConfig, m mountEntry) error {
 	rootfs := c.root
 
@@ -495,7 +562,7 @@ func mountToRootfs(c *mountConfig, m mountEntry) error {
 		// TODO: This won't be necessary once we switch to libpathrs and we can
 		//       stop all of these symlink-exchange attacks.
 		dest := filepath.Clean(m.Destination)
-		if !strings.HasPrefix(dest, rootfs) {
+		if !utils.IsLexicallyInRoot(rootfs, dest) {
 			// Do not use securejoin as it resolves symlinks.
 			dest = filepath.Join(rootfs, dest)
 		}
@@ -509,44 +576,26 @@ func mountToRootfs(c *mountConfig, m mountEntry) error {
 		} else if !fi.IsDir() {
 			return fmt.Errorf("filesystem %q must be mounted on ordinary directory", m.Device)
 		}
-		if err := os.MkdirAll(dest, 0o755); err != nil {
+		if err := utils.MkdirAllInRoot(rootfs, dest, 0o755); err != nil {
 			return err
 		}
 		// Selinux kernels do not support labeling of /proc or /sys.
 		return mountPropagate(m, rootfs, "")
 	}
 
-	mountLabel := c.label
-	dest, err := securejoin.SecureJoin(rootfs, m.Destination)
+	dest, err := createMountpoint(rootfs, m)
 	if err != nil {
-		return err
+		return fmt.Errorf("create mountpoint for %s mount: %w", m.Destination, err)
 	}
-	if err := checkProcMount(rootfs, dest, m); err != nil {
-		return err
-	}
+	mountLabel := c.label
 
 	switch m.Device {
 	case "mqueue":
-		if err := os.MkdirAll(dest, 0o755); err != nil {
-			return err
-		}
 		if err := mountPropagate(m, rootfs, ""); err != nil {
 			return err
 		}
 		return label.SetFileLabel(dest, mountLabel)
 	case "tmpfs":
-		if stat, err := os.Stat(dest); err != nil {
-			if err := os.MkdirAll(dest, 0o755); err != nil {
-				return err
-			}
-		} else {
-			dt := fmt.Sprintf("mode=%04o", syscallMode(stat.Mode()))
-			if m.Data != "" {
-				dt = dt + "," + m.Data
-			}
-			m.Data = dt
-		}
-
 		if m.Extensions&configs.EXT_COPYUP == configs.EXT_COPYUP {
 			err = doTmpfsCopyUp(m, rootfs, mountLabel)
 		} else {
@@ -555,15 +604,6 @@ func mountToRootfs(c *mountConfig, m mountEntry) error {
 
 		return err
 	case "bind":
-		fi, _, err := m.srcStat()
-		if err != nil {
-			// error out if the source of a bind mount does not exist as we will be
-			// unable to bind anything to it.
-			return err
-		}
-		if err := createIfNotExists(dest, fi.IsDir()); err != nil {
-			return err
-		}
 		// open_tree()-related shenanigans are all handled in mountViaFds.
 		if err := mountPropagate(m, rootfs, mountLabel); err != nil {
 			return err
@@ -679,9 +719,6 @@ func mountToRootfs(c *mountConfig, m mountEntry) error {
 		}
 		return mountCgroupV1(m.Mount, c)
 	default:
-		if err := os.MkdirAll(dest, 0o755); err != nil {
-			return err
-		}
 		return mountPropagate(m, rootfs, mountLabel)
 	}
 }
@@ -783,6 +820,7 @@ func checkProcMount(rootfs, dest string, m mountEntry) error {
 		"/proc/slabinfo",
 		"/proc/net/dev",
 		"/proc/sys/kernel/ns_last_pid",
+		"/proc/sys/crypto/fips_enabled",
 	}
 	for _, valid := range validProcMounts {
 		path, err := filepath.Rel(filepath.Join(rootfs, valid), dest)
@@ -898,7 +936,10 @@ func createDeviceNode(rootfs string, node *devices.Device, bind bool) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+	if dest == rootfs {
+		return fmt.Errorf("%w: mknod over rootfs", errRootfsToFile)
+	}
+	if err := utils.MkdirAllInRoot(rootfs, filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
 	if bind {
@@ -941,54 +982,33 @@ func mknodDevice(dest string, node *devices.Device) error {
 	return os.Chown(dest, int(node.Uid), int(node.Gid))
 }
 
-// Get the parent mount point of directory passed in as argument. Also return
-// optional fields.
-func getParentMount(rootfs string) (string, string, error) {
-	mi, err := mountinfo.GetMounts(mountinfo.ParentsFilter(rootfs))
-	if err != nil {
-		return "", "", err
-	}
-	if len(mi) < 1 {
-		return "", "", fmt.Errorf("could not find parent mount of %s", rootfs)
-	}
-
-	// find the longest mount point
-	var idx, maxlen int
-	for i := range mi {
-		if len(mi[i].Mountpoint) > maxlen {
-			maxlen = len(mi[i].Mountpoint)
-			idx = i
+// rootfsParentMountPrivate ensures rootfs parent mount is private.
+// This is needed for two reasons:
+//   - pivot_root() will fail if parent mount is shared;
+//   - when we bind mount rootfs, if its parent is not private, the new mount
+//     will propagate (leak!) to parent namespace and we don't want that.
+func rootfsParentMountPrivate(path string) error {
+	var err error
+	// Assuming path is absolute and clean (this is checked in
+	// libcontainer/validate). Any error other than EINVAL means we failed,
+	// and EINVAL means this is not a mount point, so traverse up until we
+	// find one.
+	for {
+		err = unix.Mount("", path, "", unix.MS_PRIVATE, "")
+		if err == nil {
+			return nil
 		}
-	}
-	return mi[idx].Mountpoint, mi[idx].Optional, nil
-}
-
-// Make parent mount private if it was shared
-func rootfsParentMountPrivate(rootfs string) error {
-	sharedMount := false
-
-	parentMount, optionalOpts, err := getParentMount(rootfs)
-	if err != nil {
-		return err
-	}
-
-	optsSplit := strings.Split(optionalOpts, " ")
-	for _, opt := range optsSplit {
-		if strings.HasPrefix(opt, "shared:") {
-			sharedMount = true
+		if err != unix.EINVAL || path == "/" { //nolint:errorlint // unix errors are bare
 			break
 		}
+		path = filepath.Dir(path)
 	}
-
-	// Make parent mount PRIVATE if it was shared. It is needed for two
-	// reasons. First of all pivot_root() will fail if parent mount is
-	// shared. Secondly when we bind mount rootfs it will propagate to
-	// parent namespace and we don't want that to happen.
-	if sharedMount {
-		return mount("", parentMount, "", unix.MS_PRIVATE, "")
+	return &mountError{
+		op:     "remount-private",
+		target: path,
+		flags:  unix.MS_PRIVATE,
+		err:    err,
 	}
-
-	return nil
 }
 
 func prepareRoot(config *configs.Config) error {
@@ -1000,9 +1020,6 @@ func prepareRoot(config *configs.Config) error {
 		return err
 	}
 
-	// Make parent mount private to make sure following bind mount does
-	// not propagate in other namespaces. Also it will help with kernel
-	// check pass in pivot_root. (IS_SHARED(new_mnt->mnt_parent))
 	if err := rootfsParentMountPrivate(config.Rootfs); err != nil {
 		return err
 	}
@@ -1164,26 +1181,6 @@ func chroot() error {
 	}
 	if err := unix.Chdir("/"); err != nil {
 		return &os.PathError{Op: "chdir", Path: "/", Err: err}
-	}
-	return nil
-}
-
-// createIfNotExists creates a file or a directory only if it does not already exist.
-func createIfNotExists(path string, isDir bool) error {
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			if isDir {
-				return os.MkdirAll(path, 0o755)
-			}
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-				return err
-			}
-			f, err := os.OpenFile(path, os.O_CREATE, 0o755)
-			if err != nil {
-				return err
-			}
-			_ = f.Close()
-		}
 	}
 	return nil
 }

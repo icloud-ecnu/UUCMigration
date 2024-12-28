@@ -22,6 +22,7 @@
 #include "rst-malloc.h"
 #include "log.h"
 #include "common/list.h"
+#include "util.h"
 #include "util-pie.h"
 #include "proc_parse.h"
 #include "file-ids.h"
@@ -398,8 +399,7 @@ static int tty_verify_active_pairs(void)
 {
 	unsigned long i, unpaired_slaves = 0;
 
-	for_each_bit(i, tty_active_pairs)
-	{
+	for_each_bit(i, tty_active_pairs) {
 		if ((i % 2) == 0) {
 			if (test_bit(i + 1, tty_active_pairs)) {
 				i++;
@@ -560,7 +560,7 @@ static int do_open_tty_reg(int ns_root_fd, struct reg_file_info *rfi, void *arg)
 		 * them. So simply setup mode from image
 		 * the regular file engine will check
 		 * for this, so if we fail here it
-		 * gonna be catched anyway.
+		 * gonna be caught anyway.
 		 */
 		if (rfi->rfe->has_mode)
 			fchmod(fd, rfi->rfe->mode);
@@ -817,8 +817,26 @@ static int do_restore_tty_parms(void *arg, int fd, pid_t pid)
 	 * on termios too. Just to be on the safe side.
 	 */
 
-	if ((p->has & HAS_TERMIOS_L) && ioctl(fd, TIOCSLCKTRMIOS, &p->tl) < 0)
-		goto err;
+	if ((p->has & HAS_TERMIOS_L) && ioctl(fd, TIOCSLCKTRMIOS, &p->tl) < 0) {
+		struct termios t;
+
+		if (errno != EPERM)
+			goto err;
+
+		memzero(&t, sizeof(t));
+		if (ioctl(fd, TIOCGLCKTRMIOS, &t) < 0) {
+			pr_perror("Can't get tty locked params on %#x", p->tty_id);
+			goto err;
+		}
+
+		/*
+		 * The ioctl(TIOCSLCKTRMIOS) requires a CRIU process to be privileged
+		 * in the init_user_ns, but if the current "termios_locked" value equal
+		 * to the "termios_locked" value from the image, we can safely skip setting it.
+		 */
+		if (memcmp(&t, &p->tl, sizeof(struct termios)) != 0)
+			goto err;
+	}
 
 	if ((p->has & HAS_TERMIOS) && ioctl(fd, TCSETS, &p->t) < 0)
 		goto err;
@@ -868,7 +886,7 @@ static int restore_tty_params(int fd, struct tty_info *info)
 	}
 
 	if (info->tie->has_uid && info->tie->has_gid) {
-		if (fchown(fd, info->tie->uid, info->tie->gid)) {
+		if (cr_fchown(fd, info->tie->uid, info->tie->gid)) {
 			pr_perror("Can't setup uid %d gid %d on %#x", (int)info->tie->uid, (int)info->tie->gid,
 				  info->tfe->id);
 			return -1;
@@ -1977,6 +1995,12 @@ static int dump_one_tty(int lfd, u32 id, const struct fd_parms *p)
 	pr_info("Dumping tty %d with id %#x\n", lfd, id);
 
 	driver = get_tty_driver(p->stat.st_rdev, p->stat.st_dev);
+	if (driver == NULL) {
+		pr_err("Unable to find a tty driver (rdev %#" PRIx64 " dev %#" PRIx64 ")\n", p->stat.st_rdev,
+		       p->stat.st_dev);
+		return -1;
+	}
+
 	if (driver->fd_get_index)
 		index = driver->fd_get_index(lfd, p);
 	else
@@ -2400,9 +2424,9 @@ int devpts_restore(struct mount_info *pm)
 	struct mount_info *bm;
 	int dfd, exit_code = -1;
 
-	dfd = open(pm->mountpoint, O_RDONLY);
+	dfd = open(service_mountpoint(pm), O_RDONLY);
 	if (dfd < 0) {
-		pr_perror("Unable to open %s", pm->mountpoint);
+		pr_perror("Unable to open %s", service_mountpoint(pm));
 		return -1;
 	}
 

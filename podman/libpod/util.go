@@ -1,13 +1,14 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,11 +19,13 @@ import (
 
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/api/handlers/utils/apiutil"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/api/handlers/utils/apiutil"
+	"github.com/containers/storage/pkg/fileutils"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // FuncTimer helps measure the execution time of a function
@@ -103,14 +106,14 @@ func DefaultSeccompPath() (string, error) {
 		return def.Containers.SeccompProfile, nil
 	}
 
-	_, err = os.Stat(config.SeccompOverridePath)
+	err = fileutils.Exists(config.SeccompOverridePath)
 	if err == nil {
 		return config.SeccompOverridePath, nil
 	}
 	if !os.IsNotExist(err) {
 		return "", err
 	}
-	if _, err := os.Stat(config.SeccompDefaultPath); err != nil {
+	if err := fileutils.Exists(config.SeccompDefaultPath); err != nil {
 		if !os.IsNotExist(err) {
 			return "", err
 		}
@@ -216,17 +219,12 @@ func writeHijackHeader(r *http.Request, conn io.Writer, tty bool) {
 		// Upgraded
 		fmt.Fprintf(conn,
 			"HTTP/1.1 101 UPGRADED\r\nContent-Type: %s\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n",
-			proto, header)
+			header, proto)
 	}
 }
 
-// Convert OCICNI port bindings into Inspect-formatted port bindings.
+// Generate inspect-formatted port mappings from the format used in our config file
 func makeInspectPortBindings(bindings []types.PortMapping) map[string][]define.InspectHostPort {
-	return makeInspectPorts(bindings, nil)
-}
-
-// Convert OCICNI port bindings into Inspect-formatted port bindings with exposed, but not bound ports set to nil.
-func makeInspectPorts(bindings []types.PortMapping, expose map[uint16][]string) map[string][]define.InspectHostPort {
 	portBindings := make(map[string][]define.InspectHostPort)
 	for _, port := range bindings {
 		protocols := strings.Split(port.Protocol, ",")
@@ -234,15 +232,24 @@ func makeInspectPorts(bindings []types.PortMapping, expose map[uint16][]string) 
 			for i := uint16(0); i < port.Range; i++ {
 				key := fmt.Sprintf("%d/%s", port.ContainerPort+i, protocol)
 				hostPorts := portBindings[key]
+				var hostIP = port.HostIP
+				if len(port.HostIP) == 0 {
+					hostIP = "0.0.0.0"
+				}
 				hostPorts = append(hostPorts, define.InspectHostPort{
-					HostIP:   port.HostIP,
+					HostIP:   hostIP,
 					HostPort: strconv.FormatUint(uint64(port.HostPort+i), 10),
 				})
 				portBindings[key] = hostPorts
 			}
 		}
 	}
-	// add exposed ports without host port information to match docker
+
+	return portBindings
+}
+
+// Add exposed ports to inspect port bindings. These must be done on a per-container basis, not per-netns basis.
+func addInspectPortsExpose(expose map[uint16][]string, portBindings map[string][]define.InspectHostPort) {
 	for port, protocols := range expose {
 		for _, protocol := range protocols {
 			key := fmt.Sprintf("%d/%s", port, protocol)
@@ -251,7 +258,6 @@ func makeInspectPorts(bindings []types.PortMapping, expose map[uint16][]string) 
 			}
 		}
 	}
-	return portBindings
 }
 
 // Write a given string to a new file at a given path.
@@ -273,8 +279,31 @@ func writeStringToPath(path, contents, mountLabel string, uid, gid int) error {
 	}
 	// Relabel runDirResolv for the container
 	if err := label.Relabel(path, mountLabel, false); err != nil {
+		if errors.Is(err, unix.ENOTSUP) {
+			logrus.Debugf("Labeling not supported on %q", path)
+			return nil
+		}
 		return err
 	}
 
 	return nil
+}
+
+// If the given path exists, evaluate any symlinks in it. If it does not, clean
+// the path and return it. Used to try and verify path equality in a somewhat
+// sane fashion.
+func evalSymlinksIfExists(toCheck string) (string, error) {
+	checkedVal, err := filepath.EvalSymlinks(toCheck)
+	if err != nil {
+		// If the error is not ENOENT, something more serious has gone
+		// wrong, return it.
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		// This is an ENOENT. On ENOENT, EvalSymlinks returns "".
+		// We don't want that. Return a cleaned version of the original
+		// path.
+		return filepath.Clean(toCheck), nil
+	}
+	return checkedVal, nil
 }

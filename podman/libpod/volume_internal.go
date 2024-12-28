@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -8,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containers/podman/v4/libpod/define"
+	"github.com/containers/podman/v5/libpod/define"
 )
 
 // Creates a new volume
@@ -111,4 +110,5 @@ func (v *Volume) refresh() error {
 func resetVolumeState(state *VolumeState) {
 	state.MountCount = 0
 	state.MountPoint = ""
+	state.CopiedUp = false
 }

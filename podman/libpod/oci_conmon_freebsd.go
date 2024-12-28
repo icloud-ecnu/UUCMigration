@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -9,7 +8,7 @@ import (
 	"os/exec"
 )
 
-func (r *ConmonOCIRuntime) createRootlessContainer(ctr *Container, restoreOptions *ContainerCheckpointOptions) (int64, error) {
+func (r *ConmonOCIRuntime) createRootlessContainer(ctr *Container, restoreOptions *ContainerCheckpointOptions, hideFiles bool) (int64, error) {
 	return -1, errors.New("unsupported (*ConmonOCIRuntime) createRootlessContainer")
 }
 
@@ -27,4 +26,8 @@ func (r *ConmonOCIRuntime) moveConmonToCgroupAndSignal(ctr *Container, cmd *exec
 		return err
 	}
 	return nil
+}
+
+func moveToRuntimeCgroup() error {
+	return errors.New("moveToRuntimeCgroup not supported on freebsd")
 }

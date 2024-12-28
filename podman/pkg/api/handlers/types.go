@@ -1,19 +1,25 @@
 package handlers
 
 import (
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	docker "github.com/docker/docker/api/types"
+	dockerBackend "github.com/docker/docker/api/types/backend"
 	dockerContainer "github.com/docker/docker/api/types/container"
 	dockerNetwork "github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/api/types/system"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 type AuthConfig struct {
-	docker.AuthConfig
+	registry.AuthConfig
 }
 
 type ImageInspect struct {
 	docker.ImageInspect
+	// Container is for backwards compat but is basically unused
+	Container string
 }
 
 type ContainerConfig struct {
@@ -30,6 +36,12 @@ type LibpodImagesRemoveReport struct {
 	entities.ImageRemoveReport
 	// Image removal requires is to return data and an error.
 	Errors []string
+}
+
+// LibpodImagesResolveReport includes a list of fully-qualified image references.
+type LibpodImagesResolveReport struct {
+	// Fully-qualified image references.
+	Names []string
 }
 
 type ContainersPruneReport struct {
@@ -62,11 +74,13 @@ type LibpodContainersRmReport struct {
 // UpdateEntities used to wrap the oci resource spec in a swagger model
 // swagger:model
 type UpdateEntities struct {
-	Resources *specs.LinuxResources
+	specs.LinuxResources
+	define.UpdateHealthCheckConfig
+	define.UpdateContainerDevicesLimits
 }
 
 type Info struct {
-	docker.Info
+	system.Info
 	BuildahVersion     string
 	CPURealtimePeriod  bool
 	CPURealtimeRuntime bool
@@ -79,7 +93,7 @@ type Info struct {
 
 type Container struct {
 	docker.Container
-	docker.ContainerCreateConfig
+	dockerBackend.ContainerCreateConfig
 }
 
 type DiskUsage struct {

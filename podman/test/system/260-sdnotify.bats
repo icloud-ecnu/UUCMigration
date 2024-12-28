@@ -52,6 +52,16 @@ function _start_socat() {
     (exec socat unix-recvfrom:"$NOTIFY_SOCKET",fork \
           system:"(cat;echo) >> $_SOCAT_LOG" 3>&-) &
     _SOCAT_PID=$!
+
+    # Wait for socat to create the socket file. This _should_ be
+    # instantaneous, but can take a few seconds under high load
+    for try in $(seq 1 10); do
+        if [[ -e "$NOTIFY_SOCKET" ]]; then
+            return
+        fi
+        sleep 0.5
+    done
+    die "Timed out waiting for socat to create $NOTIFY_SOCKET"
 }
 
 # Stop the socat background process and clean up logs
@@ -88,6 +98,7 @@ function _assert_mainpid_is_conmon() {
 ###############################################################################
 # BEGIN tests themselves
 
+# bats test_tags=ci:parallel
 @test "sdnotify : ignore" {
     export NOTIFY_SOCKET=$PODMAN_TMPDIR/ignore.sock
     _start_socat
@@ -105,12 +116,13 @@ function _assert_mainpid_is_conmon() {
     _stop_socat
 }
 
-# bats test_tags=distro-integration
+# bats test_tags=distro-integration, ci:parallel
 @test "sdnotify : conmon" {
     export NOTIFY_SOCKET=$PODMAN_TMPDIR/conmon.sock
     _start_socat
 
-    run_podman run -d --name sdnotify_conmon_c \
+    ctrname=c-$(safename)
+    run_podman run -d --name $ctrname \
                --sdnotify=conmon \
                $IMAGE \
                sh -c 'printenv NOTIFY_SOCKET;echo READY;sleep 999'
@@ -120,10 +132,10 @@ function _assert_mainpid_is_conmon() {
     run_podman container inspect $cid --format "{{.Config.SdNotifyMode}} {{.Config.SdNotifySocket}}"
     is "$output" "conmon $NOTIFY_SOCKET"
 
-    run_podman container inspect sdnotify_conmon_c --format "{{.State.ConmonPid}}"
+    run_podman container inspect $ctrname --format "{{.State.ConmonPid}}"
     mainPID="$output"
 
-    run_podman logs sdnotify_conmon_c
+    run_podman logs $ctrname
     is "$output" "READY" "\$NOTIFY_SOCKET in container"
 
     # loop-wait for the final READY line
@@ -143,7 +155,7 @@ READY=1" "sdnotify sent MAINPID and READY"
 
 # These tests can fail in dev. environment because of SELinux.
 # quick fix: chcon -t container_runtime_exec_t ./bin/podman
-# bats test_tags=distro-integration
+# bats test_tags=distro-integration, ci:parallel
 @test "sdnotify : container" {
     _prefetch $SYSTEMD_IMAGE
 
@@ -184,6 +196,7 @@ READY=1" "Container log after ready signal"
 
 # These tests can fail in dev. environment because of SELinux.
 # quick fix: chcon -t container_runtime_exec_t ./bin/podman
+# bats test_tags=ci:parallel
 @test "sdnotify : healthy" {
     export NOTIFY_SOCKET=$PODMAN_TMPDIR/container.sock
     _start_socat
@@ -194,7 +207,7 @@ READY=1" "Container log after ready signal"
 
     # Create a container with a simple `/bin/true` healthcheck that we need to
     # run manually.
-    ctr=$(random_string)
+    ctr=c-$(safename)
     run_podman create --name $ctr     \
             --health-cmd=/bin/true    \
             --health-retries=1        \
@@ -233,19 +246,39 @@ READY=1" "Container log after healthcheck run"
     is "$output" "running" "make sure container is still running"
 
     run_podman rm -f -t0 $ctr
+
+    # Disable until the race condition https://github.com/containers/podman/issues/22760 is fixed
+    # ctr=$(random_string)
+    # run_podman run --name $ctr                       \
+    #         --health-cmd="touch /terminate"          \
+    #         --sdnotify=healthy                       \
+    #         $IMAGE sh -c 'while test \! -e /terminate; do sleep 0.1; done; echo finished'
+    # is "$output" "finished" "make sure container exited successfully"
+    # run_podman rm -f -t0 $ctr
+
+    # ctr=$(random_string)
+    # run_podman 12 run --name $ctr --rm               \
+    #         --health-cmd="touch /terminate"          \
+    #         --sdnotify=healthy                       \
+    #         $IMAGE sh -c 'while test \! -e /terminate; do sleep 0.1; done; echo finished; exit 12'
+    # is "$output" "finished" "make sure container exited"
+    # run_podman rm -f -t0 $ctr
+
     _stop_socat
 }
 
+# bats test_tags=ci:parallel
 @test "sdnotify : play kube - no policies" {
     # Create the YAMl file
     yaml_source="$PODMAN_TMPDIR/test.yaml"
+    podname=p-$(safename)
     cat >$yaml_source <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
   labels:
     app: test
-  name: test_pod
+  name: $podname
 spec:
   restartPolicy: "Never"
   containers:
@@ -284,10 +317,10 @@ EOF
 
     # Tell pod to finish, then wait for all containers to stop
     touch $PODMAN_TMPDIR/tears
-    run_podman container wait $service_container test_pod-test
+    run_podman container wait $service_container ${podname}-test
 
     # Make sure the containers have the correct policy.
-    run_podman container inspect test_pod-test $service_container --format "{{.Config.SdNotifyMode}}"
+    run_podman container inspect ${podname}-test $service_container --format "{{.Config.SdNotifyMode}}"
     is "$output" "ignore
 ignore"
 
@@ -299,15 +332,16 @@ READY=1" "sdnotify sent MAINPID and READY"
 
     # Clean up pod and pause image
     run_podman play kube --down $PODMAN_TMPDIR/test.yaml
-    run_podman rmi $(pause_image)
 }
 
+# bats test_tags=ci:parallel
 @test "sdnotify : play kube - with policies" {
     skip_if_journald_unavailable
 
     _prefetch $SYSTEMD_IMAGE
 
     # Create the YAMl file
+    podname=p-$(safename)
     yaml_source="$PODMAN_TMPDIR/test.yaml"
     cat >$yaml_source <<EOF
 apiVersion: v1
@@ -315,7 +349,7 @@ kind: Pod
 metadata:
   labels:
     app: test
-  name: test_pod
+  name: $podname
   annotations:
     io.containers.sdnotify:   "container"
     io.containers.sdnotify/b: "conmon"
@@ -325,7 +359,7 @@ spec:
   - command:
     - /bin/sh
     - -c
-    - 'printenv NOTIFY_SOCKET; while ! test -f /stop;do sleep 0.1;done'
+    - 'printenv NOTIFY_SOCKET; echo READY; while ! test -f /stop;do sleep 0.1;done'
     image: $SYSTEMD_IMAGE
     name: a
   - command:
@@ -335,8 +369,8 @@ spec:
     image: $IMAGE
     name: b
 EOF
-    container_a="test_pod-a"
-    container_b="test_pod-b"
+    container_a="${podname}-a"
+    container_b="${podname}-b"
 
     # The name of the service container is predictable: the first 12 characters
     # of the hash of the YAML file followed by the "-service" suffix
@@ -367,6 +401,7 @@ EOF
         die "container $container_a and/or $container_b did not start"
     fi
 
+    wait_for_ready $container_a
     # Make sure the containers have the correct policy
     run_podman container inspect $container_a $container_b $service_container --format "{{.Config.SdNotifyMode}}"
     is "$output" "container
@@ -397,17 +432,22 @@ ignore"
     is "$output" "0" "container exited cleanly after sending READY message"
 
     wait_for_file_content $_SOCAT_LOG "READY=1"
-    assert "$(< $_SOCAT_LOG)" =~ "MAINPID=.*
+
+    # (for debugging)
+    echo;echo "$_LOG_PROMPT cat $_SOCAT_LOG"
+    run cat $_SOCAT_LOG
+    echo "$output"
+
+    assert "$output" =~ "MAINPID=.*
 READY=1" "sdnotify sent MAINPID and READY"
 
     # Make sure that Podman is the service's MainPID
-    main_pid=$(head -n1 $_SOCAT_LOG | awk -F= '{print $2}')
+    main_pid=$(head -n1 <<<"$output" | awk -F= '{print $2}')
     is "$(</proc/$main_pid/comm)" "podman" "podman is the service mainPID ($main_pid)"
     _stop_socat
 
     # Clean up pod and pause image
     run_podman play kube --down $yaml_source
-    run_podman rmi $(pause_image)
 }
 
 function generate_exit_code_yaml {
@@ -415,13 +455,14 @@ function generate_exit_code_yaml {
     local cmd1=$2
     local cmd2=$3
     local sdnotify_policy=$4
+    local podname=p-$(safename)
     echo "
 apiVersion: v1
 kind: Pod
 metadata:
   labels:
     app: test
-  name: test_pod
+  name: $podname
   annotations:
     io.containers.sdnotify: "$sdnotify_policy"
 spec:
@@ -438,7 +479,7 @@ spec:
 " > $fname
 }
 
-# bats test_tags=distro-integration
+# bats test_tags=distro-integration, ci:parallel
 @test "podman kube play - exit-code propagation" {
     fname=$PODMAN_TMPDIR/$(random_string).yaml
 
@@ -456,60 +497,70 @@ none | true  | false | 0
 none | false | false | 0
 "
 
-    # I am sorry, this is a long test as we need to test the upper matrix
-    # twice. The first run is using the default sdnotify policy of "ignore".
+    # In each iteration we switch between the sdnotify policy ignore and conmon.
+    # We could run them in a loop for each case but the test is slow so let's
+    # just switch between them as it should cover both policies sufficiently.
+    # Note because of this make sure to have at least two exit code cases directly
+    # after each other above so both polices will get at least once the error case.
+    # The first run is using the default sdnotify policy of "ignore".
     # In this case, the service container serves as the main PID of the service
     # to have a minimal resource footprint.  The second run is using the
     # "conmon" sdnotify policy in which case Podman needs to serve as the main
     # PID to act as an sdnotify proxy; there Podman will wait for the service
     # container to exit and reflects its exit code.
+    sdnotify_policy=ignore
     while read exit_code_prop cmd1 cmd2 exit_code; do
-        for sdnotify_policy in ignore conmon; do
-            generate_exit_code_yaml $fname $cmd1 $cmd2 $sdnotify_policy
-            yaml_sha=$(sha256sum $fname)
-            service_container="${yaml_sha:0:12}-service"
-            podman_exit=$exit_code
-            if [[ $sdnotify_policy == "ignore" ]];then
-                 podman_exit=0
-            fi
-            run_podman $podman_exit kube play --service-exit-code-propagation="$exit_code_prop" --service-container $fname
-            # Make sure that there are no error logs (e.g., #19715)
-            assert "$output" !~ "error msg="
-            run_podman container inspect --format '{{.KubeExitCodePropagation}}' $service_container
-            is "$output" "$exit_code_prop" "service container has the expected policy set in its annotations"
-            run_podman wait $service_container
-            is "$output" "$exit_code" "service container exit code (propagation: $exit_code_prop, policy: $service_policy, cmds: $cmd1 + $cmd2)"
-            run_podman kube down $fname
-        done
+        generate_exit_code_yaml $fname $cmd1 $cmd2 $sdnotify_policy
+        yaml_sha=$(sha256sum $fname)
+        service_container="${yaml_sha:0:12}-service"
+        podman_exit=$exit_code
+        if [[ $sdnotify_policy == "ignore" ]];then
+             podman_exit=0
+        fi
+        run_podman $podman_exit kube play --service-exit-code-propagation="$exit_code_prop" --service-container $fname
+        # Make sure that there are no error logs (e.g., #19715)
+        assert "$output" !~ "error msg="
+        run_podman container inspect --format '{{.KubeExitCodePropagation}}' $service_container
+        is "$output" "$exit_code_prop" "service container has the expected policy set in its annotations"
+        run_podman wait $service_container
+        is "$output" "$exit_code" "service container exit code (propagation: $exit_code_prop, policy: $sdnotify_policy, cmds: $cmd1 + $cmd2)"
+        run_podman kube down $fname
+
+        # in each iteration switch between conmon/ignore policy to get coverage for both
+        if [[ $sdnotify_policy == "ignore" ]]; then
+            sdnotify_policy=conmon
+        else
+            sdnotify_policy=ignore
+        fi
     done < <(parse_table "$exit_tests")
 
     # A final smoke test to make sure bogus policies lead to an error
     run_podman 125 kube play --service-exit-code-propagation=bogus --service-container $fname
     is "$output" "Error: unsupported exit-code propagation \"bogus\"" "error on unsupported exit-code propagation"
-
-    run_podman rmi $(pause_image)
 }
 
+# CANNOT BE PARALLELIZED. I don't know why. It flakes. Still investigating.
 @test "podman pull - EXTEND_TIMEOUT_USEC" {
     # Make sure that Podman extends the start timeout via DBUS when running
     # inside a systemd unit (i.e., with NOTIFY_SOCKET set).  Extending the
     # timeout works by continuously sending EXTEND_TIMEOUT_USEC; Podman does
     # this at most 10 times, adding up to ~5min.
 
-    image_on_local_registry=localhost:${PODMAN_LOGIN_REGISTRY_PORT}/name:tag
+    image_on_local_registry=localhost:${PODMAN_LOGIN_REGISTRY_PORT}/i-$(safename):tag
     registry_flags="--tls-verify=false --creds ${PODMAN_LOGIN_USER}:${PODMAN_LOGIN_PASS}"
     start_registry
 
-    export NOTIFY_SOCKET=$PODMAN_TMPDIR/notify.sock
+    export NOTIFY_SOCKET=$PODMAN_TMPDIR/notify-$(safename).sock
     _start_socat
 
     run_podman push $registry_flags $IMAGE $image_on_local_registry
+
     run_podman pull $registry_flags $image_on_local_registry
     is "${lines[1]}" "Pulling image //$image_on_local_registry inside systemd: setting pull timeout to 5m0s" "NOTIFY_SOCKET is passed to container"
 
+    echo "$_LOG_PROMPT cat $_SOCAT_LOG"
     run cat $_SOCAT_LOG
     # The 'echo's help us debug failed runs
-    echo "socat log:"
     echo "$output"
     is "$output" "EXTEND_TIMEOUT_USEC=30000000"
 
@@ -517,6 +568,7 @@ none | false | false | 0
     _stop_socat
 }
 
+# bats test_tags=ci:parallel
 @test "podman system service" {
     # This test makes sure that podman-system-service uses the NOTIFY_SOCKET
     # correctly and that it unsets it after sending the expected MAINPID and
@@ -566,7 +618,22 @@ READY=1" "podman-system-service sends expected data over NOTIFY_SOCKET"
     assert "$output" !~ "EXTEND_TIMEOUT_USEC="
 
     # Give the system-service 5sec to terminate before killing it.
-    /bin/kill --timeout 5000 KILL --signal TERM $mainpid
+    kill -TERM $mainpid
+    timeout=5
+    while :;do
+        if ! kill -0 $mainpid; then
+            # Yay, it's gone
+            break
+        fi
+
+        timeout=$((timeout - 1))
+        if [[ $timeout -eq 0 ]]; then
+            kill -KILL $mainpid
+            break
+        fi
+        sleep 1
+    done
+
     run_podman rmi $image_on_local_registry
     _stop_socat
 }

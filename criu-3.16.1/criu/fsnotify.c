@@ -132,7 +132,7 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 		if (!mnt_is_dir(m))
 			continue;
 
-		mntfd = __open_mountpoint(m, -1);
+		mntfd = __open_mountpoint(m);
 		pr_debug("\t\tTrying via mntid %d root %s ns_mountpoint @%s (%d)\n", m->mnt_id, m->root,
 			 m->ns_mountpoint, mntfd);
 		if (mntfd < 0)
@@ -183,7 +183,7 @@ static char *alloc_openable(unsigned int s_dev, unsigned long i_ino, FhEntry *f_
 				return path;
 			}
 		} else
-			pr_debug("\t\t\tnot openable as %s (%m)\n", __path);
+			pr_debug("\t\t\tnot openable as %s (%s)\n", __path, strerror(errno));
 	}
 
 err:
@@ -206,7 +206,7 @@ static int open_handle(unsigned int s_dev, unsigned long i_ino, FhEntry *f_handl
 		if (m->s_dev != s_dev || !mnt_is_dir(m))
 			continue;
 
-		mntfd = __open_mountpoint(m, -1);
+		mntfd = __open_mountpoint(m);
 		if (mntfd < 0) {
 			pr_warn("Can't open mount for s_dev %x, continue\n", s_dev);
 			continue;
@@ -404,7 +404,7 @@ static int check_one_mark(FanotifyMarkEntry *fme)
 			return -1;
 		}
 		if (!(root_ns_mask & CLONE_NEWNS))
-			fme->me->path = m->mountpoint + 1;
+			fme->me->path = m->ns_mountpoint + 1;
 		fme->s_dev = m->s_dev;
 
 		pr_info("mark: s_dev %#08x mnt_id  %#08x mask %#08x\n", fme->s_dev, fme->me->mnt_id, fme->mask);
@@ -514,7 +514,7 @@ static char *get_mark_path(const char *who, struct file_remap *remap, FhEntry *f
 	/*
 	 * fanotify/inotify open syscalls want path to attach
 	 * watch to. But the only thing we have is an FD obtained
-	 * via fhandle. Fortunatelly, when trying to attach the
+	 * via fhandle. Fortunately, when trying to attach the
 	 * /proc/pid/fd/ link, we will watch the inode the link
 	 * points to, i.e. -- just what we want.
 	 */

@@ -41,10 +41,14 @@
 #include "path.h"
 #include "fault-injection.h"
 #include "memfd.h"
+#include "hugetlb.h"
+#include "pidfd.h"
 
 #include "protobuf.h"
 #include "images/fdinfo.pb-c.h"
 #include "images/mnt.pb-c.h"
+#include "pidfd.pb-c.h"
+#include "plugin.h"
 
 #include <stdlib.h>
 
@@ -78,7 +82,7 @@ static char *buf = __buf.buf;
 #define AIO_FNAME "/[aio]"
 
 /* check the @line starts with "%lx-%lx" format */
-static bool __is_vma_range_fmt(char *line)
+extern bool __is_vma_range_fmt(char *line)
 {
 #define ____is_vma_addr_char(__c) (((__c) <= '9' && (__c) >= '0') || ((__c) <= 'f' && (__c) >= 'a'))
 
@@ -103,7 +107,21 @@ bool is_vma_range_fmt(char *line)
 	return __is_vma_range_fmt(line);
 }
 
-static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf)
+bool handle_vma_plugin(int *fd, struct stat *stat)
+{
+	int ret;
+
+	ret = run_plugins(HANDLE_DEVICE_VMA, *fd, stat);
+	if (ret < 0) {
+		pr_perror("handle_device_vma plugin failed");
+		return false;
+	}
+
+	return true;
+}
+
+static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf,
+			    int *shstk)
 {
 	char *tok;
 
@@ -147,6 +165,9 @@ static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf)
 		if (_vmflag_match(tok, "io") || _vmflag_match(tok, "pf"))
 			*io_pf = 1;
 
+		if (_vmflag_match(tok, "ss"))
+			*shstk = 1;
+
 		/*
 		 * Anything else is just ignored.
 		 */
@@ -157,14 +178,21 @@ static void __parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf)
 
 void parse_vmflags(char *buf, u32 *flags, u64 *madv, int *io_pf)
 {
-	__parse_vmflags(buf, flags, madv, io_pf);
+	int shstk = 0;
+
+	__parse_vmflags(buf, flags, madv, io_pf, &shstk);
 }
 
-static void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
+extern void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
 {
 	int io_pf = 0;
+	int shstk = 0;
 
-	__parse_vmflags(buf, &vma_area->e->flags, &vma_area->e->madv, &io_pf);
+	__parse_vmflags(buf, &vma_area->e->flags, &vma_area->e->madv, &io_pf,
+			&shstk);
+
+	if (shstk)
+		vma_area->e->status |= VMA_AREA_SHSTK;
 
 	/*
 	 * vmsplice doesn't work for VM_IO and VM_PFNMAP mappings, the
@@ -183,12 +211,7 @@ static inline int is_anon_shmem_map(dev_t dev)
 	return kdat.shmem_dev == dev;
 }
 
-struct vma_file_info {
-	int dev_maj;
-	int dev_min;
-	unsigned long ino;
-	struct vma_area *vma;
-};
+
 
 static inline int vfi_equal(struct vma_file_info *a, struct vma_file_info *b)
 {
@@ -259,7 +282,7 @@ static int vma_stat(struct vma_area *vma, int fd)
 static int vma_get_mapfile_user(const char *fname, struct vma_area *vma, struct vma_file_info *vfi, int *vm_file_fd,
 				const char *path)
 {
-	int fd;
+	int fd, hugetlb_flag = 0;
 	dev_t vfi_dev;
 
 	/*
@@ -298,35 +321,20 @@ static int vma_get_mapfile_user(const char *fname, struct vma_area *vma, struct 
 
 	vfi_dev = makedev(vfi->dev_maj, vfi->dev_min);
 
-	if (is_memfd(vfi_dev)) {
-		char tmp[PATH_MAX];
-		strlcpy(tmp, fname, PATH_MAX);
-		strip_deleted(tmp, strlen(tmp));
-
-		/*
-		 * The error EPERM will be shown in the following pr_perror().
-		 * It comes from the previous open() call.
-		 */
-		pr_perror("Can't open mapped [%s]", tmp);
-
-		/*
-		 * TODO Perhaps we could do better than failing and dump the
-		 * memory like what is being done in shmem.c
-		 */
-		return -1;
-	}
-
-	if (is_anon_shmem_map(vfi_dev)) {
+	if (is_hugetlb_dev(vfi_dev, &hugetlb_flag) || is_anon_shmem_map(vfi_dev)) {
+		vma->e->status |= VMA_AREA_REGULAR;
 		if (!(vma->e->flags & MAP_SHARED))
-			return -1;
+			vma->e->status |= VMA_ANON_PRIVATE;
+		else
+			vma->e->status |= VMA_ANON_SHARED;
 
 		vma->e->flags |= MAP_ANONYMOUS;
-		vma->e->status |= VMA_ANON_SHARED;
 		vma->e->shmid = vfi->ino;
+		vma->e->flags |= hugetlb_flag;
 
 		if (!strncmp(fname, "/SYSV", 5)) {
 			vma->e->status |= VMA_AREA_SYSVIPC;
-		} else {
+		} else if (vma->e->flags & MAP_SHARED) {
 			if (fault_injected(FI_HUGE_ANON_SHMEM_ID))
 				vma->e->shmid += FI_HUGE_ANON_SHMEM_ID_BASE;
 		}
@@ -342,18 +350,44 @@ static int vma_get_mapfile_user(const char *fname, struct vma_area *vma, struct 
 	}
 
 	if (vma_stat(vma, fd)) {
-		close(fd);
-		return -1;
+		goto closefd;
 	}
 
-	if (vma->vmst->st_dev != vfi_dev || vma->vmst->st_ino != vfi->ino) {
-		pr_err("Failed to resolve mapping %lx filename\n", (unsigned long)vma->e->start);
-		close(fd);
-		return -1;
+	if (vma->vmst->st_ino != vfi->ino) {
+		goto errmsg;
+	}
+
+	/*
+	 * If devices don't match it could be because file is on a btrfs subvolume,
+	 * which means that device number returned by stat will not match what is
+	 * seen in smaps and other places. To deal with that we need a more involved
+	 * check.
+	 */
+	if (vma->vmst->st_dev != vfi_dev) {
+		int mnt_id;
+		struct ns_id *ns;
+
+		if (get_fd_mntid(fd, &mnt_id))
+			goto errmsg;
+
+		ns = lookup_nsid_by_mnt_id(mnt_id);
+		if (!ns)
+			goto errmsg;
+
+		if (!phys_stat_dev_match(vma->vmst->st_dev, vfi_dev, ns, fname))
+			goto errmsg;
+
+		vma->mnt_id = mnt_id;
 	}
 
 	*vm_file_fd = fd;
 	return 0;
+
+errmsg:
+	pr_err("Failed to resolve mapping %lx filename\n", (unsigned long)vma->e->start);
+closefd:
+	close(fd);
+	return -1;
 }
 
 static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, struct vma_file_info *vfi,
@@ -526,7 +560,7 @@ static inline int handle_vvar_vma(struct vma_area *vma)
 	return 0;
 }
 
-static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_path, DIR *map_files_dir,
+extern int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_path, DIR *map_files_dir,
 		      struct vma_file_info *vfi, struct vma_file_info *prev_vfi, int *vm_file_fd)
 {
 	if (vma_get_mapfile(file_path, vma_area, map_files_dir, vfi, prev_vfi, vm_file_fd))
@@ -576,17 +610,25 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 		}
 	} else if (*vm_file_fd >= 0) {
 		struct stat *st_buf = vma_area->vmst;
+		int hugetlb_flag = 0;
 
-		if (S_ISREG(st_buf->st_mode))
+		if (S_ISREG(st_buf->st_mode)) {
 			/* regular file mapping -- supported */;
-		else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO))
+			pr_debug("Found regular file mapping, OK\n");
+		} else if (S_ISCHR(st_buf->st_mode) && (st_buf->st_rdev == DEVZERO)) {
 			/* devzero mapping -- also makes sense */;
-		else {
+			pr_debug("Found devzero mapping, OK\n");
+		} else if (handle_vma_plugin(vm_file_fd, st_buf)) {
+			pr_info("Found device file mapping, plugin is available\n");
+			vma_area->e->status |= VMA_EXT_PLUGIN;
+		} else {
+			/* non-regular mapping with no supporting plugin */
 			pr_err("Can't handle non-regular mapping on %d's map %" PRIx64 "\n", pid, vma_area->e->start);
 			goto err;
 		}
 
-		if (is_anon_shmem_map(st_buf->st_dev) && !strncmp(file_path, "/SYSV", 5)) {
+		if ((is_anon_shmem_map(st_buf->st_dev) || is_hugetlb_dev(st_buf->st_dev, NULL)) &&
+		    !strncmp(file_path, "/SYSV", 5)) {
 			vma_area->e->flags |= MAP_ANONYMOUS;
 			vma_area->e->status |= VMA_ANON_SHARED;
 			vma_area->e->shmid = st_buf->st_ino;
@@ -595,10 +637,28 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 			pr_info("path: %s\n", file_path);
 			vma_area->e->status |= VMA_AREA_SYSVIPC;
 		} else {
-			if (is_anon_shmem_map(st_buf->st_dev)) {
+			/* We dump memfd backed mapping, both normal and hugepage anonymous share
+			 * mapping using memfd approach when possible.
+			 */
+			if (is_memfd(st_buf->st_dev) || is_anon_shmem_map(st_buf->st_dev) ||
+			    can_dump_with_memfd_hugetlb(st_buf->st_dev, &hugetlb_flag, file_path, vma_area)) {
 				vma_area->e->status |= VMA_AREA_MEMFD;
+				vma_area->e->flags |= hugetlb_flag;
 				if (fault_injected(FI_HUGE_ANON_SHMEM_ID))
 					vma_area->e->shmid += FI_HUGE_ANON_SHMEM_ID_BASE;
+			} else if (is_hugetlb_dev(st_buf->st_dev, &hugetlb_flag)) {
+				vma_area->e->flags |= hugetlb_flag;
+				vma_area->e->flags |= MAP_ANONYMOUS;
+
+				if (vma_area->e->flags & MAP_SHARED) {
+					vma_area->e->status |= VMA_ANON_SHARED;
+					vma_area->e->shmid = st_buf->st_ino;
+				} else {
+					vma_area->e->status |= VMA_ANON_PRIVATE;
+				}
+
+				close_safe(vm_file_fd);
+				return 0;
 			}
 
 			if (vma_area->e->flags & MAP_PRIVATE)
@@ -642,10 +702,20 @@ err_bogus_mapfile:
 	goto err;
 }
 
-static int vma_list_add(struct vma_area *vma_area, struct vm_area_list *vma_area_list, unsigned long *prev_end,
+extern int vma_list_add(struct vma_area *vma_area, struct vm_area_list *vma_area_list, unsigned long *prev_end,
 			struct vma_file_info *vfi, struct vma_file_info *prev_vfi)
 {
-	if (vma_area->e->status & VMA_UNSUPP) {
+	if (vma_area->e->status & VMA_EXT_PLUGIN) {
+		/* Unsupported VMAs that provide special plugins for
+		 * backup can be treated as regular VMAs and criu
+		 * should only save their metadata in the dump files.
+		 * There can be several special backup plugins hooks
+		 * that might run at different stages during checkpoint
+		 * and restore.
+		 */
+		pr_debug("Device file mapping %016" PRIx64 "-%016" PRIx64 " supported via device plugins\n",
+			 vma_area->e->start, vma_area->e->end);
+	} else if (vma_area->e->status & VMA_UNSUPP) {
 		pr_err("Unsupported mapping found %016" PRIx64 "-%016" PRIx64 "\n", vma_area->e->start,
 		       vma_area->e->end);
 		return -1;
@@ -681,7 +751,7 @@ static int vma_list_add(struct vma_area *vma_area, struct vm_area_list *vma_area
  * On s390 we have old kernels where the global task size assumption of
  * criu does not work. See also compel_task_size() for s390.
  */
-static int task_size_check(pid_t pid, VmaEntry *entry)
+extern int task_size_check(pid_t pid, VmaEntry *entry)
 {
 #ifdef __s390x__
 	if (entry->end <= kdat.task_size)
@@ -696,9 +766,7 @@ static int task_size_check(pid_t pid, VmaEntry *entry)
 
 int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t dump_filemap)
 {
-	FILE * pageCategory_file;
 	struct vma_area *vma_area = NULL;
-	char path[4096];
 	unsigned long start, end, pgoff, prev_end = 0;
 	char r, w, x, s;
 	int ret = -1, vm_file_fd = -1;
@@ -709,13 +777,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 	struct bfd f;
 
 	vm_area_list_init(vma_area_list);
-	
-	pageCategory_file = fopen(opts.pageCategory_file, "w+");
-	
-	if (pageCategory_file  == NULL) {
-		pr_info("pageCategory_file = %s failed\n",opts.pageCategory_file);
-	}else 
-		fprintf(pageCategory_file,"pid,start,end,type\n");
+	pr_debug("pid:%d\n",pid);
 	f.fd = open_proc(pid, "smaps");
 	if (f.fd < 0)
 		goto err_n;
@@ -738,17 +800,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 		eof = (str == NULL);
 
 		if (!eof && !__is_vma_range_fmt(str)) {
-			if (!strncmp(str, "Nonlinear", 9)) {
-				BUG_ON(!vma_area);
-				pr_err("Nonlinear mapping found %016" PRIx64 "-%016" PRIx64 "\n", vma_area->e->start,
-				       vma_area->e->end);
-				/*
-				 * VMA is already on list and will be
-				 * freed later as list get destroyed.
-				 */
-				vma_area = NULL;
-				goto err;
-			} else if (!strncmp(str, "VmFlags: ", 9)) {
+			if (!strncmp(str, "VmFlags: ", 9)) {
 				BUG_ON(!vma_area);
 				parse_vma_vmflags(&str[9], vma_area);
 				continue;
@@ -766,14 +818,13 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 		if (!vma_area)
 			goto err;
 
-		num = sscanf(str, "%lx-%lx %c%c%c%c %lx %x:%x %lu %n%s", &start, &end, &r, &w, &x, &s, &pgoff,
-			     &vfi.dev_maj, &vfi.dev_min, &vfi.ino, &path_off,path);
+		num = sscanf(str, "%lx-%lx %c%c%c%c %lx %x:%x %lu %n", &start, &end, &r, &w, &x, &s, &pgoff,
+			     &vfi.dev_maj, &vfi.dev_min, &vfi.ino, &path_off);
 		if (num < 10) {
 			pr_err("Can't parse: %s\n", str);
 			goto err;
 		}
-		if(pageCategory_file != NULL)
-			fprintf(pageCategory_file,"%u,%lx,%lx,%s\n",pid,start,end,path);
+
 		vma_area->e->start = start;
 		vma_area->e->end = end;
 		vma_area->e->pgoff = pgoff;
@@ -798,6 +849,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 			goto err;
 		}
 
+		pr_debug("Handling VMA with the following smaps entry: %s\n", str);
 		if (handle_vma(pid, vma_area, str + path_off, map_files_dir, &vfi, &prev_vfi, &vm_file_fd))
 			goto err;
 
@@ -817,7 +869,7 @@ err_n:
 	close_safe(&vm_file_fd);
 	if (map_files_dir)
 		closedir(map_files_dir);
-	if (pageCategory_file  != NULL) fclose(pageCategory_file);
+
 	xfree(vma_area);
 	return ret;
 }
@@ -856,7 +908,7 @@ int parse_pid_stat(pid_t pid, struct proc_pid_stat *s)
 	*tok = '\0';
 	*p = '\0';
 
-	strlcpy(s->comm, tok + 1, sizeof(s->comm));
+	__strlcpy(s->comm, tok + 1, sizeof(s->comm));
 
 	n = sscanf(p + 1,
 		   " %c %d %d %d %d %d %u %lu %lu %lu %lu "
@@ -993,6 +1045,7 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 
 	cr->s.sigpnd = 0;
 	cr->s.shdpnd = 0;
+	cr->s.sigblk = 0;
 	cr->s.seccomp_mode = SECCOMP_MODE_DISABLED;
 
 	if (bfdopenr(&f))
@@ -1112,10 +1165,20 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 			done++;
 			continue;
 		}
+		if (!strncmp(str, "SigBlk:", 7)) {
+			unsigned long long sigblk = 0;
+
+			if (sscanf(str + 7, "%llx", &sigblk) != 1)
+				goto err_parse;
+			cr->s.sigblk |= sigblk;
+
+			done++;
+			continue;
+		}
 	}
 
 	/* seccomp and nspids are optional */
-	expected_done = (parsed_seccomp ? 11 : 10);
+	expected_done = (parsed_seccomp ? 12 : 11);
 	if (kdat.has_nspid)
 		expected_done++;
 	if (done == expected_done)
@@ -1352,7 +1415,7 @@ static int parse_mountinfo_ent(char *str, struct mount_info *new, char **fsname)
 		goto err;
 
 	new->mountpoint[0] = '.';
-	ret = sscanf(str, "%i %i %u:%u %ms %s %ms %n", &new->mnt_id, &new->parent_mnt_id, &kmaj, &kmin, &new->root,
+	ret = sscanf(str, "%i %i %u:%u %ms %4094s %ms %n", &new->mnt_id, &new->parent_mnt_id, &kmaj, &kmin, &new->root,
 		     new->mountpoint + 1, &opt, &n);
 	if (ret != 7)
 		goto err;
@@ -1451,12 +1514,12 @@ bool add_skip_mount(const char *mountpoint)
 	return true;
 }
 
-static bool should_skip_mount(const char *mountpoint)
+static bool should_skip_mount(char *mountpoint)
 {
 	struct str_node *pos;
 
 	list_for_each_entry(pos, &skip_mount_list, node) {
-		if (strcmp(mountpoint, pos->string) == 0)
+		if (is_same_path(mountpoint, pos->string))
 			return true;
 	}
 
@@ -1501,6 +1564,59 @@ out:
 	return exit_code;
 }
 
+static int get_mountinfo_sdev_from_mntid(int mnt_id, unsigned int *sdev)
+{
+	int exit_code = -1;
+	FILE *f;
+
+	f = fopen_proc(PROC_SELF, "mountinfo");
+	if (!f)
+		return -1;
+
+	while (fgets(buf, BUF_SIZE, f)) {
+		unsigned int kmaj, kmin;
+		int id;
+
+		if (sscanf(buf, "%i %*i %u:%u", &id, &kmaj, &kmin) != 3) {
+			pr_err("Failed to parse mountinfo line %s\n", buf);
+			goto err;
+		}
+
+		if (id == mnt_id) {
+			*sdev = MKKDEV(kmaj, kmin);
+			exit_code = 0;
+			break;
+		}
+	}
+err:
+	fclose(f);
+	return exit_code;
+}
+
+/* This works even on btrfs where stat does not show right sdev */
+int get_sdev_from_fd(int fd, unsigned int *sdev, bool parse_mountinfo)
+{
+	struct mount_info *mi;
+	int ret, mnt_id;
+
+	ret = get_fd_mntid(fd, &mnt_id);
+	if (ret < 0)
+		return -1;
+
+	/* Simple case mnt_id is in dumped mntns */
+	mi = lookup_mnt_id(mnt_id);
+	if (mi) {
+		*sdev = mi->s_dev_rt;
+		return 0;
+	}
+
+	if (!parse_mountinfo)
+		return -1;
+
+	/* Complex case mnt_id is in mntns created by criu */
+	return get_mountinfo_sdev_from_mntid(mnt_id, sdev);
+}
+
 struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 {
 	struct mount_info *list = NULL;
@@ -1515,7 +1631,7 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		int ret = -1;
 		char *fsname = NULL;
 
-		new = mnt_entry_alloc();
+		new = mnt_entry_alloc(false);
 		if (!new)
 			goto end;
 
@@ -1532,27 +1648,27 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		 * fail loudly at "dump" stage if an opened file or another mnt
 		 * depends on this one.
 		 */
-		if (for_dump && should_skip_mount(new->mountpoint + 1)) {
-			pr_info("\tskip %s @ %s\n", fsname, new->mountpoint);
+		if (for_dump && should_skip_mount(new->ns_mountpoint)) {
+			pr_info("\tskip %s @ %s\n", fsname, new->ns_mountpoint);
 			mnt_entry_free(new);
 			new = NULL;
 			goto end;
 		}
 
 		pr_info("\ttype %s source %s mnt_id %d s_dev %#x %s @ %s flags %#x options %s\n", fsname, new->source,
-			new->mnt_id, new->s_dev, new->root, new->mountpoint, new->flags, new->options);
+			new->mnt_id, new->s_dev, new->root, new->ns_mountpoint, new->flags, new->options);
 
 		if (new->fstype->parse) {
 			ret = new->fstype->parse(new);
 			if (ret < 0) {
-				pr_err("Failed to parse FS specific data on %s\n", new->mountpoint);
+				pr_err("Failed to parse FS specific data on %s\n", service_mountpoint(new));
 				mnt_entry_free(new);
 				new = NULL;
 				goto end;
 			}
 
 			if (ret > 0) {
-				pr_info("\tskipping fs mounted at %s\n", new->mountpoint + 1);
+				pr_info("\tskipping fs mounted at %s\n", service_mountpoint(new) + 1);
 				mnt_entry_free(new);
 				new = NULL;
 				ret = 0;
@@ -1563,10 +1679,8 @@ struct mount_info *parse_mountinfo(pid_t pid, struct ns_id *nsid, bool for_dump)
 		if (fsname)
 			free(fsname);
 
-		if (new) {
-			new->next = list;
-			list = new;
-		}
+		if (new)
+			mntinfo_add_list_before(&list, new);
 
 		if (ret)
 			goto err;
@@ -1669,6 +1783,12 @@ nodata:
 typedef struct bpfmap_fmt {
 	char *fmt;
 	void *value;
+	/*
+	 * If newer kernels are adding additional entries, these entries need
+	 * to be marked as optional in the protobuf definition and the parsing
+	 * must be able to ignore it if running on an older kernel.
+	 */
+	protobuf_c_boolean *optional;
 } bpfmap_fmt;
 
 static int parse_bpfmap(struct bfd *f, char *str, BpfmapFileEntry *bpf)
@@ -1681,28 +1801,34 @@ static int parse_bpfmap(struct bfd *f, char *str, BpfmapFileEntry *bpf)
 	 * uint32_t value_size
 	 * uint32_t max_entries
 	 * uint32_t map_flags
+	 * uint64_t map_extra
 	 * uint64_t memlock
 	 * uint32_t map_id
 	 * boolean frozen
 	 */
 
+	/* This needs to be in the same order as in the fdinfo entry. */
 	bpfmap_fmt map[] = {
-		{ "map_type: %u", &bpf->map_type },
-		{ "key_size: %u", &bpf->key_size },
-		{ "value_size: %u", &bpf->value_size },
-		{ "max_entries: %u", &bpf->max_entries },
-		{ "map_flags: %" PRIx32 "", &bpf->map_flags },
-		{ "memlock: %" PRIu64 "", &bpf->memlock },
-		{ "map_id: %u", &bpf->map_id },
-		{ "frozen: %d", &bpf->frozen },
+		{ "map_type: %u", &bpf->map_type, NULL },
+		{ "key_size: %u", &bpf->key_size, NULL },
+		{ "value_size: %u", &bpf->value_size, NULL },
+		{ "max_entries: %u", &bpf->max_entries, NULL },
+		{ "map_flags: %" PRIx32 "", &bpf->map_flags, NULL },
+		{ "map_extra: %" PRIx64 "", &bpf->map_extra, &bpf->has_map_extra },
+		{ "memlock: %" PRIu64 "", &bpf->memlock, NULL },
+		{ "map_id: %u", &bpf->map_id, NULL },
+		{ "frozen: %d", &bpf->frozen, NULL },
 	};
 
 	size_t n = sizeof(map) / sizeof(bpfmap_fmt);
 	int i;
 
 	for (i = 0; i < n; i++) {
-		if (sscanf(str, map[i].fmt, map[i].value) != 1)
+		if (sscanf(str, map[i].fmt, map[i].value) != 1) {
+			if (map[i].optional)
+				continue;
 			return -1;
+		}
 
 		if (i == n - 1)
 			break;
@@ -1713,6 +1839,9 @@ static int parse_bpfmap(struct bfd *f, char *str, BpfmapFileEntry *bpf)
 			return -1;
 		}
 	}
+
+	if (bpf->has_map_extra && bpf->map_extra)
+		pr_warn("Non-zero value for fdinfo map_extra entry found. This will not be restored.\n");
 
 	return 0;
 }
@@ -1851,10 +1980,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 				     " pos:%lli ino:%lx sdev:%x",
 				     &e->tfd, &e->events, (long long *)&e->data, (long long *)&e->pos,
 				     (long *)&e->inode, &e->dev);
-			if (ret < 3 || ret > 6) {
-				eventpoll_tfd_entry__free_unpacked(e, NULL);
-				goto parse_err;
-			} else if (ret == 3) {
+			if (ret == 3) {
 				e->has_dev = false;
 				e->has_inode = false;
 				e->has_pos = false;
@@ -1862,7 +1988,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 				e->has_dev = true;
 				e->has_inode = true;
 				e->has_pos = true;
-			} else if (ret < 6) {
+			} else {
 				eventpoll_tfd_entry__free_unpacked(e, NULL);
 				goto parse_err;
 			}
@@ -2039,6 +2165,33 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 			entry_met = true;
 			continue;
 		}
+		if (fdinfo_field(str, "ino") || fdinfo_field(str, "NSpid") || fdinfo_field(str, "Pid")) {
+			struct pidfd_dump_info *pidfd_info = arg;
+
+			if (type != FD_TYPES__PIDFD)
+				continue;
+
+			if (fdinfo_field(str, "ino")) {
+				ret = sscanf(str, "%*s %u", &pidfd_info->pidfe.ino);
+				if (ret != 1)
+					goto parse_err;
+			} else if (fdinfo_field(str, "Pid")) {
+				ret = sscanf(str, "%*s %d", &pidfd_info->pid);
+				if (ret != 1)
+					goto parse_err;
+			} else if (fdinfo_field(str, "NSpid")) {
+				char *last;
+
+				last = strrchr(str, '\t');
+				if (!last || sscanf(last, "%d", &pidfd_info->pidfe.nspid) != 1) {
+					pr_err("Unable to parse: %s\n", str);
+					goto parse_err;
+				}
+			}
+
+			entry_met = true;
+			continue;
+		}
 	}
 
 	exit_code = 0;
@@ -2087,10 +2240,10 @@ static int parse_file_lock_buf(char *buf, struct file_lock *fl, bool is_blocked)
 	char fl_flag[10], fl_type[15], fl_option[10];
 
 	if (is_blocked) {
-		num = sscanf(buf, "%lld: -> %s %s %s %d %x:%x:%ld %lld %s", &fl->fl_id, fl_flag, fl_type, fl_option,
+		num = sscanf(buf, "%lld: -> %9s %14s %9s %d %x:%x:%ld %lld %31s", &fl->fl_id, fl_flag, fl_type, fl_option,
 			     &fl->fl_owner, &fl->maj, &fl->min, &fl->i_no, &fl->start, fl->end);
 	} else {
-		num = sscanf(buf, "%lld:%s %s %s %d %x:%x:%ld %lld %s", &fl->fl_id, fl_flag, fl_type, fl_option,
+		num = sscanf(buf, "%lld:%9s %14s %9s %d %x:%x:%ld %lld %31s", &fl->fl_id, fl_flag, fl_type, fl_option,
 			     &fl->fl_owner, &fl->maj, &fl->min, &fl->i_no, &fl->start, fl->end);
 	}
 
@@ -2438,7 +2591,8 @@ err:
 	return -1;
 }
 
-int parse_task_cgroup(int pid, struct parasite_dump_cgroup_args *args, struct list_head *retl, unsigned int *n)
+int parse_thread_cgroup(int pid, int tid, struct parasite_dump_cgroup_args *args, struct list_head *retl,
+			unsigned int *n)
 {
 	FILE *f;
 	int ret;
@@ -2446,7 +2600,7 @@ int parse_task_cgroup(int pid, struct parasite_dump_cgroup_args *args, struct li
 	unsigned int n_internal = 0;
 	struct cg_ctl *intern, *ext;
 
-	f = fopen_proc(pid, "cgroup");
+	f = fopen_proc(pid, "task/%d/cgroup", tid);
 	if (!f)
 		return -1;
 
@@ -2633,7 +2787,7 @@ int aufs_parse(struct mount_info *new)
 {
 	int ret = 0;
 
-	if (!strcmp(new->mountpoint, "./")) {
+	if (!strcmp(new->ns_mountpoint, "./")) {
 		opts.aufs = true;
 		ret = parse_aufs_branches(new);
 	}

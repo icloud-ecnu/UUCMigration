@@ -1,3 +1,5 @@
+//go:build !remote
+
 package abi
 
 import (
@@ -5,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/entities/reports"
-	"github.com/containers/podman/v4/pkg/domain/filters"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi/parse"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	"github.com/containers/podman/v5/pkg/domain/filters"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi/parse"
 )
 
 func (ic *ContainerEngine) VolumeCreate(ctx context.Context, opts entities.VolumeCreateOptions) (*entities.IDOrNameResponse, error) {
@@ -162,6 +164,9 @@ func (ic *ContainerEngine) VolumeList(ctx context.Context, opts entities.VolumeL
 	for _, v := range vols {
 		inspectOut, err := v.Inspect()
 		if err != nil {
+			if errors.Is(err, define.ErrNoSuchVolume) {
+				continue
+			}
 			return nil, err
 		}
 		config := entities.VolumeConfigResponse{

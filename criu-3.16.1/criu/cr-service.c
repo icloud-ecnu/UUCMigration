@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <sched.h>
+#include <sys/prctl.h>
 
 #include "version.h"
 #include "crtools.h"
@@ -169,11 +170,11 @@ int send_criu_dump_resp(int socket_fd, bool success, bool restored)
 	return send_criu_msg(socket_fd, &msg);
 }
 
-static int send_criu_pre_dump_resp(int socket_fd, bool success)
+static int send_criu_pre_dump_resp(int socket_fd, bool success, bool single)
 {
 	CriuResp msg = CRIU_RESP__INIT;
 
-	msg.type = CRIU_REQ_TYPE__PRE_DUMP;
+	msg.type = single ? CRIU_REQ_TYPE__SINGLE_PRE_DUMP : CRIU_REQ_TYPE__PRE_DUMP;
 	msg.success = success;
 	set_resp_err(&msg);
 
@@ -239,13 +240,53 @@ int send_criu_rpc_script(enum script_actions act, char *name, int sk, int fd)
 	return 0;
 }
 
+int exec_rpc_query_external_files(char *name, int sk)
+{
+	int i, ret;
+	CriuNotify cn = CRIU_NOTIFY__INIT;
+	CriuResp msg = CRIU_RESP__INIT;
+	CriuReq *req;
+
+	cn.script = name;
+
+	msg.type = CRIU_REQ_TYPE__NOTIFY;
+	msg.success = true;
+	msg.notify = &cn;
+
+	ret = send_criu_msg_with_fd(sk, &msg, -1);
+	if (ret < 0)
+		return ret;
+
+	ret = recv_criu_msg(sk, &req);
+	if (ret < 0)
+		return ret;
+
+	if (req->type != CRIU_REQ_TYPE__NOTIFY || !req->notify_success) {
+		pr_err("RPC client reported script error\n");
+		return -1;
+	}
+
+	ret = 0;
+	if (req->opts)
+		for (i = 0; i < req->opts->n_external; i++) {
+			char *key = req->opts->external[i];
+			pr_info("Adding external object: %s\n", key);
+			if (add_external(key)) {
+				pr_err("Failed to add external object: %s\n", key);
+				ret = -1;
+			}
+		}
+	else
+		pr_info("RPC NOTIFY %s: no `opts` returned.\n", name);
+
+	criu_req__free_unpacked(req, NULL);
+	return ret;
+}
+
 static char images_dir[PATH_MAX];
 
 static int setup_opts_from_req(int sk, CriuOpts *req)
 {
-	//struct stat statbuf;
-	// char *fullPath;
-	// int needed;
 	struct ucred ids;
 	struct stat st;
 	socklen_t ids_len = sizeof(struct ucred);
@@ -341,8 +382,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	 */
 	if (imgs_changed_by_rpc_conf)
 		strncpy(images_dir_path, opts.imgs_dir, PATH_MAX - 1);
-	else
+	else if (req->images_dir_fd != -1)
 		sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd);
+	else if (req->images_dir)
+		strncpy(images_dir_path, req->images_dir, PATH_MAX - 1);
+	else {
+		pr_err("Neither images_dir_fd nor images_dir was passed by RPC client.\n");
+		goto err;
+	}
 
 	if (req->parent_img)
 		SET_CHAR_OPTS(img_parent, req->parent_img);
@@ -384,6 +431,13 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		goto err;
 	}
 
+	if(req->live_migration){
+		opts.tree_id=req->pid;
+		opts.imgs_dir=images_dir;
+		opts.work_dir=images_dir;
+		opts.is_iterative_dump=req->live_migration;
+		opts.last_dump=false;
+	}
 	/* initiate log file in work dir */
 	if (req->log_file && !output_changed_by_rpc_conf) {
 		/*
@@ -396,6 +450,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		}
 
 		SET_CHAR_OPTS(output, req->log_file);
+	} else if (req->has_log_to_stderr && req->log_to_stderr && !output_changed_by_rpc_conf) {
+		xfree(opts.output);
+		opts.output = NULL;
 	} else if (!opts.output) {
 		SET_CHAR_OPTS(output, DEFAULT_LOG_FILENAME);
 	}
@@ -412,6 +469,12 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		pr_debug("Would overwrite RPC settings with values from %s\n", req->config_file);
 	}
 
+	if (req->has_unprivileged)
+		opts.unprivileged = req->unprivileged;
+
+	if (check_caps())
+		return 1;
+
 	if (kerndat_init())
 		return 1;
 
@@ -423,7 +486,10 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	/* checking flags from client */
 	if (req->has_leave_running && req->leave_running)
 		opts.final_state = TASK_ALIVE;
-	
+
+	if (req->has_leave_stopped && req->leave_stopped)
+		opts.final_state = TASK_STOPPED;
+
 	if (!req->has_pid) {
 		req->has_pid = true;
 		req->pid = ids.pid;
@@ -467,75 +533,15 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_shell_job)
 		opts.shell_job = req->shell_job;
 
+	if (req->has_skip_file_rwx_check)
+		opts.skip_file_rwx_check = req->skip_file_rwx_check;
+
 	if (req->has_file_locks)
 		opts.handle_file_locks = req->file_locks;
 
 	if (req->has_track_mem)
 		opts.track_mem = req->track_mem;
-	
-	opts.pageState_dir = req->pagestate_dir;
-	pr_info("lsh test req->page_state_dir %s\n",req->pagestate_dir);
-	pr_info("lsh test images_dir_fd = %d  log file = %s\n",req->images_dir_fd,req->log_file);
-	if(req->pagestate_dir != NULL){
-		opts.pageState_dir = req->pagestate_dir;
-		opts.live_migration = 1;
-	}
-	/*if(opts.live_migration){
-		pr_info("Will live migration\n");
-		// if(stat(opts.pageState_dir,&statbuf) != 0){
-		// 	pr_err("Error: can't open %s\n",opts.pageState_dir);
-		// 	return 1;
-		// }
-		// if(!S_ISDIR(statbuf.st_mode)){
-		// 	pr_err("Error: %s is not a dictory\n",opts.pageState_dir);
-		// 	return 1;
-		// }
-		//opts.pageCategory_file 
-		//SET_CHAR_OPTS(pageCategory_file ,"");
-		needed = snprintf(NULL, 0, "%s/pageCategory.csv", opts.pageState_dir) + 1; // +1 for '\0'
-		fullPath = malloc(needed);
-		if (fullPath == NULL) {
-			pr_err("Error:  malloc pageCategory_file \n");
-			return 1;
-    	}
-    	snprintf(fullPath, needed, "%s/pageCategory.csv", opts.pageState_dir);
-		SET_CHAR_OPTS(pageCategory_file ,fullPath);
-		free(fullPath);
-		
-		needed = snprintf(NULL, 0, "%s/pageState.csv", opts.pageState_dir) + 1; // +1 for '\0'
-		fullPath = malloc(needed);
-		if (fullPath == NULL) {
-			pr_err("Error:  malloc pageState_file \n");
-			return 1;
-    	}
-    	snprintf(fullPath, needed, "%s/pageState.csv", opts.pageState_dir);
-		SET_CHAR_OPTS(pageState_file ,fullPath);
-		free(fullPath);
-		//opts.systemState_file
-		needed = snprintf(NULL, 0, "%s/systemState.csv", opts.pageState_dir) + 1; // +1 for '\0'
-		fullPath = malloc(needed);
-		if (fullPath == NULL) {
-			pr_err("Error:  malloc systemState_file \n");
-			return 1;
-    	}
-		 // 构建完整路径
-    	snprintf(fullPath, needed, "%s/systemState.csv", opts.pageState_dir);
-		SET_CHAR_OPTS(systemState_file ,fullPath);
-		free(fullPath);
-		
-	}*/
-	
-	/*check live migration*/
-	// if(req->has_live_migration)
-	// {
-	// 	pr_info("lsh test req->has_live_migration\n");
-	// 	opts.live_migration = req->live_migration;
-	// 	opts.pageState_file = req->pagestate_file;
-	// 	opts.pageCategory_file = req->pagecategory_file;
-	// 	opts.systemState_file = req->systemstate_file;
-	// 	opts.pageState_dir = req->page_state_dir;
-	// }
-	
+
 	if (req->has_link_remap)
 		opts.link_remap_ok = req->link_remap;
 
@@ -575,6 +581,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 			break;
 		case CRIU_NETWORK_LOCK_METHOD__NFTABLES:
 			opts.network_lock_method = NETWORK_LOCK_NFTABLES;
+			break;
+		case CRIU_NETWORK_LOCK_METHOD__SKIP:
+			opts.network_lock_method = NETWORK_LOCK_SKIP;
 			break;
 		default:
 			goto err;
@@ -776,6 +785,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->orphan_pts_master)
 		opts.orphan_pts_master = true;
 
+	if (req->has_display_stats)
+		opts.display_stats = req->display_stats;
+
 	/* Evaluate additional configuration file a second time to overwrite
 	 * all RPC settings. */
 	if (req->config_file) {
@@ -784,6 +796,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		if (i)
 			goto err;
 	}
+
+	if (req->mntns_compat_mode)
+		opts.mntns_compat_mode = true;
 
 	log_set_loglevel(opts.log_level);
 	if (check_options())
@@ -795,16 +810,48 @@ err:
 	set_cr_errno(EBADRQC);
 	return -1;
 }
+static int iterative_dump_using_req(int sk, CriuOpts *req)
+{
+	bool success = false;
+	bool self_dump = !req->pid;
+	opts.mode = CR_DUMP;
+	if (setup_opts_from_req(sk, req))
+		goto exit;
+	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
 
+	if (init_pidfd_store_hash())
+		goto pidfd_store_err;
+	/*
+	 * FIXME -- cr_dump_tasks() may return code from custom
+	 * scripts, that can be positive. However, right now we
+	 * don't have ability to push scripts via RPC, so positive
+	 * ret values are impossible here.
+	 */
+	if (cr_iterative_dump_tasks(req->pid))
+		goto exit;
+
+	success = true;
+exit:
+	free_pidfd_store();
+pidfd_store_err:
+	if (req->leave_running || !self_dump || !success) {
+		if (send_criu_dump_resp(sk, success, false) == -1) {
+			pr_perror("Can't send response");
+			success = false;
+		}
+	}
+	return success ? 0 : 1;
+}
 static int dump_using_req(int sk, CriuOpts *req)
 {
 	bool success = false;
 	bool self_dump = !req->pid;
 
+	opts.mode = CR_DUMP;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
+	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
 
 	if (init_pidfd_store_hash())
 		goto pidfd_store_err;
@@ -843,10 +890,11 @@ static int restore_using_req(int sk, CriuOpts *req)
 
 	opts.restore_detach = true;
 
+	opts.mode = CR_RESTORE;
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	setproctitle("restore --rpc -D %s", images_dir);
+	__setproctitle("restore --rpc -D %s", images_dir);
 
 	if (cr_restore_tasks())
 		goto exit;
@@ -892,8 +940,9 @@ static int check(int sk, CriuOpts *req)
 	}
 
 	if (pid == 0) {
-		setproctitle("check --rpc");
+		__setproctitle("check --rpc");
 
+		opts.mode = CR_CHECK;
 		if (setup_opts_from_req(sk, req))
 			exit(1);
 
@@ -911,7 +960,7 @@ out:
 	return send_criu_msg(sk, &resp);
 }
 
-static int pre_dump_using_req(int sk, CriuOpts *req)
+static int pre_dump_using_req(int sk, CriuOpts *req, bool single)
 {
 	int pid, status;
 	bool success = false;
@@ -925,10 +974,11 @@ static int pre_dump_using_req(int sk, CriuOpts *req)
 	if (pid == 0) {
 		int ret = 1;
 
+		opts.mode = CR_PRE_DUMP;
 		if (setup_opts_from_req(sk, req))
 			goto cout;
 
-		setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
+		__setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
 
 		if (init_pidfd_store_hash())
 			goto pidfd_store_err;
@@ -937,9 +987,9 @@ static int pre_dump_using_req(int sk, CriuOpts *req)
 			goto cout;
 
 		ret = 0;
-	cout:
+cout:
 		free_pidfd_store();
-	pidfd_store_err:
+pidfd_store_err:
 		exit(ret);
 	}
 
@@ -952,7 +1002,7 @@ static int pre_dump_using_req(int sk, CriuOpts *req)
 
 	success = true;
 out:
-	if (send_criu_pre_dump_resp(sk, success) == -1) {
+	if (send_criu_pre_dump_resp(sk, success, single) == -1) {
 		pr_perror("Can't send pre-dump resp");
 		success = false;
 	}
@@ -965,7 +1015,7 @@ static int pre_dump_loop(int sk, CriuReq *msg)
 	int ret;
 
 	do {
-		ret = pre_dump_using_req(sk, msg->opts);
+		ret = pre_dump_using_req(sk, msg->opts, false);
 		if (ret < 0)
 			return ret;
 
@@ -1002,10 +1052,11 @@ static int start_page_server_req(int sk, CriuOpts *req, bool daemon_mode)
 	if (pid == 0) {
 		close(start_pipe[0]);
 
+		opts.mode = CR_PAGE_SERVER;
 		if (setup_opts_from_req(sk, req))
 			goto out_ch;
 
-		setproctitle("page-server --rpc --address %s --port %hu", opts.addr, opts.port);
+		__setproctitle("page-server --rpc --address %s --port %hu", opts.addr, opts.port);
 
 		pr_debug("Starting page server\n");
 
@@ -1023,7 +1074,7 @@ static int start_page_server_req(int sk, CriuOpts *req, bool daemon_mode)
 		}
 
 		ret = 0;
-	out_ch:
+out_ch:
 		if (daemon_mode && ret < 0 && pid > 0)
 			kill(pid, SIGKILL);
 		close(start_pipe[1]);
@@ -1165,7 +1216,7 @@ static int handle_feature_check(int sk, CriuReq *msg)
 		if (kerndat_init())
 			exit(1);
 
-		setproctitle("feature-check --rpc");
+		__setproctitle("feature-check --rpc");
 
 		if ((msg->features->has_mem_track == 1) && (msg->features->mem_track == true))
 			feat.mem_track = kdat.has_dirty_track;
@@ -1248,17 +1299,18 @@ static int handle_cpuinfo(int sk, CriuReq *msg)
 	if (pid == 0) {
 		int ret = 1;
 
+		opts.mode = CR_CPUINFO;
 		if (setup_opts_from_req(sk, msg->opts))
 			goto cout;
 
-		setproctitle("cpuinfo %s --rpc -D %s", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check",
-			     images_dir);
+		__setproctitle("cpuinfo %s --rpc -D %s", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check",
+			       images_dir);
 
 		if (msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP)
 			ret = cpuinfo_dump();
 		else
 			ret = cpuinfo_check();
-	cout:
+cout:
 		exit(ret);
 	}
 
@@ -1297,6 +1349,8 @@ int cr_service_work(int sk)
 	CriuReq *msg = 0;
 
 more:
+	opts.mode = CR_SWRK;
+
 	if (recv_criu_msg(sk, &msg) != 0) {
 		pr_perror("Can't recv request");
 		goto err;
@@ -1337,7 +1391,11 @@ more:
 	case CRIU_REQ_TYPE__VERSION:
 		ret = handle_version(sk, msg);
 		break;
-
+	case CRIU_REQ_TYPE__SINGLE_PRE_DUMP:
+		ret = pre_dump_using_req(sk, msg->opts, true);
+		break;
+	case CRIU_REQ_TYPE__ITERATIVE_DUMP:
+		ret = iterative_dump_using_req(sk, msg->opts);
 	default:
 		send_criu_err(sk, "Invalid req");
 		break;

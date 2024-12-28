@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -7,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -18,13 +16,13 @@ import (
 	"github.com/containers/common/pkg/secrets"
 	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/pkg/namespaces"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/specgen"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/namespaces"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/regexp"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -85,11 +83,18 @@ func WithStorageConfig(config storage.StoreOptions) RuntimeOption {
 			copy(rt.storageConfig.GIDMap, config.GIDMap)
 		}
 
+		if config.PullOptions != nil {
+			rt.storageConfig.PullOptions = make(map[string]string)
+			for k, v := range config.PullOptions {
+				rt.storageConfig.PullOptions[k] = v
+			}
+		}
+
 		// If any one of runroot, graphroot, graphdrivername,
 		// or graphdriveroptions are set, then GraphRoot and RunRoot
 		// must be set
 		if setField {
-			storeOpts, err := storage.DefaultStoreOptions(rootless.IsRootless(), rootless.GetRootlessUID())
+			storeOpts, err := storage.DefaultStoreOptions()
 			if err != nil {
 				return err
 			}
@@ -270,7 +275,7 @@ func WithStaticDir(dir string) RuntimeOption {
 func WithRegistriesConf(path string) RuntimeOption {
 	logrus.Debugf("Setting custom registries.conf: %q", path)
 	return func(rt *Runtime) error {
-		if _, err := os.Stat(path); err != nil {
+		if err := fileutils.Exists(path); err != nil {
 			return fmt.Errorf("locating specified registries.conf: %w", err)
 		}
 		if rt.imageContext == nil {
@@ -362,15 +367,6 @@ func WithTmpDir(dir string) RuntimeOption {
 		}
 		rt.config.Engine.TmpDir = dir
 
-		return nil
-	}
-}
-
-// WithNoStore sets a bool on the runtime that we do not need
-// any containers storage.
-func WithNoStore() RuntimeOption {
-	return func(rt *Runtime) error {
-		rt.noStore = true
 		return nil
 	}
 }
@@ -568,7 +564,7 @@ func WithShmDir(dir string) CtrCreateOption {
 	}
 }
 
-// WithNOShmMount tells libpod whether to mount /dev/shm
+// WithNoShm tells libpod whether to mount /dev/shm
 func WithNoShm(mount bool) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
@@ -1069,7 +1065,7 @@ func WithDependencyCtrs(ctrs []*Container) CtrCreateOption {
 // namespace with a minimal configuration.
 // An optional array of port mappings can be provided.
 // Conflicts with WithNetNSFrom().
-func WithNetNS(portMappings []nettypes.PortMapping, exposedPorts map[uint16][]string, postConfigureNetNS bool, netmode string, networks map[string]nettypes.PerNetworkOptions) CtrCreateOption {
+func WithNetNS(portMappings []nettypes.PortMapping, postConfigureNetNS bool, netmode string, networks map[string]nettypes.PerNetworkOptions) CtrCreateOption {
 	return func(ctr *Container) error {
 		if ctr.valid {
 			return define.ErrCtrFinalized
@@ -1079,12 +1075,25 @@ func WithNetNS(portMappings []nettypes.PortMapping, exposedPorts map[uint16][]st
 		ctr.config.NetMode = namespaces.NetworkMode(netmode)
 		ctr.config.CreateNetNS = true
 		ctr.config.PortMappings = portMappings
-		ctr.config.ExposedPorts = exposedPorts
 
 		if !ctr.config.NetMode.IsBridge() && len(networks) > 0 {
 			return errors.New("cannot use networks when network mode is not bridge")
 		}
 		ctr.config.Networks = networks
+
+		return nil
+	}
+}
+
+// WithExposedPorts includes a set of ports that were exposed by the image in
+// the container config, e.g. for display when the container is inspected.
+func WithExposedPorts(exposedPorts map[uint16][]string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.ExposedPorts = exposedPorts
 
 		return nil
 	}
@@ -1112,7 +1121,7 @@ func WithLogDriver(driver string) CtrCreateOption {
 		switch driver {
 		case "":
 			return fmt.Errorf("log driver must be set: %w", define.ErrInvalidArg)
-		case define.JournaldLogging, define.KubernetesLogging, define.JSONLogging, define.NoLogging, define.PassthroughLogging:
+		case define.JournaldLogging, define.KubernetesLogging, define.JSONLogging, define.NoLogging, define.PassthroughLogging, define.PassthroughTTYLogging:
 			break
 		default:
 			return fmt.Errorf("invalid log driver: %w", define.ErrInvalidArg)
@@ -1340,7 +1349,7 @@ func WithRootFS(rootfs string, overlay bool, mapping *string) CtrCreateOption {
 		if ctr.valid {
 			return define.ErrCtrFinalized
 		}
-		if _, err := os.Stat(rootfs); err != nil {
+		if err := fileutils.Exists(rootfs); err != nil {
 			return err
 		}
 		ctr.config.Rootfs = rootfs
@@ -1403,12 +1412,11 @@ func WithRestartPolicy(policy string) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 
-		switch policy {
-		case define.RestartPolicyNone, define.RestartPolicyNo, define.RestartPolicyOnFailure, define.RestartPolicyAlways, define.RestartPolicyUnlessStopped:
-			ctr.config.RestartPolicy = policy
-		default:
-			return fmt.Errorf("%q is not a valid restart policy: %w", policy, define.ErrInvalidArg)
+		if err := define.ValidateRestartPolicy(policy); err != nil {
+			return err
 		}
+
+		ctr.config.RestartPolicy = policy
 
 		return nil
 	}
@@ -1486,6 +1494,7 @@ func WithImageVolumes(volumes []*ContainerImageVolume) CtrCreateOption {
 				Dest:      vol.Dest,
 				Source:    vol.Source,
 				ReadWrite: vol.ReadWrite,
+				SubPath:   vol.SubPath,
 			})
 		}
 
@@ -1500,6 +1509,43 @@ func WithHealthCheck(healthCheck *manifest.Schema2HealthConfig) CtrCreateOption 
 			return define.ErrCtrFinalized
 		}
 		ctr.config.HealthCheckConfig = healthCheck
+		return nil
+	}
+}
+
+// WithHealthCheckLogDestination adds the healthLogDestination to the container config
+func WithHealthCheckLogDestination(destination string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		dest, err := define.GetValidHealthCheckDestination(destination)
+		if err != nil {
+			return err
+		}
+		ctr.config.HealthLogDestination = dest
+		return nil
+	}
+}
+
+// WithHealthCheckMaxLogCount adds the healthMaxLogCount to the container config
+func WithHealthCheckMaxLogCount(maxLogCount uint) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.HealthMaxLogCount = maxLogCount
+		return nil
+	}
+}
+
+// WithHealthCheckMaxLogSize adds the healthMaxLogSize to the container config
+func WithHealthCheckMaxLogSize(maxLogSize uint) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.HealthMaxLogSize = maxLogSize
 		return nil
 	}
 }
@@ -1523,6 +1569,18 @@ func WithPreserveFDs(fd uint) CtrCreateOption {
 			return define.ErrCtrFinalized
 		}
 		ctr.config.PreserveFDs = fd
+		return nil
+	}
+}
+
+// WithPreserveFD forwards from the process running Libpod into the container
+// the given list of extra FDs to the created container
+func WithPreserveFD(fds []uint) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+		ctr.config.PreserveFD = fds
 		return nil
 	}
 }
@@ -1826,7 +1884,7 @@ func WithSecrets(containerSecrets []*ContainerSecret) CtrCreateOption {
 	}
 }
 
-// WithSecrets adds environment variable secrets to the container
+// WithEnvSecrets adds environment variable secrets to the container
 func WithEnvSecrets(envSecrets map[string]string) CtrCreateOption {
 	return func(ctr *Container) error {
 		ctr.config.EnvSecrets = make(map[string]*secrets.Secret)
@@ -2084,7 +2142,7 @@ func WithPodCgroupParent(path string) PodCreateOption {
 	}
 }
 
-// WithPodCgroups tells containers in this pod to use the cgroup created for
+// WithPodParent tells containers in this pod to use the cgroup created for
 // this pod.
 // This can still be overridden at the container level by explicitly specifying
 // a Cgroup parent.
@@ -2328,6 +2386,19 @@ func WithGroupEntry(groupEntry string) CtrCreateOption {
 		}
 
 		ctr.config.GroupEntry = groupEntry
+
+		return nil
+	}
+}
+
+// WithBaseHostsFile sets the option to copy /etc/hosts file.
+func WithBaseHostsFile(baseHostsFile string) CtrCreateOption {
+	return func(ctr *Container) error {
+		if ctr.valid {
+			return define.ErrCtrFinalized
+		}
+
+		ctr.config.BaseHostsFile = baseHostsFile
 
 		return nil
 	}

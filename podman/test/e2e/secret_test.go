@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -5,11 +7,10 @@ import (
 	"os"
 	"path/filepath"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	"github.com/containers/storage/pkg/stringid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "github.com/onsi/gomega/gexec"
 )
 
 var _ = Describe("Podman secret", func() {
@@ -39,8 +40,7 @@ var _ = Describe("Podman secret", func() {
 
 		session = podmanTest.Podman([]string{"secret", "create", "-d", "file", "--driver-opts", "opt1=val1", "a", secretFilePath})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(Exit(125))
-		Expect(session.ErrorToString()).To(Equal("Error: a: secret name in use"))
+		Expect(session).Should(ExitWithError(125, "Error: a: secret name in use"))
 
 		session = podmanTest.Podman([]string{"secret", "create", "-d", "file", "--driver-opts", "opt1=val1", "--replace", "a", secretFilePath})
 		session.WaitWithDefaultTimeout()
@@ -49,8 +49,7 @@ var _ = Describe("Podman secret", func() {
 
 		inspect = podmanTest.Podman([]string{"secret", "inspect", "-f", "{{.Spec.Driver.Options}}", secrID})
 		inspect.WaitWithDefaultTimeout()
-		Expect(inspect).To(ExitWithError())
-		Expect(inspect.ErrorToString()).To(ContainSubstring(fmt.Sprintf("Error: inspecting secret: no secret with name or id %q: no such secret", secrID)))
+		Expect(inspect).To(ExitWithError(125, fmt.Sprintf("Error: inspecting secret: no secret with name or id %q: no such secret", secrID)))
 
 		inspect = podmanTest.Podman([]string{"secret", "inspect", "-f", "{{.Spec.Driver.Options}}", "a"})
 		inspect.WaitWithDefaultTimeout()
@@ -66,14 +65,12 @@ var _ = Describe("Podman secret", func() {
 		badName := "foo/bar"
 		session := podmanTest.Podman([]string{"secret", "create", badName, secretFilePath})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
-		Expect(session.ErrorToString()).To(Equal(fmt.Sprintf("Error: secret name %q can not include '=', '/', ',', or the '\\0' (NULL) and be between 1 and 253 characters: invalid secret name", badName)))
+		Expect(session).To(ExitWithError(125, fmt.Sprintf("Error: secret name %q can not include '=', '/', ',', or the '\\0' (NULL) and be between 1 and 253 characters: invalid secret name", badName)))
 
 		badName = "foo=bar"
 		session = podmanTest.Podman([]string{"secret", "create", badName, secretFilePath})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
-		Expect(session.ErrorToString()).To(Equal(fmt.Sprintf("Error: secret name %q can not include '=', '/', ',', or the '\\0' (NULL) and be between 1 and 253 characters: invalid secret name", badName)))
+		Expect(session).To(ExitWithError(125, fmt.Sprintf("Error: secret name %q can not include '=', '/', ',', or the '\\0' (NULL) and be between 1 and 253 characters: invalid secret name", badName)))
 	})
 
 	It("podman secret inspect", func() {
@@ -164,7 +161,7 @@ var _ = Describe("Podman secret", func() {
 
 		inspect := podmanTest.Podman([]string{"secret", "inspect", "bogus"})
 		inspect.WaitWithDefaultTimeout()
-		Expect(inspect).To(ExitWithError())
+		Expect(inspect).To(ExitWithError(125, `inspecting secret: no secret with name or id "bogus": no such secret`))
 	})
 
 	It("podman secret ls", func() {
@@ -352,7 +349,7 @@ var _ = Describe("Podman secret", func() {
 		// no env variable set, should fail
 		session := podmanTest.Podman([]string{"secret", "create", "--env", "a", "MYENVVAR"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, "cannot create store secret data: environment variable MYENVVAR is not set"))
 
 		os.Setenv("MYENVVAR", "somedata")
 		if IsRemote() {
@@ -434,6 +431,6 @@ var _ = Describe("Podman secret", func() {
 
 		exists := podmanTest.Podman([]string{"secret", "exists", secretName})
 		exists.WaitWithDefaultTimeout()
-		Expect(exists).Should(Exit(1))
+		Expect(exists).Should(ExitWithError(1, ""))
 	})
 })

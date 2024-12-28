@@ -1,8 +1,17 @@
 ## memfd-bind ##
 
-`runc` normally has to make a binary copy of itself (or of a smaller helper
-binary called `runc-dmz`) when constructing a container process in order to
-defend against certain container runtime attacks such as CVE-2019-5736.
+> **NOTE**: Since runc 1.2.0, runc will now use a private overlayfs mount to
+> protect the runc binary (if you are on Linux 5.1 or later). This protection
+> is far more light-weight than memfd-bind, and for most users this should
+> obviate the need for `memfd-bind` entirely. Rootless containers will still
+> make a memfd copy (unless you are using `runc` itself inside a user namespace
+> -- a-la [`rootlesskit`][rootlesskit] -- and are on Linux 5.11 or later), but
+> `memfd-bind` is not particularly useful for rootless container users anyway
+> (see [Caveats](#Caveats) for more details).
+
+`runc` sometimes has to make a binary copy of itself when constructing a
+container process in order to defend against certain container runtime attacks
+such as CVE-2019-5736.
 
 This cloned binary only exists until the container process starts (this means
 for `runc run` and `runc exec`, it only exists for a few hundred milliseconds
@@ -24,8 +33,8 @@ but for most users the security benefit is identical.
 The provided `memfd-bind@.service` file can be used to get systemd to manage
 this daemon. You can supply the path like so:
 
-```
-% systemctl start memfd-bind@/usr/bin/runc
+```bash
+systemctl start memfd-bind@$(systemd-escape -p /usr/bin/runc)
 ```
 
 Thus, there are three ways of protecting against CVE-2019-5736, in order of how
@@ -34,18 +43,11 @@ much memory usage they can use:
 * `memfd-bind` only creates a single in-memory copy of the `runc` binary (about
   10MB), regardless of how many containers are running.
 
-* `runc-dmz` is (depending on which libc it was compiled with) between 10kB and
-  1MB in size, and a copy is created once per process spawned inside a
-  container by runc (both the pid1 and every `runc exec`). There are
-  circumstances where using `runc-dmz` will fail in ways that runc cannot
-  predict ahead of time (such as restrictive LSMs applied to containers), in
-  which case users can disable it with the `RUNC_DMZ=legacy` setting.
-  `runc-dmz` also requires an additional `execve` over the other options,
-  though since the binary is so small the cost is probably not even noticeable.
-
 * The classic method of making a copy of the entire `runc` binary during
   container process setup takes up about 10MB per process spawned inside the
   container by runc (both pid1 and `runc exec`).
+
+[rootlesskit]: https://github.com/rootless-containers/rootlesskit
 
 ### Caveats ###
 

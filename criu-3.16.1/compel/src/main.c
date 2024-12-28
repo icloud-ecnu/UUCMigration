@@ -19,6 +19,7 @@
 
 #define CFLAGS_DEFAULT_SET     \
 	"-Wstrict-prototypes " \
+	"-ffreestanding "      \
 	"-fno-stack-protector -nostdlib -fomit-frame-pointer "
 
 #define COMPEL_CFLAGS_PIE   CFLAGS_DEFAULT_SET "-fpie"
@@ -55,6 +56,10 @@ static const flags_t flags = {
 	.cflags = COMPEL_CFLAGS_PIE,
 #elif defined CONFIG_MIPS
 	.arch = "mips",
+	.cflags = COMPEL_CFLAGS_PIE,
+#elif defined CONFIG_LOONGARCH64
+	.arch = "loongarch64",
+	.cflags = COMPEL_CFLAGS_PIE,
 #else
 #error "CONFIG_<ARCH> not defined, or unsupported ARCH"
 #endif
@@ -93,7 +98,6 @@ static int piegen(void)
 	}
 
 	if (handle_binary(mem, st.st_size)) {
-		close(fd), fd = -1;
 		unlink(opts.output_filename);
 		goto err;
 	}
@@ -101,8 +105,7 @@ static int piegen(void)
 	ret = 0;
 
 err:
-	if (fd >= 0)
-		close(fd);
+	close(fd);
 	if (opts.fout)
 		fclose(opts.fout);
 	if (!ret)
@@ -346,11 +349,9 @@ int main(int argc, char *argv[])
 			printf("Version: %d.%d.%d\n", COMPEL_SO_VERSION_MAJOR, COMPEL_SO_VERSION_MINOR,
 			       COMPEL_SO_VERSION_SUBLEVEL);
 			exit(0);
-			break;
 		default: // '?'
 			// error message already printed by getopt_long()
 			return usage(1);
-			break;
 		}
 	}
 

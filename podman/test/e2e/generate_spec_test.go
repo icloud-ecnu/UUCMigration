@@ -1,11 +1,14 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"path/filepath"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gexec"
 )
 
 var _ = Describe("Podman generate spec", func() {
@@ -17,7 +20,7 @@ var _ = Describe("Podman generate spec", func() {
 	It("podman generate spec bogus should fail", func() {
 		session := podmanTest.Podman([]string{"generate", "spec", "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitWithError())
+		Expect(session).Should(ExitWithError(125, "could not find a pod or container with the id foobar"))
 	})
 
 	It("podman generate spec basic usage", func() {
@@ -57,6 +60,12 @@ var _ = Describe("Podman generate spec", func() {
 
 		session = podmanTest.Podman([]string{"generate", "spec", "--compact", "podspecgen"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).Should(ExitCleanly())
+
+		if isRootless() && !CGROUPSV2 {
+			Expect(session).Should(Exit(0))
+			Expect(session.ErrorToString()).Should(ContainSubstring("Resource limits are not supported and ignored on cgroups V1 rootless"))
+		} else {
+			Expect(session).Should(ExitCleanly())
+		}
 	})
 })

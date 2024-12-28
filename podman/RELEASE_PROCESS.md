@@ -231,20 +231,10 @@ spelled with complete minutiae.
    1. Update `RELEASE_NOTES.md` on main. Commit these changes.
    1. Create a PR with the above commits, and oversee it's merging.
 
-1. Create Github Release entry and upload assets
+1. Create GitHub Release entry and upload assets
 
    1. Return to the Cirrus-CI Build page for the new release tag, confirm
       (or wait for) it to complete, re-running any failed tasks as appropriate.
-   1. For anything other than an RC, the release artifacts need to be published along
-      with the release. These can be built locally using:
-
-      ```shell
-      $ git checkout vX.Y.Z
-      $ make release-artifacts
-      ```
-
-   1. In the directory where you downloaded the archives, run
-      `sha256sum *.tar.gz *.zip > shasums` to generate SHA sums.
    1. Go to `https://github.com/containers/podman/releases/tag/vX.Y.Z` and
       press the "Edit Release" button.  Change the name to the form `vX.Y.Z`
    1. If this is a release candidate be certain to click the pre-release
@@ -253,73 +243,75 @@ spelled with complete minutiae.
       click the latest release checkbox at the bottom of the page.
    1. Copy and paste the release notes for the release into the body of
       the release.
-   1. Near the bottom of the page there is a box with the message
-      “Add binaries by dropping them here or selecting them”. Use
-      that to upload the artifacts in the `release/` dir generated earlier,
-      as well as the two Mac pkginstallers:
-
-      * podman-remote-release-darwin_amd64.zip
-      * podman-remote-release-darwin_arm64.zip
-      * podman-remote-release-windows_amd64.zip
-      * podman-vX.Y.Z.msi
-      * podman-remote-static-linux_amd64.tar.gz
-      * podman-remote-static-linux_arm64.tar.gz
-      * podman-installer-macos-amd64.pkg
-      * podman-installer-macos-arm64.pkg
-      * shasums
-
    1. Click the Publish button to make the release (or pre-release)
       available.
-   1. Check the "Actions" tab, after the publish you should see a job
-      automatically launch to build the Windows installer and the Mac Installer (named after
-      the release). There may be more than one running due to the multiple
+   1. For all releases, including RC's, artifacts should be published. The
+      release-artifacts, upload-win-installer, and mac-pkg GitHub Actions
+      should automatically take care of building, signing, and uploading artifacts.
+      Check the "Actions" tab, after publishing you should see the jobs running.
+      There may be more than one running due to the multiple
       event states triggered, but this can be ignored, as any duplicates
       will gracefully back-off. The job takes 5-6 minutes to complete.
-   1. Confirm the podman-[version]-setup.exe file is now on the release
-      page. This might not be the case if you accidentally published the
-      release before uploading the binaries, as the job may look before
-      they are available. If that happens, you can either manually kick
-      off the job (see below), or just make a harmless edit to the
-      release (e.g. add an extra whitespace character somewhere). As
-      long as the body content is different in some way, a new run will
-      be triggered.
 
-      ## Manually Triggering Windows Installer Build & Upload
+      Please note that the Windows action depends on the artifact action, and will be
+      triggered after the artifact action succeeds.
+
+      If any of these actions are somehow not triggered, you can manually trigger them
 
       ### *CLI Approach*
       1. Install the [GitHub CLI](https://github.com/cli/cli#installation)
       1. Run (replacing below version number to release version)
          ```
-         gh workflow run "Upload Windows Installer" -F version="v4.2.0"
+         gh workflow run "ACTION NAME" -F version="vX.Y.Z"
          ```
       ### *GUI Approach*
       1. Go to the "Actions" tab
-      1. On the left pick the "Update Windows Installer" category
+      1. On the left pick the required action to be triggered.
       1. A blue box will appear above the job list with a right side drop
          -down. Click the drop-down and specify the version number in the
          dialog that appears
+   1. Check that all following artifacts are now attached to the release
+         * podman-remote-release-darwin_amd64.zip
+         * podman-remote-release-darwin_arm64.zip
+         * podman-remote-release-windows_amd64.zip
+         * podman-vX.Y.Z.msi
+         * podman-remote-static-linux_amd64.tar.gz
+         * podman-remote-static-linux_arm64.tar.gz
+         * podman-installer-macos-amd64.pkg
+         * podman-installer-macos-arm64.pkg
+         * podman-5.2.1-setup.exe
+         * shasums
 
-      ## Manually Triggering Mac Installer Build & Upload
-
-      ### *CLI Approach*
-      1. Install the [GitHub CLI](https://github.com/cli/cli#installation)
-      1. Run (replacing below version number to release version)
-         ```
-         gh workflow run "Sign and Upload Mac Installer" -F version="v4.2.0"
-         ```
-      ### *GUI Approach*
-      1. Go to the "Actions" tab
-      1. On the left pick the "Sign and Upload Mac Installer" category
-      1. A blue box will appear above the job list with a right side drop
-         -down. Click the drop-down and specify the version number in the
-         dialog that appears
+1. Update Cirrus-CI cron job list
+   1. After any Major or significant minor (esp. `-rhel`) releases, it's critical to
+      maintain the Cirrus-CI cron job list.  This applies to all containers-org repos,
+      not just podman.
+   1. Access the repo. settings WebUI by navigating to
+      `https://cirrus-ci.com/github/containers/<repo name>`
+      and clicking the gear-icon in the upper-right.
+   1. For minor (i.e. **NOT** `-rhel`) releases, (e.x. `vX.Y`), the previous release
+      should be removed from rotation (e.x. `vX.<Y-1>`) assuming it's no longer supported.
+      Simply click the trash-can icon to the right of the job definition.
+   1. For `-rhel` releases, these are tied to products with specific EOL dates.  They should
+      *never* be disabled unless you (and a buddy) are *absolutely* certain the product is EOL
+      and will *never* ever see another backport (CVE or otherwise).
+   1. On the settings page, pick a "less used" time-slot based on the currently defined
+      jobs.  For example, if three jobs specify `12 12 12 ? * 1-6`, choose another.  Any
+      spec. `H`/`M`/`S` value between 12 and 22 is acceptable (e.x. `22 22 22 ? * 1-6`).
+      The point is to not overload the clouds with CI jobs.
+   1. Following the pattern of the already defined jobs, at the bottom of the settings
+      page add a new entry.  The "Name" should reflect the version number, the "Branch"
+      is simply the newly created release branch name (must be exact), and the "Expression"
+      is the time slot you selected (copy-paste).
+   1. Click the "+" button next to the new-job row you just filled out.
 
 1. Announce the release
       1. For major and minor releases, write a blog post and publish it to blogs.podman.io
          Highlight key features and important changes or fixes. Link to the GitHub release.
          Make sure the blog post is properly tagged with the Announcement, Release, and Podman tags,
          and any other appropriate tags.
-      1. For all releases, including patch releases and RC's, send an email to the [podman](mailto:podman@lists.podman.io) and [podman-desktop](mailto:podman-desktop@lists.podman.io) mailing lists.
+      1. For all releases, including patch releases and RC's, send an email to the [podman](mailto:podman@lists.podman.io) and [podman-desktop](mailto:podman-desktop@lists.podman.io) mailing lists. This should be automated by the release-artifacts
+      action, but it's best to keep and eye on it to see if the email went through to the lists.
          Link the to release blog and GitHub release.
       1. Update [LATEST_VERSION](https://github.com/containers/podman.io/blob/main/static/data/global.ts) on the Podman.io website.
       1. Tweet the release. Make a Mastodon post about the release.

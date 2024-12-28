@@ -23,9 +23,9 @@ import (
 	"github.com/opencontainers/runc/libcontainer/cgroups/fs2"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
+	"github.com/opencontainers/runc/libcontainer/internal/userns"
 	"github.com/opencontainers/runc/libcontainer/logs"
 	"github.com/opencontainers/runc/libcontainer/system"
-	"github.com/opencontainers/runc/libcontainer/userns"
 	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
@@ -124,6 +124,13 @@ func (p *setnsProcess) signal(sig os.Signal) error {
 
 func (p *setnsProcess) start() (retErr error) {
 	defer p.comm.closeParent()
+
+	if p.process.IOPriority != nil {
+		if err := setIOPriority(p.process.IOPriority); err != nil {
+			return err
+		}
+	}
+
 	// get the "before" value of oom kill count
 	oom, _ := p.manager.OOMKillCount()
 	err := p.cmd.Start()
@@ -133,16 +140,11 @@ func (p *setnsProcess) start() (retErr error) {
 		return fmt.Errorf("error starting setns process: %w", err)
 	}
 
-	waitInit := initWaiter(p.comm.initSockParent)
 	defer func() {
 		if retErr != nil {
 			if newOom, err := p.manager.OOMKillCount(); err == nil && newOom != oom {
 				// Someone in this cgroup was killed, this _might_ be us.
 				retErr = fmt.Errorf("%w (possibly OOM-killed)", retErr)
-			}
-			werr := <-waitInit
-			if werr != nil {
-				logrus.WithError(werr).Warn()
 			}
 			err := ignoreTerminateErrors(p.terminate())
 			if err != nil {
@@ -155,10 +157,6 @@ func (p *setnsProcess) start() (retErr error) {
 		if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
 			return fmt.Errorf("error copying bootstrap data to pipe: %w", err)
 		}
-	}
-	err = <-waitInit
-	if err != nil {
-		return err
 	}
 	if err := p.execSetns(); err != nil {
 		return fmt.Errorf("error executing setns process: %w", err)
@@ -195,20 +193,26 @@ func (p *setnsProcess) start() (retErr error) {
 			}
 		}
 	}
-	// set rlimits, this has to be done here because we lose permissions
-	// to raise the limits once we enter a user-namespace
-	if err := setupRlimits(p.config.Rlimits, p.pid()); err != nil {
-		return fmt.Errorf("error setting rlimits for process: %w", err)
-	}
+
 	if err := utils.WriteJSON(p.comm.initSockParent, p.config); err != nil {
 		return fmt.Errorf("error writing config to pipe: %w", err)
 	}
 
+	var seenProcReady bool
 	ierr := parseSync(p.comm.syncSockParent, func(sync *syncT) error {
 		switch sync.Type {
 		case procReady:
-			// This shouldn't happen.
-			panic("unexpected procReady in setns")
+			seenProcReady = true
+			// Set rlimits, this has to be done here because we lose permissions
+			// to raise the limits once we enter a user-namespace
+			if err := setupRlimits(p.config.Rlimits, p.pid()); err != nil {
+				return fmt.Errorf("error setting rlimits for ready process: %w", err)
+			}
+
+			// Sync with child.
+			if err := writeSync(p.comm.syncSockParent, procRun); err != nil {
+				return err
+			}
 		case procHooks:
 			// This shouldn't happen.
 			panic("unexpected procHooks in setns")
@@ -266,6 +270,9 @@ func (p *setnsProcess) start() (retErr error) {
 
 	if err := p.comm.syncSockParent.Shutdown(unix.SHUT_WR); err != nil && ierr == nil {
 		return err
+	}
+	if !seenProcReady && ierr == nil {
+		ierr = errors.New("procReady not received")
 	}
 	// Must be done after Shutdown so the child will exit and we can wait for it.
 	if ierr != nil {
@@ -520,7 +527,6 @@ func (p *initProcess) start() (retErr error) {
 		return fmt.Errorf("unable to start init: %w", err)
 	}
 
-	waitInit := initWaiter(p.comm.initSockParent)
 	defer func() {
 		if retErr != nil {
 			// Find out if init is killed by the kernel's OOM killer.
@@ -543,11 +549,6 @@ func (p *initProcess) start() (retErr error) {
 				}
 			}
 
-			werr := <-waitInit
-			if werr != nil {
-				logrus.WithError(werr).Warn()
-			}
-
 			// Terminate the process to ensure we can remove cgroups.
 			if err := ignoreTerminateErrors(p.terminate()); err != nil {
 				logrus.WithError(err).Warn("unable to terminate initProcess")
@@ -564,7 +565,18 @@ func (p *initProcess) start() (retErr error) {
 	// cgroup. We don't need to worry about not doing this and not being root
 	// because we'd be using the rootless cgroup manager in that case.
 	if err := p.manager.Apply(p.pid()); err != nil {
-		return fmt.Errorf("unable to apply cgroup configuration: %w", err)
+		if errors.Is(err, cgroups.ErrRootless) {
+			// ErrRootless is to be ignored except when
+			// the container doesn't have private pidns.
+			if !p.config.Config.Namespaces.IsPrivate(configs.NEWPID) {
+				// TODO: make this an error in runc 1.3.
+				logrus.Warn("Creating a rootless container with no cgroup and no private pid namespace. " +
+					"Such configuration is strongly discouraged (as it is impossible to properly kill all container's processes) " +
+					"and will result in an error in a future runc version.")
+			}
+		} else {
+			return fmt.Errorf("unable to apply cgroup configuration: %w", err)
+		}
 	}
 	if p.intelRdtManager != nil {
 		if err := p.intelRdtManager.Apply(p.pid()); err != nil {
@@ -573,10 +585,6 @@ func (p *initProcess) start() (retErr error) {
 	}
 	if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
 		return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
-	}
-	err = <-waitInit
-	if err != nil {
-		return err
 	}
 
 	childPid, err := p.getChildPid()
@@ -701,7 +709,7 @@ func (p *initProcess) start() (retErr error) {
 			}
 		case procReady:
 			seenProcReady = true
-			// set rlimits, this has to be done here because we lose permissions
+			// Set rlimits, this has to be done here because we lose permissions
 			// to raise the limits once we enter a user-namespace
 			if err := setupRlimits(p.config.Rlimits, p.pid()); err != nil {
 				return fmt.Errorf("error setting rlimits for ready process: %w", err)
@@ -948,27 +956,20 @@ func (p *Process) InitializeIO(rootuid, rootgid int) (i *IO, err error) {
 	return i, nil
 }
 
-// initWaiter returns a channel to wait on for making sure
-// runc init has finished the initial setup.
-func initWaiter(r io.Reader) chan error {
-	ch := make(chan error, 1)
-	go func() {
-		defer close(ch)
+func setIOPriority(ioprio *configs.IOPriority) error {
+	const ioprioWhoPgrp = 1
 
-		inited := make([]byte, 1)
-		n, err := r.Read(inited)
-		if err == nil {
-			if n < 1 {
-				err = errors.New("short read")
-			} else if inited[0] != 0 {
-				err = fmt.Errorf("unexpected %d != 0", inited[0])
-			} else {
-				ch <- nil
-				return
-			}
-		}
-		ch <- fmt.Errorf("waiting for init preliminary setup: %w", err)
-	}()
+	class, ok := configs.IOPrioClassMapping[ioprio.Class]
+	if !ok {
+		return fmt.Errorf("invalid io priority class: %s", ioprio.Class)
+	}
 
-	return ch
+	// Combine class and priority into a single value
+	// https://github.com/torvalds/linux/blob/v5.18/include/uapi/linux/ioprio.h#L5-L17
+	iop := (class << 13) | ioprio.Priority
+	_, _, errno := unix.RawSyscall(unix.SYS_IOPRIO_SET, ioprioWhoPgrp, 0, uintptr(iop))
+	if errno != 0 {
+		return fmt.Errorf("failed to set io priority: %w", errno)
+	}
+	return nil
 }

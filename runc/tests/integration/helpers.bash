@@ -13,12 +13,12 @@ eval "$IMAGES"
 unset IMAGES
 
 : "${RUNC:="${INTEGRATION_ROOT}/../../runc"}"
-RECVTTY="${INTEGRATION_ROOT}/../../contrib/cmd/recvtty/recvtty"
-SD_HELPER="${INTEGRATION_ROOT}/../../contrib/cmd/sd-helper/sd-helper"
-SECCOMP_AGENT="${INTEGRATION_ROOT}/../../contrib/cmd/seccompagent/seccompagent"
-FS_IDMAP="${INTEGRATION_ROOT}/../../contrib/cmd/fs-idmap/fs-idmap"
-PIDFD_KILL="${INTEGRATION_ROOT}/../../contrib/cmd/pidfd-kill/pidfd-kill"
-REMAP_ROOTFS="${INTEGRATION_ROOT}/../../contrib/cmd/remap-rootfs/remap-rootfs"
+RECVTTY="${INTEGRATION_ROOT}/../../tests/cmd/recvtty/recvtty"
+SD_HELPER="${INTEGRATION_ROOT}/../../tests/cmd/sd-helper/sd-helper"
+SECCOMP_AGENT="${INTEGRATION_ROOT}/../../tests/cmd/seccompagent/seccompagent"
+FS_IDMAP="${INTEGRATION_ROOT}/../../tests/cmd/fs-idmap/fs-idmap"
+PIDFD_KILL="${INTEGRATION_ROOT}/../../tests/cmd/pidfd-kill/pidfd-kill"
+REMAP_ROOTFS="${INTEGRATION_ROOT}/../../tests/cmd/remap-rootfs/remap-rootfs"
 
 # Some variables may not always be set. Set those to empty value,
 # if unset, to avoid "unbound variable" error.
@@ -121,7 +121,7 @@ function init_cgroup_paths() {
 		CGROUP_BASE_PATH=/sys/fs/cgroup
 
 		# Find any cgroup.freeze files...
-		if [ -n "$(find "$CGROUP_BASE_PATH" -type f -name "cgroup.freeze" -print -quit)" ]; then
+		if [ -n "$(find "$CGROUP_BASE_PATH" -maxdepth 2 -type f -name "cgroup.freeze" -print -quit)" ]; then
 			CGROUP_SUBSYSTEMS+=" freezer"
 		fi
 	else
@@ -260,29 +260,30 @@ function get_cgroup_value() {
 	cat "$cgroup/$1"
 }
 
-# Helper to check a if value in a cgroup file matches the expected one.
+# Check if a value in a cgroup file $1 matches $2 or $3 (if specified).
 function check_cgroup_value() {
-	local current
-	current="$(get_cgroup_value "$1")"
-	local expected=$2
+	local got
+	got="$(get_cgroup_value "$1")"
+	local want=$2
+	local want2="${3:-}"
 
-	echo "current $current !? $expected"
-	[ "$current" = "$expected" ]
+	echo "$1: got $got, want $want $want2"
+	[ "$got" = "$want" ] || [[ -n "$want2" && "$got" = "$want2" ]]
 }
 
-# Helper to check a value in systemd.
+# Check if a value of systemd unit property $1 matches $2 or $3 (if specified).
 function check_systemd_value() {
 	[ ! -v RUNC_USE_SYSTEMD ] && return
 	local source="$1"
 	[ "$source" = "unsupported" ] && return
-	local expected="$2"
-	local expected2="${3:-}"
+	local want="$2"
+	local want2="${3:-}"
 	local user=""
 	[ $EUID -ne 0 ] && user="--user"
 
-	current=$(systemctl show $user --property "$source" "$SD_UNIT_NAME" | awk -F= '{print $2}')
-	echo "systemd $source: current $current !? $expected $expected2"
-	[ "$current" = "$expected" ] || [[ -n "$expected2" && "$current" = "$expected2" ]]
+	got=$(systemctl show $user --property "$source" "$SD_UNIT_NAME" | awk -F= '{print $2}')
+	echo "systemd $source: got $got, want $want $want2"
+	[ "$got" = "$want" ] || [[ -n "$want2" && "$got" = "$want2" ]]
 }
 
 function check_cpu_quota() {
@@ -316,8 +317,10 @@ function check_cpu_quota() {
 function check_cpu_burst() {
 	local burst=$1
 	if [ -v CGROUP_V2 ]; then
-		burst=$((burst / 1000))
-		check_cgroup_value "cpu.max.burst" "$burst"
+		# Due to a kernel bug (fixed by commit 49217ea147df, see
+		# https://lore.kernel.org/all/20240424132438.514720-1-serein.chengyu@huawei.com/),
+		# older kernels printed value divided by 1000. Check for both.
+		check_cgroup_value "cpu.max.burst" "$burst" "$((burst / 1000))"
 	else
 		check_cgroup_value "cpu.cfs_burst_us" "$burst"
 	fi
@@ -365,6 +368,55 @@ function rootless_cgroup() {
 	[[ "$ROOTLESS_FEATURES" == *"cgroup"* || -v RUNC_USE_SYSTEMD ]]
 }
 
+function in_userns() {
+	# The kernel guarantees the root userns inode number (and thus the value of
+	# the magic-link) is always the same value (PROC_USER_INIT_INO).
+	[[ "$(readlink /proc/self/ns/user)" != "user:[$((0xEFFFFFFD))]" ]]
+}
+
+function can_fsopen() {
+	fstype="$1"
+
+	# At the very least you need 5.1 for fsopen() and the filesystem needs to
+	# be supported by the running kernel.
+	if ! is_kernel_gte 5.1 || ! grep -qFw "$fstype" /proc/filesystems; then
+		return 1
+	fi
+
+	# You need to be root to use fsopen.
+	if [ "$EUID" -ne 0 ]; then
+		return 1
+	fi
+
+	# If we're root in the initial userns, we're done.
+	if ! in_userns; then
+		return 0
+	fi
+
+	# If we are running in a userns, then the filesystem needs to support
+	# FS_USERNS_MOUNT, which is a per-filesystem flag that depends on the
+	# kernel version.
+	case "$fstype" in
+	overlay)
+		# 459c7c565ac3 ("ovl: unprivieged mounts")
+		is_kernel_gte 5.11 || return 2
+		;;
+	fuse)
+		# 4ad769f3c346 ("fuse: Allow fully unprivileged mounts")
+		is_kernel_gte 4.18 || return 2
+		;;
+	ramfs | tmpfs)
+		# b3c6761d9b5c ("userns: Allow the userns root to mount ramfs.")
+		# 2b8576cb09a7 ("userns: Allow the userns root to mount tmpfs.")
+		is_kernel_gte 3.9 || return 2
+		;;
+	*)
+		# If we don't know about the filesystem, return an error.
+		fail "can_fsopen: unknown filesystem $fstype"
+		;;
+	esac
+}
+
 # Check if criu is available and working.
 function have_criu() {
 	command -v criu &>/dev/null || return 1
@@ -386,8 +438,14 @@ function requires() {
 				skip_me=1
 			fi
 			;;
+		criu_feature_*)
+			var=${var#criu_feature_}
+			if ! criu check --feature "$var"; then
+				skip "requires CRIU feature ${var}"
+			fi
+			;;
 		root)
-			if [ $EUID -ne 0 ]; then
+			if [ $EUID -ne 0 ] || in_userns; then
 				skip_me=1
 			fi
 			;;
@@ -424,8 +482,14 @@ function requires() {
 			;;
 		cgroups_swap)
 			init_cgroup_paths
-			if [ -v CGROUP_V1 ] && [ ! -e "${CGROUP_MEMORY_BASE_PATH}/memory.memsw.limit_in_bytes" ]; then
-				skip_me=1
+			if [ -v CGROUP_V1 ]; then
+				if [ ! -e "${CGROUP_MEMORY_BASE_PATH}/memory.memsw.limit_in_bytes" ]; then
+					skip_me=1
+				fi
+			elif [ -v CGROUP_V2 ]; then
+				if [ -z "$(find "$CGROUP_BASE_PATH" -maxdepth 2 -type f -name memory.swap.max -print -quit)" ]; then
+					skip_me=1
+				fi
 			fi
 			;;
 		cgroups_cpu_idle)
@@ -433,7 +497,7 @@ function requires() {
 			init_cgroup_paths
 			[ -v CGROUP_V1 ] && p="$CGROUP_CPU_BASE_PATH"
 			[ -v CGROUP_V2 ] && p="$CGROUP_BASE_PATH"
-			if [ -z "$(find "$p" -name cpu.idle -print -quit)" ]; then
+			if [ -z "$(find "$p" -maxdepth 2 -type f -name cpu.idle -print -quit)" ]; then
 				skip_me=1
 			fi
 			;;
@@ -444,10 +508,28 @@ function requires() {
 				p="$CGROUP_CPU_BASE_PATH"
 				f="cpu.cfs_burst_us"
 			elif [ -v CGROUP_V2 ]; then
+				# https://github.com/torvalds/linux/commit/f4183717b370ad28dd0c0d74760142b20e6e7931
+				requires_kernel 5.14
 				p="$CGROUP_BASE_PATH"
 				f="cpu.max.burst"
 			fi
-			if [ -z "$(find "$p" -name "$f" -print -quit)" ]; then
+			if [ -z "$(find "$p" -maxdepth 2 -type f -name "$f" -print -quit)" ]; then
+				skip_me=1
+			fi
+			;;
+		cgroups_io_weight)
+			local p f1 f2
+			init_cgroup_paths
+			if [ -v CGROUP_V1 ]; then
+				p="$CGROUP_CPU_BASE_PATH"
+				f1="blkio.weight"
+				f2="blkio.bfq.weight"
+			elif [ -v CGROUP_V2 ]; then
+				p="$CGROUP_BASE_PATH"
+				f1="io.weight"
+				f2="io.bfq.weight"
+			fi
+			if [ -z "$(find "$p" -type f \( -name "$f1" -o -name "$f2" \) -print -quit)" ]; then
 				skip_me=1
 			fi
 			;;
@@ -538,6 +620,20 @@ function requires() {
 	done
 }
 
+# Allow a test to specify that it will not work properly on a given OS. The
+# fingerprint for the OS used for this test is $ID-$VERSION_ID, using the
+# variables in /etc/os-release. The arguments are regular expressions, and any
+# match will cause the test to be skipped.
+function exclude_os() {
+	local host
+	host="$(sh -c '. /etc/os-release ; echo "$ID-$VERSION_ID"')"
+	for bad_os in "$@"; do
+		if [[ "$host" =~ ^$bad_os$ ]]; then
+			skip "test doesn't work on $bad_os"
+		fi
+	done
+}
+
 # Retry a command $1 times until it succeeds. Wait $2 seconds between retries.
 function retry() {
 	local attempts=$1
@@ -579,6 +675,36 @@ function testcontainer() {
 	fi
 	[ "$status" -eq 0 ]
 	[[ "${output}" == *"$2"* ]]
+}
+
+# Check that all the listed processes are gone. Use after kill/stop etc.
+function wait_pids_gone() {
+	if [ $# -lt 3 ]; then
+		echo "Usage: wait_pids_gone ITERATIONS SLEEP PID [PID ...]"
+		return 1
+	fi
+	local iter=$1
+	shift
+	local sleep=$1
+	shift
+	local pids=("$@")
+
+	while true; do
+		for i in "${!pids[@]}"; do
+			# Check if the pid is there; if not, remove it from the list.
+			kill -0 "${pids[i]}" 2>/dev/null || unset "pids[i]"
+		done
+		[ ${#pids[@]} -eq 0 ] && return 0
+		# Rebuild pids array to avoid sparse array issues.
+		pids=("${pids[@]}")
+
+		((--iter > 0)) || break
+
+		sleep "$sleep"
+	done
+
+	echo "Expected all PIDs to be gone, but some are still there:" "${pids[@]}" 1>&2
+	return 1
 }
 
 function setup_recvtty() {
@@ -650,6 +776,8 @@ function teardown_bundle() {
 	[ ! -v ROOT ] && return 0 # nothing to teardown
 
 	cd "$INTEGRATION_ROOT" || return
+	echo "--- teardown ---" >&2
+
 	teardown_recvtty
 	local ct
 	for ct in $(__runc list -q); do
@@ -692,25 +820,15 @@ function requires_idmap_fs() {
 		;;
 	*operation\ not\ permitted)
 		if uname -r | grep -q el9; then
-			# centos kernel 5.14.0-200 does not permit using ID map mounts due to a
-			# specific patch added to their sources:
+			# Older EL9 kernels did not permit using ID map mounts
+			# due to a specific patch added to their sources:
 			# 	https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/merge_requests/131
 			#
-			# There doesn't seem to be any technical reason behind
-			# it, none was provided in numerous examples, like:
-			# 	https://lore.kernel.org/lkml/20210213130042.828076-1-christian.brauner@ubuntu.com/T/#m3a9df31aa183e8797c70bc193040adfd601399ad
-			#	https://lore.kernel.org/lkml/20210213130042.828076-1-christian.brauner@ubuntu.com/T/#m59cdad9630d5a279aeecd0c1f117115144bc15eb
-			#	https://lore.kernel.org/lkml/m1r1ifzf8x.fsf@fess.ebiederm.org
-			#	https://lore.kernel.org/lkml/20210510125147.tkgeurcindldiwxg@wittgenstein
+			# That patch was reverted in:
+			# 	https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/merge_requests/2179
 			#
-			# So, sadly we just need to skip this on centos.
-			#
-			# TODO Nonetheless, there are ongoing works to revert the patch
-			# deactivating ID map mounts:
-			# https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/merge_requests/2179/diffs?commit_id=06f4fe946394cb94d2cf274aa7f3091d8f8469dc
-			# Once this patch is merge, we should be able to remove the below skip
-			# if the revert is backported or if CI centos kernel is upgraded.
-			skip "sadly, centos kernel 5.14 does not permit using ID map mounts"
+			# The above revert is included into the kernel 5.14.0-334.el9.
+			skip "Needs kernel >= 5.14.0-334.el9"
 		fi
 		;;
 	esac

@@ -5,7 +5,7 @@
 
 load helpers
 
-# bats test_tags=distro-integration
+# bats test_tags=distro-integration, ci:parallel
 @test "podman exec - basic test" {
     rand_filename=$(random_string 20)
     rand_content=$(random_string 50)
@@ -33,6 +33,9 @@ load helpers
     run_podman 127 exec $cid /no/such/command
     is "$output" ".*such file or dir"   "podman exec /no/such/command"
 
+    run_podman 125 exec $cid
+    is "$output" ".*must provide a non-empty command to start an exec session"   "podman exec must include a command"
+
     # Done. Tell the container to stop.
     # The '-d' is because container exit is racy: the exec process itself
     # could get caught and killed by cleanup, causing this step to exit 137
@@ -44,7 +47,7 @@ load helpers
     run_podman rm $cid
 }
 
-# bats test_tags=distro-integration
+# bats test_tags=distro-integration, ci:parallel
 @test "podman exec - leak check" {
     skip_if_remote "test is meaningless over remote"
 
@@ -66,6 +69,7 @@ load helpers
 
 # Issue #4785 - piping to exec statement - fixed in #4818
 # Issue #5046 - piping to exec truncates results (actually a conmon issue)
+# bats test_tags=ci:parallel
 @test "podman exec - cat from stdin" {
     run_podman run -d $IMAGE top
     cid="$output"
@@ -92,6 +96,7 @@ load helpers
 }
 
 # #6829 : add username to /etc/passwd inside container if --userns=keep-id
+# bats test_tags=ci:parallel
 @test "podman exec - with keep-id" {
     skip_if_not_rootless "--userns=keep-id only works in rootless mode"
     # Multiple --userns options confirm command-line override (last one wins)
@@ -106,6 +111,7 @@ load helpers
 }
 
 # #11496: podman-remote loses output
+# bats test_tags=ci:parallel
 @test "podman exec/run - missing output" {
     local bigfile=${PODMAN_TMPDIR}/bigfile
     local newfile=${PODMAN_TMPDIR}/newfile
@@ -133,29 +139,23 @@ load helpers
     run_podman rm -t 0 -f $cid
 }
 
-@test "podman exec --wait" {
-    skip_if_remote "test is meaningless over remote"
-
-    # wait on bogus container
-    run_podman 125 exec --wait 5 "bogus_container" echo hello
-    assert "$output" = "Error: timed out waiting for container: bogus_container"
-
-    run_podman create --name "wait_container" $IMAGE top
-    run_podman 255 exec --wait 5 "wait_container" echo hello
-    assert "$output" = "Error: can only create exec sessions on running containers: container state improper"
-
-    run_podman rm -f wait_container
-}
-
+# bats test_tags=ci:parallel
 @test "podman run umask" {
-    test "$(podman_runtime)" == "crun" \
-        || skip "FIXME: runtime is $(podman_runtime); this test requires crun or runc 1.1.7 or newer which is not currently in debian"
     umask="0724"
     run_podman run --rm -q $IMAGE grep Umask /proc/self/status
     is "$output" "Umask:.*0022" "default_umask should not be modified"
 
     run_podman run -q --rm --umask $umask $IMAGE grep Umask /proc/self/status
     is "$output" "Umask:.*$umask" "umask should be modified"
+
+    # FIXME: even in December 2023, exec test fails with Debian runc (1.1.10).
+    # And even if we some day get a fixed version on Debian, these tests have
+    # to pass on RHEL, and we have no control over runc version there.
+    if [[ "$(podman_runtime)" == "runc" ]]; then
+        echo "# Passed run test; skipping exec because runtime != crun" >&3
+        return
+    fi
+
     run_podman run -q -d --umask $umask $IMAGE sleep inf
     cid=$output
     run_podman exec $cid grep Umask /proc/self/status
@@ -166,7 +166,11 @@ load helpers
     run_podman rm -f -t0 $cid
 }
 
+# bats test_tags=ci:parallel
 @test "podman exec --tty" {
+    # Run all tests, report failures at end
+    defer-assertion-failures
+
     # Outer loops: different variations on the RUN container
     for run_opt_t in "" "-t"; do
         for run_term_env in "" "explicit_RUN_term"; do
@@ -174,7 +178,8 @@ load helpers
             if [[ -n "$run_term_env" ]]; then
                 run_opt_env="--env=TERM=$run_term_env"
             fi
-            run_podman run -d $run_opt_t $run_opt_env --name test $IMAGE top
+            cname="c-${run_opt_t}-${run_term_env}-$(safename)"
+            run_podman run -d $run_opt_t $run_opt_env --name $cname $IMAGE top
 
             # Inner loops: different variations on EXEC
             for exec_opt_t in "" "-t"; do
@@ -197,16 +202,17 @@ load helpers
                     fi
 
                     local desc="run $run_opt_t $run_opt_env, exec $exec_opt_t $exec_opt_env"
-                    TERM=exec-term run_podman exec $exec_opt_t $exec_opt_env test sh -c 'echo -n $TERM'
+                    TERM=exec-term run_podman exec $exec_opt_t $exec_opt_env $cname sh -c 'echo -n $TERM'
                     assert "$output" = "$expected" "$desc"
                 done
             done
 
-            run_podman rm -f -t0 test
+            run_podman rm -f -t0 $cname
         done
     done
 }
 
+# bats test_tags=ci:parallel
 @test "podman exec - does not leak session IDs on invalid command" {
     run_podman run -d $IMAGE top
     cid="$output"
@@ -218,6 +224,33 @@ load helpers
 
     run_podman inspect --format "{{len .ExecIDs}}" $cid
     assert "$output" = "0" ".ExecIDs must be empty"
+
+    run_podman rm -f -t0 $cid
+}
+
+# 'exec --preserve-fd' passes a list of additional file descriptors into the container
+# bats test_tags=ci:parallel
+@test "podman exec --preserve-fd" {
+    skip_if_remote "preserve-fd is meaningless over remote"
+
+    runtime=$(podman_runtime)
+    if [[ $runtime != "crun" ]]; then
+        skip "runtime is $runtime; preserve-fd requires crun"
+    fi
+
+    run_podman run -d $IMAGE top
+    cid="$output"
+
+    content=$(random_string 20)
+    echo "$content" > $PODMAN_TMPDIR/tempfile
+
+    # /proc/self/fd will have 0 1 2, possibly 3 & 4, but no 2-digit fds other than 40
+    run_podman exec --preserve-fd=9,40 $cid sh -c '/bin/ls -C -w999 /proc/self/fd; cat <&9; cat <&40' 9<<<"fd9" 10</dev/null 40<$PODMAN_TMPDIR/tempfile
+    assert "${lines[0]}" !~ [123][0-9] "/proc/self/fd must not contain 10-39"
+    assert "${lines[1]}" = "fd9"       "cat from fd 9"
+    assert "${lines[2]}" = "$content"  "cat from fd 40"
+
+    run_podman rm -f -t0 $cid
 }
 
 # vim: filetype=sh

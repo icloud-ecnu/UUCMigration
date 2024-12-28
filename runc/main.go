@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	//nolint:revive // Enable cgroup manager to manage devices
+	_ "github.com/opencontainers/runc/libcontainer/cgroups/devices"
 	"github.com/opencontainers/runc/libcontainer/seccomp"
 	"github.com/opencontainers/runtime-spec/specs-go"
 
@@ -53,7 +55,7 @@ value for "bundle" is the current directory.`
 )
 
 func main() {
-	app := cli.NewApp() //新的 CLI 应用程序实例
+	app := cli.NewApp()
 	app.Name = "runc"
 	app.Usage = usage
 
@@ -114,7 +116,6 @@ func main() {
 			Usage: "ignore cgroup permission errors ('true', 'false', or 'auto')",
 		},
 	}
-	// 注册了一系列子命令，用于管理容器的不同操作
 	app.Commands = []cli.Command{
 		checkpointCommand,
 		createCommand,
@@ -134,7 +135,6 @@ func main() {
 		updateCommand,
 		featuresCommand,
 	}
-	// 执行任何命令之前，会先运行
 	app.Before = func(context *cli.Context) error {
 		if !context.IsSet("root") && xdgDirUsed {
 			// According to the XDG specification, we need to set anything in
@@ -156,21 +156,19 @@ func main() {
 		if context.IsSet("criu") {
 			fmt.Fprintln(os.Stderr, "WARNING: --criu ignored (criu binary from $PATH is used); do not use")
 		}
-		// 配置日志系统
+
 		return configLogrus(context)
 	}
 
 	// If the command returns an error, cli takes upon itself to print
 	// the error on cli.ErrWriter and exit.
 	// Use our own writer here to ensure the log gets sent to the right location.
-	// 程序的入口，CLI 应用启动后会解析命令行参数并执行相应的命令。如果命令执行过程中出现错误，会调用 fatal 函数进行错误处理
 	cli.ErrWriter = &FatalWriter{cli.ErrWriter}
 	if err := app.Run(os.Args); err != nil {
 		fatal(err)
 	}
 }
 
-// 自定义错误输出处理逻辑
 type FatalWriter struct {
 	cliErrWriter io.Writer
 }
@@ -183,7 +181,6 @@ func (f *FatalWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// 根据 CLI 参数配置 logrus 日志系统
 func configLogrus(context *cli.Context) error {
 	if context.GlobalBool("debug") {
 		logrus.SetLevel(logrus.DebugLevel)

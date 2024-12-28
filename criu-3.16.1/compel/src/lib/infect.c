@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -42,7 +43,7 @@
 #ifndef SECCOMP_MODE_DISABLED
 #define SECCOMP_MODE_DISABLED 0
 #endif
-
+extern int iter;
 static int prepare_thread(int pid, struct thread_ctx *ctx);
 
 static inline void close_safe(int *pfd)
@@ -87,6 +88,12 @@ static int parse_pid_status(int pid, struct seize_task_status *ss, void *data)
 		}
 		if (!strncmp(aux, "SigPnd:", 7)) {
 			if (sscanf(aux + 7, "%llx", &ss->sigpnd) != 1)
+				goto err_parse;
+
+			continue;
+		}
+		if (!strncmp(aux, "SigBlk:", 7)) {
+			if (sscanf(aux + 7, "%llx", &ss->sigblk) != 1)
 				goto err_parse;
 
 			continue;
@@ -185,6 +192,29 @@ static int skip_sigstop(int pid, int nr_signals)
 	return 0;
 }
 
+#define SIG_MASK(sig) (1ULL << ((sig)-1))
+
+#define SIG_IN_MASK(sig, mask) ((sig) > 0 && (sig) <= SIGMAX && (SIG_MASK(sig) & (mask)))
+
+#define SUPPORTED_STOP_MASK ((1ULL << (SIGSTOP - 1)) | (1ULL << (SIGTSTP - 1)))
+
+static inline int sig_stop(int sig)
+{
+	return SIG_IN_MASK(sig, SUPPORTED_STOP_MASK);
+}
+
+int compel_parse_stop_signo(int pid)
+{
+	siginfo_t si;
+
+	if (ptrace(PTRACE_GETSIGINFO, pid, NULL, &si) < 0) {
+		pr_perror("SEIZE %d: can't parse stopped siginfo", pid);
+		return -1;
+	}
+
+	return si.si_signo;
+}
+
 /*
  * This routine seizes task putting it into a special
  * state where we can manipulate the task via ptrace
@@ -197,7 +227,7 @@ int compel_wait_task(int pid, int ppid, int (*get_status)(int pid, struct seize_
 		     void *data)
 {
 	siginfo_t si;
-	int status, nr_sigstop;
+	int status, nr_stopsig;
 	int ret = 0, ret2, wait_errno = 0;
 
 	/*
@@ -274,6 +304,11 @@ try_again:
 		goto try_again;
 	}
 
+	if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
+		pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
+		return -1;
+	}
+
 	if (ss->seccomp_mode != SECCOMP_MODE_DISABLED && ptrace_suspend_seccomp(pid) < 0)
 		goto err;
 
@@ -290,17 +325,32 @@ try_again:
 		goto err;
 	}
 
-	nr_sigstop = 0;
-	if (ss->sigpnd & (1 << (SIGSTOP - 1)))
-		nr_sigstop++;
-	if (ss->shdpnd & (1 << (SIGSTOP - 1)))
-		nr_sigstop++;
-	if (si.si_signo == SIGSTOP)
-		nr_sigstop++;
+	nr_stopsig = 0;
+	if (SIG_IN_MASK(SIGSTOP, ss->sigpnd))
+		nr_stopsig++;
+	if (SIG_IN_MASK(SIGSTOP, ss->shdpnd))
+		nr_stopsig++;
 
-	if (nr_sigstop) {
-		if (skip_sigstop(pid, nr_sigstop))
-			goto err_stop;
+	if (SIG_IN_MASK(SIGTSTP, ss->sigpnd) && !SIG_IN_MASK(SIGTSTP, ss->sigblk))
+		nr_stopsig++;
+	if (SIG_IN_MASK(SIGTSTP, ss->shdpnd) && !SIG_IN_MASK(SIGTSTP, ss->sigblk))
+		nr_stopsig++;
+
+	if (sig_stop(si.si_signo))
+		nr_stopsig++;
+
+	if (nr_stopsig) {
+		if (skip_sigstop(pid, nr_stopsig)) {
+			/*
+			 * Make sure that the task is stopped by a supported stop signal and
+			 * send it again to restore task state before criu intervention.
+			 */
+			if (sig_stop(si.si_signo))
+				kill(pid, si.si_signo);
+			else
+				kill(pid, SIGSTOP);
+			goto err;
+		}
 
 		return COMPEL_TASK_STOPPED;
 	}
@@ -312,8 +362,6 @@ try_again:
 		goto err;
 	}
 
-err_stop:
-	kill(pid, SIGSTOP);
 err:
 	if (ptrace(PTRACE_DETACH, pid, NULL, NULL))
 		pr_perror("Unable to detach from %d", pid);
@@ -321,6 +369,11 @@ err:
 }
 
 int compel_resume_task(pid_t pid, int orig_st, int st)
+{
+	return compel_resume_task_sig(pid, orig_st, st, SIGSTOP);
+}
+
+int compel_resume_task_sig(pid_t pid, int orig_st, int st, int stop_signo)
 {
 	int ret = 0;
 
@@ -344,8 +397,18 @@ int compel_resume_task(pid_t pid, int orig_st, int st)
 		 * task with STOP in queue that would get lost after
 		 * detach, so stop it again.
 		 */
-		if (orig_st == COMPEL_TASK_STOPPED)
-			kill(pid, SIGSTOP);
+		if (orig_st == COMPEL_TASK_STOPPED) {
+			/*
+			 * Check that stop_signo contain supported stop signal.
+			 * If it isn't, then send SIGSTOP. It makes sense in the case
+			 * when we get COMPEL_TASK_STOPPED from old image,
+			 * where stop_signo was not yet supported.
+			 */
+			if (sig_stop(stop_signo))
+				kill(pid, stop_signo);
+			else
+				kill(pid, SIGSTOP);
+		}
 	} else {
 		pr_err("Unknown final state %d\n", st);
 		ret = -1;
@@ -364,8 +427,9 @@ static int gen_parasite_saddr(struct sockaddr_un *saddr, int key)
 	int sun_len;
 
 	saddr->sun_family = AF_UNIX;
-	snprintf(saddr->sun_path, UNIX_PATH_MAX, "X/crtools-pr-%d", key);
-
+	
+	if(iter>0)snprintf(saddr->sun_path, UNIX_PATH_MAX, "X/crtools-pr-%d-%d-%" PRIx64, key,iter, compel_run_id);
+	else snprintf(saddr->sun_path, UNIX_PATH_MAX, "X/crtools-pr-%d-%" PRIx64, key, compel_run_id);
 	sun_len = SUN_LEN(saddr);
 	*saddr->sun_path = '\0';
 
@@ -455,8 +519,8 @@ static int parasite_run(pid_t pid, int cmd, unsigned long ip, void *stack, user_
 
 	ksigfillset(&block);
 	/*
-	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwice its hanlder
-	 * will be reseted to the default one.
+	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwise its handler
+	 * will be reset to the default one.
 	 */
 	ksigdelset(&block, SIGTRAP);
 	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &block)) {
@@ -526,7 +590,7 @@ static int parasite_trap(struct parasite_ctl *ctl, pid_t pid, user_regs_struct_t
 	}
 
 	if (!WIFSTOPPED(status)) {
-		pr_err("Task is still running (pid: %d)\n", pid);
+		pr_err("Task is still running (pid: %d, status: 0x%x)\n", pid, status);
 		goto err;
 	}
 
@@ -676,6 +740,7 @@ static int parasite_start_daemon(struct parasite_ctl *ctl)
 {
 	pid_t pid = ctl->rpid;
 	struct infect_ctx *ictx = &ctl->ictx;
+	user_fpregs_struct_t ext_regs;
 
 	/*
 	 * Get task registers before going daemon, since the
@@ -683,7 +748,7 @@ static int parasite_start_daemon(struct parasite_ctl *ctl)
 	 * while in daemon it is not such.
 	 */
 
-	if (compel_get_task_regs(pid, &ctl->orig.regs, NULL, ictx->save_regs, ictx->regs_arg, ictx->flags)) {
+	if (compel_get_task_regs(pid, &ctl->orig.regs, &ext_regs, ictx->save_regs, ictx->regs_arg, ictx->flags)) {
 		pr_err("Can't obtain regs for thread %d\n", pid);
 		return -1;
 	}
@@ -694,6 +759,9 @@ static int parasite_start_daemon(struct parasite_ctl *ctl)
 	}
 
 	if (ictx->make_sigframe(ictx->regs_arg, ctl->sigframe, ctl->rsigframe, &ctl->orig.sigmask))
+		return -1;
+
+	if (parasite_setup_shstk(ctl, &ext_regs))
 		return -1;
 
 	if (parasite_init_daemon(ctl))
@@ -749,7 +817,7 @@ static int parasite_memfd_exchange(struct parasite_ctl *ctl, unsigned long size,
 	uint8_t orig_code[MEMFD_FNAME_SZ] = MEMFD_FNAME;
 	pid_t pid = ctl->rpid;
 	long sret = -ENOSYS;
-	int ret, fd, lfd;
+	int ret, fd, lfd, remote_flags;
 
 	if (ctl->ictx.flags & INFECT_NO_MEMFD)
 		return 1;
@@ -793,7 +861,11 @@ static int parasite_memfd_exchange(struct parasite_ctl *ctl, unsigned long size,
 		goto err_cure;
 	}
 
-	ctl->remote_map = remote_mmap(ctl, NULL, size, remote_prot, MAP_FILE | MAP_SHARED, fd, 0);
+	remote_flags = MAP_FILE | MAP_SHARED;
+	if (ctl->ictx.remote_map_addr){
+		remote_flags |= MAP_FIXED_NOREPLACE;
+	}
+	ctl->remote_map = remote_mmap(ctl, (void *)ctl->ictx.remote_map_addr, size, remote_prot, remote_flags, fd, 0);
 	if (!ctl->remote_map) {
 		pr_err("Can't rmap memfd for parasite blob\n");
 		goto err_curef;
@@ -904,7 +976,7 @@ static int compel_map_exchange(struct parasite_ctl *ctl, unsigned long size)
 	return ret;
 }
 
-int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned long args_size)
+int compel_infect_no_daemon(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned long args_size)
 {
 	int ret;
 	unsigned long p, map_exchange_size, parasite_size = 0;
@@ -955,7 +1027,7 @@ int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned l
 	ctl->args_size = args_size;
 	parasite_size += ctl->args_size;
 
-	/* RESTORE_STACK_SIGFRAME needs a 64 bytes alignement */
+	/* RESTORE_STACK_SIGFRAME needs a 64 bytes alignment */
 	parasite_size = round_up(parasite_size, 64);
 
 	map_exchange_size = parasite_size;
@@ -1016,13 +1088,21 @@ int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned l
 		goto err;
 	}
 
-	if (parasite_start_daemon(ctl))
-		goto err;
-
 	return 0;
 
 err:
 	return -1;
+}
+
+int compel_infect(struct parasite_ctl *ctl, unsigned long nr_threads, unsigned long args_size)
+{
+	if (compel_infect_no_daemon(ctl, nr_threads, args_size))
+		return -1;
+
+	if (parasite_start_daemon(ctl))
+		return -1;
+
+	return 0;
 }
 
 struct parasite_thread_ctl *compel_prepare_thread(struct parasite_ctl *ctl, int pid)
@@ -1308,7 +1388,6 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 	pid_t pid = ctl->rpid;
 	user_regs_struct_t regs;
 	int status, ret = 0;
-	enum trace_flags flag;
 
 	/* stop getting chld from parasite -- we're about to step-by-step it */
 	if (restore_child_handler(ctl))
@@ -1328,7 +1407,7 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 
 	pr_debug("Daemon %d exited trapping\n", pid);
 	if (!WIFSTOPPED(status)) {
-		pr_err("Task is still running (pid: %d)\n", pid);
+		pr_err("Task is still running (pid: %d, status: 0x%x)\n", pid, status);
 		return -1;
 	}
 
@@ -1349,14 +1428,11 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 		return -1;
 
 	/* Go to sigreturn as closer as we can */
-	ret = compel_stop_pie(pid, ctl->sigreturn_addr, &flag, ctl->ictx.flags & INFECT_NO_BREAKPOINTS);
+	ret = compel_stop_pie(pid, ctl->sigreturn_addr, ctl->ictx.flags & INFECT_NO_BREAKPOINTS);
 	if (ret < 0)
 		return ret;
 
-	if (compel_stop_on_syscall(1, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1), flag))
-		return -1;
-
-	if (ptrace_flush_breakpoints(pid))
+	if (compel_stop_on_syscall(1, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1)))
 		return -1;
 
 	/*
@@ -1366,6 +1442,11 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 	 */
 
 	return 0;
+}
+
+int compel_start_daemon(struct parasite_ctl *ctl)
+{
+	return parasite_start_daemon(ctl);
 }
 
 int compel_stop_daemon(struct parasite_ctl *ctl)
@@ -1475,7 +1556,7 @@ int compel_run_in_thread(struct parasite_thread_ctl *tctl, unsigned int cmd)
 
 /*
  * compel_unmap() is used for unmapping parasite and restorer blobs.
- * A blob can contain code for unmapping itself, so the porcess is
+ * A blob can contain code for unmapping itself, so the process is
  * trapped on the exit from the munmap syscall.
  */
 int compel_unmap(struct parasite_ctl *ctl, unsigned long addr)
@@ -1488,7 +1569,7 @@ int compel_unmap(struct parasite_ctl *ctl, unsigned long addr)
 	if (ret)
 		goto err;
 
-	ret = compel_stop_on_syscall(1, __NR(munmap, 0), __NR(munmap, 1), TRACE_ENTER);
+	ret = compel_stop_on_syscall(1, __NR(munmap, 0), __NR(munmap, 1));
 
 	/*
 	 * Don't touch extended registers here: they were restored
@@ -1500,12 +1581,12 @@ err:
 	return ret;
 }
 
-int compel_stop_pie(pid_t pid, void *addr, enum trace_flags *tf, bool no_bp)
+int compel_stop_pie(pid_t pid, void *addr, bool no_bp)
 {
 	int ret;
 
 	if (no_bp) {
-		pr_debug("Force no-breakpoints restore\n");
+		pr_debug("Force no-breakpoints restore of %d\n", pid);
 		ret = 0;
 	} else
 		ret = ptrace_set_breakpoint(pid, addr);
@@ -1517,7 +1598,6 @@ int compel_stop_pie(pid_t pid, void *addr, enum trace_flags *tf, bool no_bp)
 		 * PIE will stop on a breakpoint, next
 		 * stop after that will be syscall enter.
 		 */
-		*tf = TRACE_EXIT;
 		return 0;
 	}
 
@@ -1530,14 +1610,12 @@ int compel_stop_pie(pid_t pid, void *addr, enum trace_flags *tf, bool no_bp)
 		pr_perror("Unable to restart the %d process", pid);
 		return -1;
 	}
-
-	*tf = TRACE_ENTER;
 	return 0;
 }
 
 static bool task_is_trapped(int status, pid_t pid)
 {
-	if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+	if (WIFSTOPPED(status) && (WSTOPSIG(status) & ~PTRACE_SYSCALL_TRAP) == SIGTRAP)
 		return true;
 
 	pr_err("Task %d is in unexpected state: %x\n", pid, status);
@@ -1571,14 +1649,12 @@ static inline int is_required_syscall(user_regs_struct_t *regs, pid_t pid, const
  * sys_nr - the required syscall number
  * sys_nr_compat - the required compatible syscall number
  */
-int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat, enum trace_flags trace)
+int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 {
+	enum trace_flags trace = tasks > 1 ? TRACE_ALL : TRACE_ENTER;
 	user_regs_struct_t regs;
 	int status, ret;
 	pid_t pid;
-
-	if (tasks > 1)
-		trace = TRACE_ALL;
 
 	/* Stop all threads on the enter point in sys_rt_sigreturn */
 	while (tasks) {
@@ -1593,6 +1669,18 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat,
 
 		pr_debug("%d was trapped\n", pid);
 
+		if ((WSTOPSIG(status) & PTRACE_SYSCALL_TRAP) == 0) {
+			/*
+			 * On some platforms such as ARM64, it is impossible to
+			 * pass through a breakpoint, so let's clear it right
+			 * after it has been triggered.
+			*/
+			if (ptrace_flush_breakpoints(pid)) {
+				pr_err("Unable to clear breakpoints\n");
+				return -1;
+			}
+			goto goon;
+		}
 		if (trace == TRACE_EXIT) {
 			trace = TRACE_ENTER;
 			pr_debug("`- Expecting exit\n");
@@ -1685,4 +1773,32 @@ uint64_t compel_get_leader_sp(struct parasite_ctl *ctl)
 uint64_t compel_get_thread_sp(struct parasite_thread_ctl *tctl)
 {
 	return REG_SP(tctl->th.regs);
+}
+
+uint64_t compel_get_leader_ip(struct parasite_ctl *ctl)
+{
+	return REG_IP(ctl->orig.regs);
+}
+
+uint64_t compel_get_thread_ip(struct parasite_thread_ctl *tctl)
+{
+	return REG_IP(tctl->th.regs);
+}
+
+void compel_set_leader_ip(struct parasite_ctl *ctl, uint64_t v)
+{
+	SET_REG_IP(ctl->orig.regs, v);
+}
+
+void compel_set_thread_ip(struct parasite_thread_ctl *tctl, uint64_t v)
+{
+	SET_REG_IP(tctl->th.regs, v);
+}
+
+void compel_get_stack(struct parasite_ctl *ctl, void **rstack, void **r_thread_stack)
+{
+	if (rstack)
+		*rstack = ctl->rstack;
+	if (r_thread_stack)
+		*r_thread_stack = ctl->r_thread_stack;
 }

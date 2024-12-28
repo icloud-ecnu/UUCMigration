@@ -1,9 +1,11 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"path/filepath"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gexec"
@@ -171,16 +173,10 @@ var _ = Describe("Podman import", func() {
 
 		importImage := podmanTest.Podman([]string{"import", "-q", "--signature-policy", "/no/such/file", outfile})
 		importImage.WaitWithDefaultTimeout()
-		Expect(importImage).To(ExitWithError())
+		Expect(importImage).To(ExitWithError(125, "open /no/such/file: no such file or directory"))
 
 		result := podmanTest.Podman([]string{"import", "-q", "--signature-policy", "/etc/containers/policy.json", outfile})
 		result.WaitWithDefaultTimeout()
-		if IsRemote() {
-			Expect(result).To(ExitWithError())
-			Expect(result.ErrorToString()).To(ContainSubstring("unknown flag"))
-			result := podmanTest.Podman([]string{"import", "-q", outfile})
-			result.WaitWithDefaultTimeout()
-		}
 		Expect(result).Should(ExitCleanly())
 	})
 })

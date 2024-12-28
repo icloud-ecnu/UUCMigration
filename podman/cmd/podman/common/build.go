@@ -21,10 +21,10 @@ import (
 	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
 	enchelpers "github.com/containers/ocicrypt/helpers"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/cmd/podman/utils"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/env"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/cmd/podman/utils"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/env"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -75,7 +75,7 @@ func DefineBuildFlags(cmd *cobra.Command, buildOpts *BuildFlagsWrapper, isFarmBu
 	if err := flag.Value.Set("missing"); err != nil {
 		logrus.Errorf("Unable to set --pull to 'missing': %v", err)
 	}
-	flag.Usage = `Pull image policy ("always/true"|"missing"|"never/false"|"newer")`
+	flag.Usage = `Pull image policy ("always"|"missing"|"never"|"newer")`
 	flags.AddFlagSet(&budFlags)
 
 	// Add the completion functions
@@ -113,14 +113,20 @@ func DefineBuildFlags(cmd *cobra.Command, buildOpts *BuildFlagsWrapper, isFarmBu
 	completion.CompleteCommandFlags(cmd, fromAndBudFlagsCompletions)
 	flags.SetNormalizeFunc(buildahCLI.AliasFlags)
 	if registry.IsRemote() {
+		// Unset the isolation default as we never want to send this over the API
+		// as it can be wrong (root vs rootless).
+		_ = flags.Lookup("isolation").Value.Set("")
 		_ = flags.MarkHidden("disable-content-trust")
 		_ = flags.MarkHidden("sign-by")
 		_ = flags.MarkHidden("signature-policy")
-		_ = flags.MarkHidden("tls-verify")
 		_ = flags.MarkHidden("compress")
 		_ = flags.MarkHidden("output")
 		_ = flags.MarkHidden("logsplit")
 		_ = flags.MarkHidden("cw")
+		// Support for farm build in podman-remote
+		if !isFarmBuild {
+			_ = flags.MarkHidden("tls-verify")
+		}
 	}
 	if isFarmBuild {
 		for _, f := range FarmBuildHiddenFlags {
@@ -130,9 +136,8 @@ func DefineBuildFlags(cmd *cobra.Command, buildOpts *BuildFlagsWrapper, isFarmBu
 }
 
 func ParseBuildOpts(cmd *cobra.Command, args []string, buildOpts *BuildFlagsWrapper) (*entities.BuildOptions, error) {
-	if (cmd.Flags().Changed("squash") && cmd.Flags().Changed("layers")) ||
-		(cmd.Flags().Changed("squash-all") && cmd.Flags().Changed("squash")) {
-		return nil, errors.New("cannot specify --squash with --layers and --squash-all with --squash")
+	if cmd.Flags().Changed("squash-all") && cmd.Flags().Changed("squash") {
+		return nil, errors.New("cannot specify --squash-all with --squash")
 	}
 
 	if cmd.Flag("output").Changed && registry.IsRemote() {
@@ -197,10 +202,7 @@ func ParseBuildOpts(cmd *cobra.Command, args []string, buildOpts *BuildFlagsWrap
 		// No context directory or URL was specified.  Try to use the home of
 		// the first locally-available Containerfile.
 		for i := range containerFiles {
-			if strings.HasPrefix(containerFiles[i], "http://") ||
-				strings.HasPrefix(containerFiles[i], "https://") ||
-				strings.HasPrefix(containerFiles[i], "git://") ||
-				strings.HasPrefix(containerFiles[i], "github.com/") {
+			if isURL(containerFiles[i]) {
 				continue
 			}
 			absFile, err := filepath.Abs(containerFiles[i])
@@ -234,6 +236,10 @@ func ParseBuildOpts(cmd *cobra.Command, args []string, buildOpts *BuildFlagsWrap
 		default:
 			return nil, fmt.Errorf("no Containerfile or Dockerfile specified or found in context directory, %s: %w", contextDir, syscall.ENOENT)
 		}
+	}
+
+	if err := areContainerfilesValid(contextDir, containerFiles); err != nil {
+		return nil, err
 	}
 
 	var logFile *os.File
@@ -310,7 +316,9 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 		pullPolicy = buildahDefine.PullAlways
 	}
 
-	if flags.PullNever || strings.EqualFold(strings.TrimSpace(flags.Pull), "never") {
+	if flags.PullNever ||
+		strings.EqualFold(strings.TrimSpace(flags.Pull), "false") ||
+		strings.EqualFold(strings.TrimSpace(flags.Pull), "never") {
 		pullPolicy = buildahDefine.PullNever
 	}
 
@@ -334,15 +342,15 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 	}
 	if c.Flag("build-arg").Changed {
 		for _, arg := range flags.BuildArg {
-			av := strings.SplitN(arg, "=", 2)
-			if len(av) > 1 {
-				args[av[0]] = av[1]
+			key, val, hasVal := strings.Cut(arg, "=")
+			if hasVal {
+				args[key] = val
 			} else {
 				// check if the env is set in the local environment and use that value if it is
-				if val, present := os.LookupEnv(av[0]); present {
-					args[av[0]] = val
+				if val, present := os.LookupEnv(key); present {
+					args[key] = val
 				} else {
-					delete(args, av[0])
+					delete(args, key)
 				}
 			}
 		}
@@ -398,9 +406,14 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 		compression = buildahDefine.Uncompressed
 	}
 
-	isolation, err := parse.IsolationOption(flags.Isolation)
-	if err != nil {
-		return nil, err
+	isolation := buildahDefine.IsolationDefault
+	// Only parse the isolation when it is actually needed as we do not want to send a wrong default
+	// to the server in the remote case (root vs rootless).
+	if flags.Isolation != "" {
+		isolation, err = parse.IsolationOption(flags.Isolation)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	usernsOption, idmappingOptions, err := parse.IDMappingOptions(c, isolation)
@@ -451,15 +464,15 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 	additionalBuildContext := make(map[string]*buildahDefine.AdditionalBuildContext)
 	if c.Flag("build-context").Changed {
 		for _, contextString := range flags.BuildContext {
-			av := strings.SplitN(contextString, "=", 2)
-			if len(av) > 1 {
-				parseAdditionalBuildContext, err := parse.GetAdditionalBuildContext(av[1])
+			key, val, hasVal := strings.Cut(contextString, "=")
+			if hasVal {
+				parseAdditionalBuildContext, err := parse.GetAdditionalBuildContext(val)
 				if err != nil {
 					return nil, fmt.Errorf("while parsing additional build context: %w", err)
 				}
-				additionalBuildContext[av[0]] = &parseAdditionalBuildContext
+				additionalBuildContext[key] = &parseAdditionalBuildContext
 			} else {
-				return nil, fmt.Errorf("while parsing additional build context: %q, accepts value in the form of key=value", av)
+				return nil, fmt.Errorf("while parsing additional build context: %s, accepts value in the form of key=value", contextString)
 			}
 		}
 	}
@@ -493,6 +506,14 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 		}
 	}
 
+	retryDelay := 2 * time.Second
+	if flags.RetryDelay != "" {
+		retryDelay, err = time.ParseDuration(flags.RetryDelay)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse value provided %q as --retry-delay: %w", flags.RetryDelay, err)
+		}
+	}
+
 	opts := buildahDefine.BuildOptions{
 		AddCapabilities:         flags.CapAdd,
 		AdditionalTags:          tags,
@@ -507,6 +528,7 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 		CacheTTL:                cacheTTL,
 		ConfidentialWorkload:    confidentialWorkloadOptions,
 		CommonBuildOpts:         commonOpts,
+		CompatVolumes:           types.NewOptionalBool(flags.CompatVolumes),
 		Compression:             compression,
 		ConfigureNetwork:        networkPolicy,
 		ContextDirectory:        contextDir,
@@ -530,7 +552,7 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 		LogFile:                 flags.Logfile,
 		LogSplitByPlatform:      flags.LogSplitByPlatform,
 		Manifest:                flags.Manifest,
-		MaxPullPushRetries:      3,
+		MaxPullPushRetries:      flags.Retry,
 		NamespaceOptions:        nsValues,
 		NoCache:                 flags.NoCache,
 		OSFeatures:              flags.OSFeatures,
@@ -541,7 +563,7 @@ func buildFlagsWrapperToOptions(c *cobra.Command, contextDir string, flags *Buil
 		OutputFormat:            format,
 		Platforms:               platforms,
 		PullPolicy:              pullPolicy,
-		PullPushRetryDelay:      2 * time.Second,
+		PullPushRetryDelay:      retryDelay,
 		Quiet:                   flags.Quiet,
 		RemoveIntermediateCtrs:  flags.Rm,
 		ReportWriter:            reporter,
@@ -615,4 +637,42 @@ func parseDockerignore(ignoreFile string) ([]string, error) {
 		excludes = append(excludes, e)
 	}
 	return excludes, nil
+}
+
+func areContainerfilesValid(contextDir string, containerFiles []string) error {
+	for _, f := range containerFiles {
+		if isURL(f) || f == "/dev/stdin" {
+			continue
+		}
+
+		// Because currently podman runs the test/bud.bats tests under the buildah project in CI,
+		// the following error messages need to be consistent with buildah; otherwise, the podman CI will fail.
+		// See: https://github.com/containers/buildah/blob/4c781b59b49d66e07324566555339888113eb7e2/imagebuildah/build.go#L139-L141
+		// 	    https://github.com/containers/buildah/blob/4c781b59b49d66e07324566555339888113eb7e2/tests/bud.bats#L3474-L3479
+		if utils.IsDir(f) {
+			return fmt.Errorf("containerfile: %q cannot be path to a directory", f)
+		}
+
+		// If the file is not found, try again with context directory prepended (if not prepended yet)
+		// Ref: https://github.com/containers/buildah/blob/4c781b59b49d66e07324566555339888113eb7e2/imagebuildah/build.go#L125-L135
+		if utils.FileExists(f) {
+			continue
+		}
+		if !strings.HasPrefix(f, contextDir) {
+			if utils.FileExists(filepath.Join(contextDir, f)) {
+				continue
+			}
+		}
+
+		return fmt.Errorf("the specified Containerfile or Dockerfile does not exist, %s: %w", f, syscall.ENOENT)
+	}
+
+	return nil
+}
+
+func isURL(s string) bool {
+	return strings.HasPrefix(s, "http://") ||
+		strings.HasPrefix(s, "https://") ||
+		strings.HasPrefix(s, "git://") ||
+		strings.HasPrefix(s, "github.com/")
 }

@@ -20,6 +20,7 @@
 #include "file-lock.h"
 #include "irmap.h"
 #include "mount.h"
+#include "mount-v2.h"
 #include "namespaces.h"
 #include "net.h"
 #include "sk-inet.h"
@@ -229,7 +230,7 @@ out:
 		tmp_string[0] = 0;
 
 	/* Check for unsupported configuration file entries */
-	if (configuration[i] + offset + 1 != 0 && strchr(configuration[i] + offset, ' ')) {
+	if (strchr(configuration[i] + offset, ' ')) {
 		int j;
 		len = strlen(configuration[i] + offset);
 		for (j = 0; j < len - 1; j++) {
@@ -410,6 +411,7 @@ void init_opts(void)
 	memset(&opts, 0, sizeof(opts));
 
 	/* Default options */
+	opts.is_iterative_dump=false;
 	opts.final_state = TASK_DEAD;
 	INIT_LIST_HEAD(&opts.ext_mounts);
 	INIT_LIST_HEAD(&opts.inherit_fds);
@@ -429,7 +431,7 @@ void init_opts(void)
 	opts.pre_dump_mode = PRE_DUMP_SPLICE;
 	opts.file_validation_method = FILE_VALIDATION_DEFAULT;
 	opts.network_lock_method = NETWORK_LOCK_DEFAULT;
-	//opts.live_migration = 0;
+	opts.ghost_fiemap = FIEMAP_DEFAULT;
 }
 
 bool deprecated_ok(char *what)
@@ -550,7 +552,7 @@ static size_t parse_size(char *optarg)
 static int parse_join_ns(const char *ptr)
 {
 	char *aux, *ns_file, *extra_opts = NULL;
-	char *ns;
+	cleanup_free char *ns = NULL;
 
 	ns = xstrdup(ptr);
 	if (ns == NULL)
@@ -648,12 +650,6 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "prev-images-dir", required_argument, 0, 1053 },
 		{ "ms", no_argument, 0, 1054 },
 		BOOL_OPT("track-mem", &opts.track_mem),
-		{ "page-state-dir", optional_argument, 0, 2101 },
-		//BOOL_OPT("live-migration", &opts.live_migration),
-		/*{ "live-migration", optional_argument, 0, 2101 },
-		{ "pageState-file", required_argument, 0, 2102 },
-		{ "pageCategory-file", required_argument, 0, 2103 },
-		{ "systemState-file", required_argument, 0, 2104 },*/
 		BOOL_OPT("auto-dedup", &opts.auto_dedup),
 		{ "libdir", required_argument, 0, 'L' },
 		{ "cpu-cap", optional_argument, 0, 1057 },
@@ -702,12 +698,19 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "cgroup-yard", required_argument, 0, 1096 },
 		{ "pre-dump-mode", required_argument, 0, 1097 },
 		{ "file-validation", required_argument, 0, 1098 },
+		BOOL_OPT("skip-file-rwx-check", &opts.skip_file_rwx_check),
 		{ "lsm-mount-context", required_argument, 0, 1099 },
 		{ "network-lock", required_argument, 0, 1100 },
+		BOOL_OPT("mntns-compat-mode", &opts.mntns_compat_mode),
+		BOOL_OPT("unprivileged", &opts.unprivileged),
+		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		{},
 	};
 
 #undef BOOL_OPT
+
+	if (argv && argv[0])
+		SET_CHAR_OPTS(argv_0, argv[0]);
 
 	ret = pre_parse(argc, argv, usage_error, &no_default_config, &cfg_file);
 
@@ -758,7 +761,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		 */
 		if (!opt)
 			continue;
-		pr_info("lsh opt = %d\n",opt);
+
 		switch (opt) {
 		case 's':
 			opts.final_state = TASK_STOPPED;
@@ -1034,24 +1037,13 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 				opts.network_lock_method = NETWORK_LOCK_IPTABLES;
 			} else if (!strcmp("nftables", optarg)) {
 				opts.network_lock_method = NETWORK_LOCK_NFTABLES;
+			} else if (!strcmp("skip", optarg) || !strcmp("none", optarg)) {
+				opts.network_lock_method = NETWORK_LOCK_SKIP;
 			} else {
 				pr_err("Invalid value for --network-lock: %s\n", optarg);
 				return 1;
 			}
 			break;
-		case 2101:
-			opts.live_migration = 1;
-			SET_CHAR_OPTS(pageState_dir, optarg);
-			break;
-		/* case 2102:
-			SET_CHAR_OPTS(pageState_file, optarg);
-			break;
-		case 2103:
-			SET_CHAR_OPTS(pageCategory_file, optarg);
-			break;
-		case 2104:
-			SET_CHAR_OPTS(systemState_file, optarg);
-			break; */
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);
 			if (strcmp(CRIU_GITID, "0"))
@@ -1082,9 +1074,6 @@ bad_arg:
 
 int check_options(void)
 {
-	struct stat statbuf;
-	char *fullPath;
-	int needed;
 	if (opts.tcp_established_ok)
 		pr_info("Will dump/restore TCP connections\n");
 	if (opts.tcp_skip_in_flight)
@@ -1094,7 +1083,7 @@ int check_options(void)
 	if (opts.link_remap_ok)
 		pr_info("Will allow link remaps on FS\n");
 	if (opts.weak_sysctls)
-		pr_info("Will skip non-existant sysctls on restore\n");
+		pr_info("Will skip non-existent sysctls on restore\n");
 
 	if (opts.deprecated_ok)
 		pr_info("Turn deprecated stuff ON\n");
@@ -1126,54 +1115,25 @@ int check_options(void)
 	}
 #endif
 
+	if (opts.mntns_compat_mode && opts.mode != CR_RESTORE) {
+		pr_err("Option --mntns-compat-mode is only valid on restore\n");
+		return 1;
+	} else if (!opts.mntns_compat_mode && opts.mode == CR_RESTORE) {
+		if (check_mount_v2()) {
+			pr_debug("Mount engine fallback to --mntns-compat-mode mode\n");
+			opts.mntns_compat_mode = true;
+		}
+	}
+
+	if (opts.track_mem && !kdat.has_dirty_track) {
+		pr_err("Tracking memory is not available. Consider omitting --track-mem option.\n");
+		return 1;
+	}
+
 	if (check_namespace_opts()) {
 		pr_err("Error: namespace flags conflict\n");
 		return 1;
 	}
-	if(opts.live_migration){
-		pr_info("Will live migration\n");
-		if(stat(opts.pageState_dir,&statbuf) != 0){
-			pr_err("Error: can't open %s\n",opts.pageState_dir);
-			return 1;
-		}
-		if(!S_ISDIR(statbuf.st_mode)){
-			pr_err("Error: %s is not a dictory\n",opts.pageState_dir);
-			return 1;
-		}
-		//opts.pageCategory_file 
-		//SET_CHAR_OPTS(pageCategory_file ,"");
-		needed = snprintf(NULL, 0, "%s/pageCategory.csv", opts.pageState_dir) + 1; // +1 for '\0'
-		fullPath = malloc(needed);
-		if (fullPath == NULL) {
-			pr_err("Error:  malloc pageCategory_file \n");
-			return 1;
-    	}
-    	snprintf(fullPath, needed, "%s/pageCategory.csv", opts.pageState_dir);
-		SET_CHAR_OPTS(pageCategory_file ,fullPath);
-		free(fullPath);
-		
-		needed = snprintf(NULL, 0, "%s/pageState.csv", opts.pageState_dir) + 1; // +1 for '\0'
-		fullPath = malloc(needed);
-		if (fullPath == NULL) {
-			pr_err("Error:  malloc pageState_file \n");
-			return 1;
-    	}
-    	snprintf(fullPath, needed, "%s/pageState.csv", opts.pageState_dir);
-		SET_CHAR_OPTS(pageState_file ,fullPath);
-		free(fullPath);
-		//opts.systemState_file
-		needed = snprintf(NULL, 0, "%s/systemState.csv", opts.pageState_dir) + 1; // +1 for '\0'
-		fullPath = malloc(needed);
-		if (fullPath == NULL) {
-			pr_err("Error:  malloc systemState_file \n");
-			return 1;
-    	}
-		 // 构建完整路径
-    	snprintf(fullPath, needed, "%s/systemState.csv", opts.pageState_dir);
-		SET_CHAR_OPTS(systemState_file ,fullPath);
-		free(fullPath);
-		
-	}
-	
+
 	return 0;
 }

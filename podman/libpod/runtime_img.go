@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -14,9 +13,9 @@ import (
 	"github.com/containers/buildah/imagebuildah"
 	"github.com/containers/common/libimage"
 	"github.com/containers/image/v5/docker/reference"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/sirupsen/logrus"
 )
 
@@ -106,7 +105,7 @@ func (r *Runtime) IsExternalContainerCallback(_ context.Context) libimage.IsExte
 	}
 }
 
-// newBuildEvent creates a new event based on completion of a built image
+// newImageBuildCompleteEvent creates a new event based on completion of a built image
 func (r *Runtime) newImageBuildCompleteEvent(idOrName string) {
 	e := events.NewEvent(events.Build)
 	e.Type = events.Image
@@ -121,6 +120,8 @@ func (r *Runtime) Build(ctx context.Context, options buildahDefine.BuildOptions,
 	if options.Runtime == "" {
 		options.Runtime = r.GetOCIRuntimePath()
 	}
+	options.NoPivotRoot = r.config.Engine.NoPivotRoot
+
 	// share the network interface between podman and buildah
 	options.NetworkInterface = r.network
 	id, ref, err := imagebuildah.BuildDockerfiles(ctx, r.store, options, dockerfiles...)

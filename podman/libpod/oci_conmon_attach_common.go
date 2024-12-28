@@ -1,11 +1,8 @@
 //go:build !remote && (linux || freebsd)
-// +build !remote
-// +build linux freebsd
 
 package libpod
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,8 +14,8 @@ import (
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/common/pkg/detach"
 	"github.com/containers/common/pkg/resize"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/errorhandling"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/errorhandling"
 	"github.com/moby/term"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -34,8 +31,9 @@ const (
 // Attach to the given container.
 // Does not check if state is appropriate.
 // started is only required if startContainer is true.
+// It does not wait for the container to be healthy, it is the caller responsibility to do so.
 func (r *ConmonOCIRuntime) Attach(c *Container, params *AttachOptions) error {
-	passthrough := c.LogDriver() == define.PassthroughLogging
+	passthrough := c.LogDriver() == define.PassthroughLogging || c.LogDriver() == define.PassthroughTTYLogging
 
 	if params == nil || params.Streams == nil {
 		return fmt.Errorf("must provide parameters to Attach: %w", define.ErrInternal)
@@ -88,11 +86,12 @@ func (r *ConmonOCIRuntime) Attach(c *Container, params *AttachOptions) error {
 	// If starting was requested, start the container and notify when that's
 	// done.
 	if params.Start {
-		if err := c.start(context.TODO()); err != nil {
+		if err := c.start(); err != nil {
 			return err
 		}
 		params.Started <- true
 	}
+	close(params.Started)
 
 	if passthrough {
 		return nil

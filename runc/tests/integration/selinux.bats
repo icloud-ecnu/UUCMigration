@@ -38,16 +38,7 @@ function teardown() {
 	[ "$status" -eq 0 ]
 }
 
-# https://github.com/opencontainers/runc/issues/4057
 @test "runc run (custom selinux label)" {
-	update_config '	  .process.selinuxLabel |= "system_u:system_r:container_t:s0:c4,c5"
-			| .process.args = ["/bin/true"]'
-	runc run tst
-	[ "$status" -eq 0 ]
-}
-
-@test "runc run (custom selinux label, RUNC_DMZ=legacy)" {
-	export RUNC_DMZ=legacy
 	update_config '	  .process.selinuxLabel |= "system_u:system_r:container_t:s0:c4,c5"
 			| .process.args = ["/bin/true"]'
 	runc run tst

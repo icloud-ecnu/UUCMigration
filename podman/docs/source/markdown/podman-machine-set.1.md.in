@@ -15,6 +15,8 @@ then the settings will be applied to `podman-machine-default`.
 
 Rootless only.
 
+Default Podman machine settings can be set via the [machine] section in the containers.conf(5) file.
+
 ## OPTIONS
 
 #### **--cpus**=*number*
@@ -70,30 +72,30 @@ devices with the same vendor product value, the first available device is assign
 
 ## EXAMPLES
 
-To switch the default VM `podman-machine-default` from rootless to rootful:
+To switch the default Podman machine from rootless to rootful:
 
 ```
 $ podman machine set --rootful
 ```
 
-or more explicitly:
+or more explicitly set with value true.
 
 ```
 $ podman machine set --rootful=true
 ```
 
-To switch the default VM `podman-machine-default` from rootful to rootless:
+Switch the default Podman machine from rootful to rootless.
 ```
 $ podman machine set --rootful=false
 ```
 
-To switch the VM `myvm` from rootless to rootful:
+Switch the specified Podman machine from rootless to rootful.
 ```
 $ podman machine set --rootful myvm
 ```
 
 ## SEE ALSO
-**[podman(1)](podman.1.md)**, **[podman-machine(1)](podman-machine.1.md)**
+**[podman(1)](podman.1.md)**, **[podman-machine(1)](podman-machine.1.md)**, **containers.conf(5)**
 
 ## HISTORY
 February 2022, Originally compiled by Jason Greene <jason.greene@redhat.com>

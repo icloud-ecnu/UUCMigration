@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -10,41 +9,39 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/config"
-	cutil "github.com/containers/common/pkg/util"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/annotations"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/env"
-	v1 "github.com/containers/podman/v4/pkg/k8s.io/api/core/v1"
-	"github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/api/resource"
-	v12 "github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/apis/meta/v1"
-	"github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/util/intstr"
-	"github.com/containers/podman/v4/pkg/lookup"
-	"github.com/containers/podman/v4/pkg/namespaces"
-	"github.com/containers/podman/v4/pkg/specgen"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/env"
+	v1 "github.com/containers/podman/v5/pkg/k8s.io/api/core/v1"
+	"github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/api/resource"
+	v12 "github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/containers/podman/v5/pkg/k8s.io/apimachinery/pkg/util/intstr"
+	"github.com/containers/podman/v5/pkg/lookup"
+	"github.com/containers/podman/v5/pkg/namespaces"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
 
 // GenerateForKube takes a slice of libpod containers and generates
 // one v1.Pod description that includes just a single container.
-func GenerateForKube(ctx context.Context, ctrs []*Container, getService, useLongAnnotations, podmanOnly bool) (*v1.Pod, error) {
+func GenerateForKube(ctx context.Context, ctrs []*Container, getService, podmanOnly bool) (*v1.Pod, error) {
 	// Generate the v1.Pod yaml description
-	return simplePodWithV1Containers(ctx, ctrs, getService, useLongAnnotations, podmanOnly)
+	return simplePodWithV1Containers(ctx, ctrs, getService, podmanOnly)
 }
 
 // GenerateForKube takes a slice of libpod containers and generates
 // one v1.Pod description
-func (p *Pod) GenerateForKube(ctx context.Context, getService, useLongAnnotations, podmanOnly bool) (*v1.Pod, []v1.ServicePort, error) {
+func (p *Pod) GenerateForKube(ctx context.Context, getService, podmanOnly bool) (*v1.Pod, []v1.ServicePort, error) {
 	// Generate the v1.Pod yaml description
 	var (
 		ports        []v1.ContainerPort
@@ -74,13 +71,13 @@ func (p *Pod) GenerateForKube(ctx context.Context, getService, useLongAnnotation
 			return nil, servicePorts, err
 		}
 		for _, host := range infraContainer.config.ContainerNetworkConfig.HostAdd {
-			hostSli := strings.SplitN(host, ":", 2)
-			if len(hostSli) != 2 {
+			hostname, ip, hasIP := strings.Cut(host, ":")
+			if !hasIP {
 				return nil, servicePorts, errors.New("invalid hostAdd")
 			}
 			extraHost = append(extraHost, v1.HostAlias{
-				IP:        hostSli[1],
-				Hostnames: []string{hostSli[0]},
+				IP:        ip,
+				Hostnames: []string{hostname},
 			})
 		}
 		ports, err = portMappingToContainerPort(infraContainer.config.PortMappings, getService)
@@ -96,7 +93,7 @@ func (p *Pod) GenerateForKube(ctx context.Context, getService, useLongAnnotation
 		hostUsers = infraContainer.IDMappings().HostUIDMapping && infraContainer.IDMappings().HostGIDMapping
 		infraName = infraContainer.config.Name
 	}
-	pod, err := p.podWithContainers(ctx, allContainers, ports, hostNetwork, hostUsers, getService, useLongAnnotations, podmanOnly, infraName)
+	pod, err := p.podWithContainers(ctx, allContainers, ports, hostNetwork, hostUsers, getService, podmanOnly, infraName)
 	if err != nil {
 		return nil, servicePorts, err
 	}
@@ -236,6 +233,61 @@ func GenerateForKubeDeployment(ctx context.Context, pod *YAMLPod, options entiti
 	return &dep, nil
 }
 
+// GenerateForKubeJob returns a YAMLDeployment from a YAMLPod that is then used to create a kubernetes Job
+// kind YAML.
+func GenerateForKubeJob(ctx context.Context, pod *YAMLPod, options entities.GenerateKubeOptions) (*YAMLJob, error) {
+	// Restart policy for Job cannot be set to Always
+	if options.Type == define.K8sKindJob && pod.Spec.RestartPolicy == v1.RestartPolicyAlways {
+		return nil, fmt.Errorf("k8s Jobs can not have restartPolicy set to Always; only Never and OnFailure policies allowed")
+	}
+
+	// Create label map that will be added to podSpec and Job metadata
+	// The matching label lets the job know which pods to manage
+	appKey := "app"
+	matchLabels := map[string]string{appKey: pod.Name}
+	// Add the key:value (app:pod-name) to the podSpec labels
+	if pod.Labels == nil {
+		pod.Labels = matchLabels
+	} else {
+		pod.Labels[appKey] = pod.Name
+	}
+
+	jobSpec := YAMLJobSpec{
+		Template: &YAMLPodTemplateSpec{
+			PodTemplateSpec: v1.PodTemplateSpec{
+				ObjectMeta: pod.ObjectMeta,
+			},
+			Spec: pod.Spec,
+		},
+	}
+
+	// Set the completions and parallelism to 1 by default for the Job
+	completions, parallelism := int32(1), int32(1)
+	jobSpec.Completions = &completions
+	jobSpec.Parallelism = &parallelism
+	// Set the restart policy to never as k8s requires a job to have a restart policy
+	// of onFailure or never set in the kube yaml
+	jobSpec.Template.Spec.RestartPolicy = v1.RestartPolicyNever
+
+	// Create the Deployment object
+	job := YAMLJob{
+		Job: v1.Job{
+			ObjectMeta: v12.ObjectMeta{
+				Name:              pod.Name + "-job",
+				CreationTimestamp: pod.CreationTimestamp,
+				Labels:            pod.Labels,
+			},
+			TypeMeta: v12.TypeMeta{
+				Kind:       "Job",
+				APIVersion: "batch/v1",
+			},
+		},
+		Spec: &jobSpec,
+	}
+
+	return &job, nil
+}
+
 // GenerateForKube generates a v1.PersistentVolumeClaim from a libpod volume.
 func (v *Volume) GenerateForKube() *v1.PersistentVolumeClaim {
 	annotations := make(map[string]string)
@@ -331,6 +383,15 @@ type YAMLDaemonSetSpec struct {
 	Strategy *v1.DaemonSetUpdateStrategy `json:"strategy,omitempty"`
 }
 
+// YAMLJobSpec represents the same k8s API core JobSpec with a small
+// change and that is having Template as a pointer to YAMLPodTemplateSpec
+// because Go doesn't omit empty struct and we want to omit Strategy and any fields in the Pod YAML
+// if it's empty.
+type YAMLJobSpec struct {
+	v1.JobSpec
+	Template *YAMLPodTemplateSpec `json:"template,omitempty"`
+}
+
 // YAMLDaemonSet represents the same k8s API core DaemonSet with a small change
 // and that is having Spec as a pointer to YAMLDaemonSetSpec and Status as a pointer to
 // k8s API core DaemonSetStatus.
@@ -351,6 +412,12 @@ type YAMLDeployment struct {
 	v1.Deployment
 	Spec   *YAMLDeploymentSpec  `json:"spec,omitempty"`
 	Status *v1.DeploymentStatus `json:"status,omitempty"`
+}
+
+type YAMLJob struct {
+	v1.Job
+	Spec   *YAMLJobSpec  `json:"spec,omitempty"`
+	Status *v1.JobStatus `json:"status,omitempty"`
 }
 
 // YAMLService represents the same k8s API core Service struct with a small
@@ -452,16 +519,6 @@ func newServicePortState() servicePortState {
 	}
 }
 
-func truncateKubeAnnotation(str string, useLongAnnotations bool) string {
-	str = strings.TrimSpace(str)
-	if useLongAnnotations || utf8.RuneCountInString(str) < define.MaxKubeAnnotation {
-		return str
-	}
-	trunc := string([]rune(str)[:define.MaxKubeAnnotation])
-	logrus.Warnf("Truncation Annotation: %q to %q: Kubernetes only allows %d characters", str, trunc, define.MaxKubeAnnotation)
-	return trunc
-}
-
 // containerPortsToServicePorts takes a slice of containerports and generates a
 // slice of service ports
 func (state *servicePortState) containerPortsToServicePorts(containerPorts []v1.ContainerPort) ([]v1.ServicePort, error) {
@@ -508,7 +565,7 @@ func containersToServicePorts(containers []v1.Container) ([]v1.ServicePort, erro
 	return sps, nil
 }
 
-func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, ports []v1.ContainerPort, hostNetwork, hostUsers, getService, useLongAnnotations, podmanOnly bool, infraName string) (*v1.Pod, error) {
+func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, ports []v1.ContainerPort, hostNetwork, hostUsers, getService, podmanOnly bool, infraName string) (*v1.Pod, error) {
 	deDupPodVolumes := make(map[string]*v1.Volume)
 	first := true
 	podContainers := make([]v1.Container, 0, len(containers))
@@ -520,21 +577,51 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 		stopTimeout *uint
 	)
 
+	cfg, err := config.Default()
+	if err != nil {
+		return nil, err
+	}
+
 	// Let's sort the containers in order of created time
 	// This will ensure that the init containers are defined in the correct order in the kube yaml
 	sort.Slice(containers, func(i, j int) bool { return containers[i].CreatedTime().Before(containers[j].CreatedTime()) })
 
 	for _, ctr := range containers {
-		if !ctr.IsInfra() {
+		if ctr.IsInfra() {
+			// If there is an user namespace for the infra container, then register it for the entire pod.
+			if v, found := ctr.config.Spec.Annotations[define.UserNsAnnotation]; found {
+				podAnnotations[define.UserNsAnnotation] = v
+			}
+			_, _, infraDNS, _, err := containerToV1Container(ctx, ctr, getService)
+			if err != nil {
+				return nil, err
+			}
+			if infraDNS != nil {
+				if servers := infraDNS.Nameservers; len(servers) > 0 {
+					dnsInfo.Nameservers = servers
+				}
+				if searches := infraDNS.Searches; len(searches) > 0 {
+					dnsInfo.Searches = searches
+				}
+				if options := infraDNS.Options; len(options) > 0 {
+					dnsInfo.Options = options
+				}
+			}
+			// If the infraName is not the podID-infra, that means the user set another infra name using
+			// --infra-name during pod creation
+			if infraName != "" && infraName != p.ID()[:12]+"-infra" {
+				podAnnotations[define.InfraNameAnnotation] = infraName
+			}
+		} else {
 			for k, v := range ctr.config.Spec.Annotations {
-				if !podmanOnly && (define.IsReservedAnnotation(k) || annotations.IsReservedAnnotation(k)) {
+				if !podmanOnly && (define.IsReservedAnnotation(k)) {
 					continue
 				}
-				podAnnotations[fmt.Sprintf("%s/%s", k, removeUnderscores(ctr.Name()))] = truncateKubeAnnotation(v, useLongAnnotations)
+				podAnnotations[fmt.Sprintf("%s/%s", k, removeUnderscores(ctr.Name()))] = v
 			}
 			// Convert auto-update labels into kube annotations
-			for k, v := range getAutoUpdateAnnotations(ctr.Name(), ctr.Labels(), useLongAnnotations) {
-				podAnnotations[k] = truncateKubeAnnotation(v, useLongAnnotations)
+			for k, v := range getAutoUpdateAnnotations(ctr.Name(), ctr.Labels()) {
+				podAnnotations[k] = v
 			}
 			isInit := ctr.IsInitCtr()
 			// Since hostname is only set at pod level, set the hostname to the hostname of the first container we encounter
@@ -548,7 +635,7 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 
 			// Pick the first container that has a stop-timeout set and use that value
 			// Ignore podman's default
-			if ctr.config.StopTimeout != util.DefaultContainerConfig().Engine.StopTimeout && stopTimeout == nil {
+			if ctr.config.StopTimeout != cfg.Engine.StopTimeout && stopTimeout == nil {
 				stopTimeout = &ctr.config.StopTimeout
 			}
 
@@ -557,7 +644,7 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 				return nil, err
 			}
 			for k, v := range annotations {
-				podAnnotations[define.BindMountPrefix] = truncateKubeAnnotation(k+":"+v, useLongAnnotations)
+				podAnnotations[define.BindMountPrefix] = k + ":" + v
 			}
 			// Since port bindings for the pod are handled by the
 			// infra container, wipe them here only if we are sharing the net namespace
@@ -584,29 +671,7 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 			// Deduplicate volumes, so if containers in the pod share a volume, it's only
 			// listed in the volumes section once
 			for _, vol := range volumes {
-				vol := vol
 				deDupPodVolumes[vol.Name] = &vol
-			}
-		} else {
-			_, _, infraDNS, _, err := containerToV1Container(ctx, ctr, getService)
-			if err != nil {
-				return nil, err
-			}
-			if infraDNS != nil {
-				if servers := infraDNS.Nameservers; len(servers) > 0 {
-					dnsInfo.Nameservers = servers
-				}
-				if searches := infraDNS.Searches; len(searches) > 0 {
-					dnsInfo.Searches = searches
-				}
-				if options := infraDNS.Options; len(options) > 0 {
-					dnsInfo.Options = options
-				}
-			}
-			// If the infraName is not the podID-infra, that means the user set another infra name using
-			// --infra-name during pod creation
-			if infraName != "" && infraName != p.ID()[:12]+"-infra" {
-				podAnnotations[define.InfraNameAnnotation] = truncateKubeAnnotation(infraName, useLongAnnotations)
 			}
 		}
 	}
@@ -675,7 +740,12 @@ func newPodObject(podName string, annotations map[string]string, initCtrs, conta
 
 // simplePodWithV1Containers is a function used by inspect when kube yaml needs to be generated
 // for a single container.  we "insert" that container description in a pod.
-func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getService, useLongAnnotations, podmanOnly bool) (*v1.Pod, error) {
+func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getService, podmanOnly bool) (*v1.Pod, error) {
+	cfg, err := config.Default()
+	if err != nil {
+		return nil, err
+	}
+
 	kubeCtrs := make([]v1.Container, 0, len(ctrs))
 	kubeInitCtrs := []v1.Container{}
 	kubeVolumes := make([]v1.Volume, 0)
@@ -692,15 +762,15 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getServic
 	for _, ctr := range ctrs {
 		ctrNames = append(ctrNames, removeUnderscores(ctr.Name()))
 		for k, v := range ctr.config.Spec.Annotations {
-			if !podmanOnly && (define.IsReservedAnnotation(k) || annotations.IsReservedAnnotation(k)) {
+			if !podmanOnly && define.IsReservedAnnotation(k) {
 				continue
 			}
-			kubeAnnotations[fmt.Sprintf("%s/%s", k, removeUnderscores(ctr.Name()))] = truncateKubeAnnotation(v, useLongAnnotations)
+			kubeAnnotations[fmt.Sprintf("%s/%s", k, removeUnderscores(ctr.Name()))] = v
 		}
 
 		// Convert auto-update labels into kube annotations
-		for k, v := range getAutoUpdateAnnotations(ctr.Name(), ctr.Labels(), useLongAnnotations) {
-			kubeAnnotations[k] = truncateKubeAnnotation(v, useLongAnnotations)
+		for k, v := range getAutoUpdateAnnotations(ctr.Name(), ctr.Labels()) {
+			kubeAnnotations[k] = v
 		}
 
 		isInit := ctr.IsInitCtr()
@@ -715,7 +785,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getServic
 
 		// Pick the first container that has a stop-timeout set and use that value
 		// Ignore podman's default
-		if ctr.config.StopTimeout != util.DefaultContainerConfig().Engine.StopTimeout && stopTimeout == nil {
+		if ctr.config.StopTimeout != cfg.Engine.StopTimeout && stopTimeout == nil {
 			stopTimeout = &ctr.config.StopTimeout
 		}
 
@@ -726,11 +796,11 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getServic
 
 		if ctr.config.Spec.Process != nil {
 			var ulimitArr []string
-			defaultUlimits := util.DefaultContainerConfig().Ulimits()
+			defaultUlimits := cfg.Ulimits()
 			for _, ulimit := range ctr.config.Spec.Process.Rlimits {
 				finalUlimit := strings.ToLower(strings.ReplaceAll(ulimit.Type, "RLIMIT_", "")) + "=" + strconv.Itoa(int(ulimit.Soft)) + ":" + strconv.Itoa(int(ulimit.Hard))
 				// compare ulimit with default list so we don't add it twice
-				if cutil.StringInSlice(finalUlimit, defaultUlimits) {
+				if slices.Contains(defaultUlimits, finalUlimit) {
 					continue
 				}
 
@@ -753,7 +823,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getServic
 			return nil, err
 		}
 		for k, v := range annotations {
-			kubeAnnotations[define.BindMountPrefix] = truncateKubeAnnotation(k+":"+v, useLongAnnotations)
+			kubeAnnotations[define.BindMountPrefix] = k + ":" + v
 		}
 		if isInit {
 			kubeInitCtrs = append(kubeInitCtrs, kubeCtr)
@@ -769,7 +839,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getServic
 					podDNS.Nameservers = make([]string, 0)
 				}
 				for _, s := range servers {
-					if !cutil.StringInSlice(s, podDNS.Nameservers) { // only append if it does not exist
+					if !slices.Contains(podDNS.Nameservers, s) { // only append if it does not exist
 						podDNS.Nameservers = append(podDNS.Nameservers, s)
 					}
 				}
@@ -780,7 +850,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getServic
 					podDNS.Searches = make([]string, 0)
 				}
 				for _, d := range domains {
-					if !cutil.StringInSlice(d, podDNS.Searches) { // only append if it does not exist
+					if !slices.Contains(podDNS.Searches, d) { // only append if it does not exist
 						podDNS.Searches = append(podDNS.Searches, d)
 					}
 				}
@@ -797,7 +867,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container, getServic
 	podName := removeUnderscores(ctrs[0].Name())
 	// Check if the pod name and container name will end up conflicting
 	// Append -pod if so
-	if cutil.StringInSlice(podName, ctrNames) {
+	if slices.Contains(ctrNames, podName) {
 		podName += "-pod"
 	}
 
@@ -1002,10 +1072,10 @@ func containerToV1Container(ctx context.Context, c *Container, getService bool) 
 		dnsOptions := make([]v1.PodDNSConfigOption, 0)
 		for _, option := range options {
 			// the option can be "k:v" or just "k", no delimiter is required
-			opts := strings.SplitN(option, ":", 2)
+			name, value, _ := strings.Cut(option, ":")
 			dnsOpt := v1.PodDNSConfigOption{
-				Name:  opts[0],
-				Value: &opts[1],
+				Name:  name,
+				Value: &value,
 			}
 			dnsOptions = append(dnsOptions, dnsOpt)
 		}
@@ -1056,23 +1126,23 @@ func libpodEnvVarsToKubeEnvVars(envs []string, imageEnvs []string) ([]v1.EnvVar,
 	envVars := make([]v1.EnvVar, 0, len(envs))
 	imageMap := make(map[string]string, len(imageEnvs))
 	for _, ie := range imageEnvs {
-		split := strings.SplitN(ie, "=", 2)
-		imageMap[split[0]] = split[1]
+		key, val, _ := strings.Cut(ie, "=")
+		imageMap[key] = val
 	}
 	for _, e := range envs {
-		split := strings.SplitN(e, "=", 2)
-		if len(split) != 2 {
+		envName, envValue, hasValue := strings.Cut(e, "=")
+		if !hasValue {
 			return envVars, fmt.Errorf("environment variable %s is malformed; should be key=value", e)
 		}
-		if defaultEnv[split[0]] == split[1] {
+		if defaultEnv[envName] == envValue {
 			continue
 		}
-		if imageMap[split[0]] == split[1] {
+		if imageMap[envName] == envValue {
 			continue
 		}
 		ev := v1.EnvVar{
-			Name:  split[0],
-			Value: split[1],
+			Name:  envName,
+			Value: envValue,
 		}
 		envVars = append(envVars, ev)
 	}
@@ -1115,17 +1185,18 @@ func libpodMountsToKubeVolumeMounts(c *Container) ([]v1.VolumeMount, []v1.Volume
 
 // generateKubePersistentVolumeClaim converts a ContainerNamedVolume to a Kubernetes PersistentVolumeClaim
 func generateKubePersistentVolumeClaim(v *ContainerNamedVolume) (v1.VolumeMount, v1.Volume) {
-	ro := cutil.StringInSlice("ro", v.Options)
+	ro := slices.Contains(v.Options, "ro")
 
 	// To avoid naming conflicts with any host path mounts, add a unique suffix to the volume's name.
-	name := v.Name + "-pvc"
+	vName := strings.ToLower(v.Name)
+	name := vName + "-pvc"
 
 	vm := v1.VolumeMount{}
 	vm.Name = name
 	vm.MountPath = v.Dest
 	vm.ReadOnly = ro
 
-	pvc := v1.PersistentVolumeClaimVolumeSource{ClaimName: v.Name, ReadOnly: ro}
+	pvc := v1.PersistentVolumeClaimVolumeSource{ClaimName: vName, ReadOnly: ro}
 	vs := v1.VolumeSource{}
 	vs.PersistentVolumeClaim = &pvc
 	vo := v1.Volume{Name: name, VolumeSource: vs}
@@ -1176,7 +1247,7 @@ func generateKubeVolumeMount(m specs.Mount) (v1.VolumeMount, v1.Volume, error) {
 	}
 	vm.Name = name
 	vm.MountPath = m.Destination
-	if cutil.StringInSlice("ro", m.Options) {
+	if slices.Contains(m.Options, "ro") {
 		vm.ReadOnly = true
 	}
 
@@ -1204,7 +1275,7 @@ func convertVolumePathToName(hostSourcePath string) (string, error) {
 	}
 	// First, trim trailing slashes, then replace slashes with dashes.
 	// Thus, /mnt/data/ will become mnt-data
-	return strings.ReplaceAll(strings.Trim(hostSourcePath, "/"), "/", "-"), nil
+	return strings.ToLower(strings.ReplaceAll(strings.Trim(hostSourcePath, "/"), "/", "-")), nil
 }
 
 func determineCapAddDropFromCapabilities(defaultCaps, containerCaps []string) *v1.Capabilities {
@@ -1217,7 +1288,7 @@ func determineCapAddDropFromCapabilities(defaultCaps, containerCaps []string) *v
 	// Find caps in the defaultCaps but not in the container's
 	// those indicate a dropped cap
 	for _, capability := range defaultCaps {
-		if !cutil.StringInSlice(capability, containerCaps) {
+		if !slices.Contains(containerCaps, capability) {
 			if _, ok := dedupDrop[capability]; !ok {
 				drop = append(drop, v1.Capability(capability))
 				dedupDrop[capability] = true
@@ -1227,7 +1298,7 @@ func determineCapAddDropFromCapabilities(defaultCaps, containerCaps []string) *v
 	// Find caps in the container but not in the defaults; those indicate
 	// an added cap
 	for _, capability := range containerCaps {
-		if !cutil.StringInSlice(capability, defaultCaps) {
+		if !slices.Contains(defaultCaps, capability) {
 			if _, ok := dedupAdd[capability]; !ok {
 				add = append(add, v1.Capability(capability))
 				dedupAdd[capability] = true
@@ -1287,25 +1358,22 @@ func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, bool, error
 	var selinuxOpts v1.SELinuxOptions
 	selinuxHasData := false
 	for _, label := range strings.Split(c.config.Spec.Annotations[define.InspectAnnotationLabel], ",label=") {
-		opts := strings.SplitN(label, ":", 2)
-		switch len(opts) {
-		case 2:
-			switch opts[0] {
+		opt, val, hasVal := strings.Cut(label, ":")
+		if hasVal {
+			switch opt {
 			case "filetype":
-				selinuxOpts.FileType = opts[1]
+				selinuxOpts.FileType = val
 				selinuxHasData = true
 			case "type":
-				selinuxOpts.Type = opts[1]
+				selinuxOpts.Type = val
 				selinuxHasData = true
 			case "level":
-				selinuxOpts.Level = opts[1]
+				selinuxOpts.Level = val
 				selinuxHasData = true
 			}
-		case 1:
-			if opts[0] == "disable" {
-				selinuxOpts.Type = "spc_t"
-				selinuxHasData = true
-			}
+		} else if opt == "disable" {
+			selinuxOpts.Type = "spc_t"
+			selinuxHasData = true
 		}
 	}
 	if selinuxHasData {
@@ -1324,7 +1392,7 @@ func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, bool, error
 		scHasData = true
 		sc.ReadOnlyRootFilesystem = &ro
 	}
-	if c.config.Spec.Linux.MaskedPaths == nil {
+	if c.config.Spec.Linux != nil && c.config.Spec.Linux.MaskedPaths == nil {
 		scHasData = true
 		unmask := v1.UnmaskedProcMount
 		sc.ProcMount = &unmask
@@ -1388,7 +1456,7 @@ func removeUnderscores(s string) string {
 
 // getAutoUpdateAnnotations searches for auto-update container labels
 // and returns them as kube annotations
-func getAutoUpdateAnnotations(ctrName string, ctrLabels map[string]string, useLongAnnotations bool) map[string]string {
+func getAutoUpdateAnnotations(ctrName string, ctrLabels map[string]string) map[string]string {
 	autoUpdateLabel := "io.containers.autoupdate"
 	annotations := make(map[string]string)
 
@@ -1398,7 +1466,7 @@ func getAutoUpdateAnnotations(ctrName string, ctrLabels map[string]string, useLo
 			// since labels can variate between containers within a pod, they will be
 			// identified with the container name when converted into kube annotations
 			kc := fmt.Sprintf("%s/%s", k, ctrName)
-			annotations[kc] = truncateKubeAnnotation(v, useLongAnnotations)
+			annotations[kc] = v
 		}
 	}
 

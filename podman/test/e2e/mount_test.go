@@ -1,7 +1,9 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -59,10 +61,9 @@ var _ = Describe("Podman mount", func() {
 		Expect(j).Should(ExitCleanly())
 		Expect(j.OutputToString()).To(BeValidJSON())
 
-		j = podmanTest.Podman([]string{"mount", "--format='{{.foobar}}'"})
+		j = podmanTest.Podman([]string{"mount", "--format={{.foobar}}"})
 		j.WaitWithDefaultTimeout()
-		Expect(j).To(ExitWithError())
-		Expect(j.ErrorToString()).To(ContainSubstring("unknown --format"))
+		Expect(j).To(ExitWithError(125, `unknown --format argument: "{{.foobar}}"`))
 
 		umount := podmanTest.Podman([]string{"umount", cid})
 		umount.WaitWithDefaultTimeout()
@@ -179,9 +180,7 @@ var _ = Describe("Podman mount", func() {
 		Expect(lmount).Should(ExitCleanly())
 		Expect(lmount.OutputToString()).To(ContainSubstring(cid))
 
-		stop := podmanTest.Podman([]string{"stop", cid})
-		stop.WaitWithDefaultTimeout()
-		Expect(stop).Should(ExitCleanly())
+		podmanTest.StopContainer(cid)
 
 		lmount = podmanTest.Podman([]string{"mount", "--no-trunc"})
 		lmount.WaitWithDefaultTimeout()

@@ -8,10 +8,10 @@ import (
 	"github.com/containers/common/pkg/auth"
 	"github.com/containers/common/pkg/completion"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/cmd/podman/common"
-	"github.com/containers/podman/v4/cmd/podman/registry"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/cmd/podman/common"
+	"github.com/containers/podman/v5/cmd/podman/registry"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/spf13/cobra"
 )
 
@@ -111,6 +111,13 @@ func pushFlags(cmd *cobra.Command) {
 	flags.BoolVarP(&pushOptions.Quiet, "quiet", "q", false, "Suppress output information when pushing images")
 	flags.BoolVar(&pushOptions.RemoveSignatures, "remove-signatures", false, "Discard any pre-existing signatures in the image")
 
+	retryFlagName := "retry"
+	flags.Uint(retryFlagName, registry.RetryDefault(), "number of times to retry in case of failure when performing push")
+	_ = cmd.RegisterFlagCompletionFunc(retryFlagName, completion.AutocompleteNone)
+	retryDelayFlagName := "retry-delay"
+	flags.String(retryDelayFlagName, registry.RetryDelayDefault(), "delay between retries in case of push failures")
+	_ = cmd.RegisterFlagCompletionFunc(retryDelayFlagName, completion.AutocompleteNone)
+
 	signByFlagName := "sign-by"
 	flags.StringVar(&pushOptions.SignBy, signByFlagName, "", "Add a signature at the destination using the specified key")
 	_ = cmd.RegisterFlagCompletionFunc(signByFlagName, completion.AutocompleteNone)
@@ -138,7 +145,7 @@ func pushFlags(cmd *cobra.Command) {
 	_ = cmd.RegisterFlagCompletionFunc(compLevel, completion.AutocompleteNone)
 
 	encryptionKeysFlagName := "encryption-key"
-	flags.StringSliceVar(&pushOptions.EncryptionKeys, encryptionKeysFlagName, nil, "Key with the encryption protocol to use to encrypt the image (e.g. jwe:/path/to/key.pem)")
+	flags.StringArrayVar(&pushOptions.EncryptionKeys, encryptionKeysFlagName, nil, "Key with the encryption protocol to use to encrypt the image (e.g. jwe:/path/to/key.pem)")
 	_ = cmd.RegisterFlagCompletionFunc(encryptionKeysFlagName, completion.AutocompleteDefault)
 
 	encryptLayersFlagName := "encrypt-layer"
@@ -155,10 +162,10 @@ func pushFlags(cmd *cobra.Command) {
 		_ = flags.MarkHidden(signPassphraseFileFlagName)
 		_ = flags.MarkHidden(encryptionKeysFlagName)
 		_ = flags.MarkHidden(encryptLayersFlagName)
-	}
-	if !registry.IsRemote() {
-		flags.StringVar(&pushOptions.SignaturePolicy, "signature-policy", "", "Path to a signature-policy file")
-		_ = flags.MarkHidden("signature-policy")
+	} else {
+		signaturePolicyFlagName := "signature-policy"
+		flags.StringVar(&pushOptions.SignaturePolicy, signaturePolicyFlagName, "", "Path to a signature-policy file")
+		_ = flags.MarkHidden(signaturePolicyFlagName)
 	}
 }
 
@@ -208,6 +215,24 @@ func imagePush(cmd *cobra.Command, args []string) error {
 	pushOptions.OciEncryptConfig = encConfig
 	pushOptions.OciEncryptLayers = encLayers
 
+	if cmd.Flags().Changed("retry") {
+		retry, err := cmd.Flags().GetUint("retry")
+		if err != nil {
+			return err
+		}
+
+		pushOptions.Retry = &retry
+	}
+
+	if cmd.Flags().Changed("retry-delay") {
+		val, err := cmd.Flags().GetString("retry-delay")
+		if err != nil {
+			return err
+		}
+
+		pushOptions.RetryDelay = val
+	}
+
 	if cmd.Flags().Changed("compression-level") {
 		val, err := cmd.Flags().GetInt("compression-level")
 		if err != nil {
@@ -232,7 +257,7 @@ func imagePush(cmd *cobra.Command, args []string) error {
 	}
 
 	if pushOptions.DigestFile != "" {
-		if err := os.WriteFile(pushOptions.DigestFile, []byte(report.ManifestDigest), 0644); err != nil {
+		if err := os.WriteFile(pushOptions.DigestFile, []byte(report.ManifestDigest), 0o644); err != nil {
 			return err
 		}
 	}

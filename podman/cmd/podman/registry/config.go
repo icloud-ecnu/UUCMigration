@@ -8,9 +8,10 @@ import (
 	"sync"
 
 	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/util"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/util"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -72,7 +73,7 @@ func containersConfModules() ([]string, error) {
 	fs.ParseErrorsWhitelist.UnknownFlags = true
 	fs.Usage = func() {}
 	fs.SetInterspersed(false)
-	fs.StringSliceVar(&modules, "module", nil, "")
+	fs.StringArrayVar(&modules, "module", nil, "")
 	fs.BoolP("help", "h", false, "") // Need a fake help flag to avoid the `pflag: help requested` error
 	return modules, fs.Parse(os.Args[index:])
 }
@@ -134,7 +135,7 @@ func setXdgDirs() error {
 
 	// Set up XDG_RUNTIME_DIR
 	if _, found := os.LookupEnv("XDG_RUNTIME_DIR"); !found {
-		dir, err := util.GetRuntimeDir()
+		dir, err := util.GetRootlessRuntimeDir()
 		if err != nil {
 			return err
 		}
@@ -145,7 +146,7 @@ func setXdgDirs() error {
 
 	if _, found := os.LookupEnv("DBUS_SESSION_BUS_ADDRESS"); !found {
 		sessionAddr := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "bus")
-		if _, err := os.Stat(sessionAddr); err == nil {
+		if err := fileutils.Exists(sessionAddr); err == nil {
 			sessionAddr, err = filepath.EvalSymlinks(sessionAddr)
 			if err != nil {
 				return err
@@ -165,4 +166,20 @@ func setXdgDirs() error {
 		}
 	}
 	return nil
+}
+
+func RetryDefault() uint {
+	if IsRemote() {
+		return 0
+	}
+
+	return PodmanConfig().ContainersConfDefaultsRO.Engine.Retry
+}
+
+func RetryDelayDefault() string {
+	if IsRemote() {
+		return ""
+	}
+
+	return PodmanConfig().ContainersConfDefaultsRO.Engine.RetryDelay
 }

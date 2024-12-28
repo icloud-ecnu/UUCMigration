@@ -1,10 +1,11 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "github.com/onsi/gomega/gexec"
 )
 
 var _ = Describe("Podman pod kill", func() {
@@ -12,7 +13,11 @@ var _ = Describe("Podman pod kill", func() {
 	It("podman pod kill bogus", func() {
 		session := podmanTest.Podman([]string{"pod", "kill", "foobar"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		expect := "no pod with name or ID foobar found: no such pod"
+		if IsRemote() {
+			expect = `unable to find pod "foobar": no such pod`
+		}
+		Expect(session).To(ExitWithError(125, expect))
 	})
 
 	It("podman pod kill a pod by id", func() {
@@ -71,7 +76,7 @@ var _ = Describe("Podman pod kill", func() {
 
 		result := podmanTest.Podman([]string{"pod", "kill", "-s", "bogus", "test1"})
 		result.WaitWithDefaultTimeout()
-		Expect(result).Should(Exit(125))
+		Expect(result).Should(ExitWithError(125, "invalid signal: bogus"))
 		Expect(podmanTest.NumberOfContainersRunning()).To(Equal(1))
 	})
 

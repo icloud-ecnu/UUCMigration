@@ -1,19 +1,15 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/libpod/define"
 	"github.com/containers/storage"
 	"github.com/sirupsen/logrus"
 	bolt "go.etcd.io/bbolt"
@@ -103,7 +99,7 @@ type dbConfigValidation struct {
 // configuration of the runtime opening it
 // If there is no runtime configuration loaded, load our own
 func checkRuntimeConfig(db *bolt.DB, rt *Runtime) error {
-	storeOpts, err := storage.DefaultStoreOptions(rootless.IsRootless(), rootless.GetRootlessUID())
+	storeOpts, err := storage.DefaultStoreOptions()
 	if err != nil {
 		return err
 	}
@@ -239,20 +235,18 @@ func readOnlyValidateConfig(bucket *bolt.Bucket, toCheck dbConfigValidation) (bo
 	// which is symlinked to /var/home.
 	if toCheck.isPath {
 		if dbValue != "" {
-			// Ignore ENOENT on both, on a fresh system some paths
-			// may not exist this early in Libpod init.
-			dbVal, err := filepath.EvalSymlinks(dbValue)
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			checkedVal, err := evalSymlinksIfExists(dbValue)
+			if err != nil {
 				return false, fmt.Errorf("evaluating symlinks on DB %s path %q: %w", toCheck.name, dbValue, err)
 			}
-			dbValue = dbVal
+			dbValue = checkedVal
 		}
 		if ourValue != "" {
-			ourVal, err := filepath.EvalSymlinks(ourValue)
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			checkedVal, err := evalSymlinksIfExists(ourValue)
+			if err != nil {
 				return false, fmt.Errorf("evaluating symlinks on configured %s path %q: %w", toCheck.name, ourValue, err)
 			}
-			ourValue = ourVal
+			ourValue = checkedVal
 		}
 	}
 

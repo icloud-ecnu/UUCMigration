@@ -3,15 +3,17 @@
 #include <signal.h>
 #include <linux/limits.h>
 #include <linux/capability.h>
-#include <sys/mount.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
 #include <sys/uio.h>
+
+#include "linux/rseq.h"
 
 #include "common/config.h"
 #include "int.h"
 #include "types.h"
 #include <compel/plugins/std/syscall.h>
+#include "linux/mount.h"
 #include "parasite.h"
 #include "fcntl.h"
 #include "prctl.h"
@@ -167,6 +169,7 @@ static int dump_posix_timers(struct parasite_dump_posix_timers_args *args)
 }
 
 static int dump_creds(struct parasite_dump_creds *args);
+static int check_rseq(struct parasite_check_rseq *rseq);
 
 static int dump_thread_common(struct parasite_dump_thread *ti)
 {
@@ -197,9 +200,72 @@ static int dump_thread_common(struct parasite_dump_thread *ti)
 		goto out;
 	}
 
+	ret = check_rseq(&ti->rseq);
+	if (ret) {
+		pr_err("Unable to check if rseq() is initialized: %d\n", ret);
+		goto out;
+	}
+
 	ret = dump_creds(ti->creds);
 out:
 	return ret;
+}
+
+/*
+ * Returns a membarrier() registration command (it is a bitmask) if the process
+ * was registered for specified (as a bit index) membarrier()-issuing command;
+ * returns zero otherwise.
+ */
+static int get_membarrier_registration_mask(int cmd_bit)
+{
+	unsigned cmd = 1 << cmd_bit;
+	int ret;
+
+	/*
+	 * Issuing a barrier will be successful only if the process was registered
+	 * for this type of membarrier. All errors are a sign that the type issued
+	 * was not registered (EPERM) or not supported by kernel (EINVAL or ENOSYS).
+	 */
+	ret = sys_membarrier(cmd, 0, 0);
+	if (ret && ret != -EPERM && ret != -EINVAL && ret != -ENOSYS) {
+		pr_err("membarrier(1 << %d) returned %d\n", cmd_bit, ret);
+		return -1;
+	}
+	pr_debug("membarrier(1 << %d) returned %d\n", cmd_bit, ret);
+	/*
+	 * For supported registrations, MEMBARRIER_CMD_REGISTER_xxx = MEMBARRIER_CMD_xxx << 1.
+	 * See: enum membarrier_cmd in include/uapi/linux/membarrier.h in kernel sources.
+	 */
+	return ret ? 0 : cmd << 1;
+}
+
+/*
+ * It would be better to check the following with BUILD_BUG_ON, but we might
+ * have an old linux/membarrier.h header without necessary enum values.
+ */
+#define MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED	      3
+#define MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_SYNC_CORE 5
+#define MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_RSEQ      7
+#define MEMBARRIER_CMDBIT_GET_REGISTRATIONS	      9
+
+static int dump_membarrier_compat(int *membarrier_registration_mask)
+{
+	int ret;
+
+	*membarrier_registration_mask = 0;
+	ret = get_membarrier_registration_mask(MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED);
+	if (ret < 0)
+		return -1;
+	*membarrier_registration_mask |= ret;
+	ret = get_membarrier_registration_mask(MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_SYNC_CORE);
+	if (ret < 0)
+		return -1;
+	*membarrier_registration_mask |= ret;
+	ret = get_membarrier_registration_mask(MEMBARRIER_CMDBIT_PRIVATE_EXPEDITED_RSEQ);
+	if (ret < 0)
+		return -1;
+	*membarrier_registration_mask |= ret;
+	return 0;
 }
 
 static int dump_misc(struct parasite_dump_misc *args)
@@ -215,6 +281,19 @@ static int dump_misc(struct parasite_dump_misc *args)
 	sys_umask(args->umask); /* never fails */
 	args->dumpable = sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
 	args->thp_disabled = sys_prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+
+	if (args->has_membarrier_get_registrations) {
+		ret = sys_membarrier(1 << MEMBARRIER_CMDBIT_GET_REGISTRATIONS, 0, 0);
+		if (ret < 0) {
+			pr_err("membarrier(1 << %d) returned %d\n", MEMBARRIER_CMDBIT_GET_REGISTRATIONS, ret);
+			return -1;
+		}
+		args->membarrier_registration_mask = ret;
+	} else {
+		ret = dump_membarrier_compat(&args->membarrier_registration_mask);
+		if (ret)
+			return ret;
+	}
 
 	ret = sys_prctl(PR_GET_CHILD_SUBREAPER, (unsigned long)&args->child_subreaper, 0, 0, 0);
 	if (ret)
@@ -259,6 +338,7 @@ static int dump_creds(struct parasite_dump_creds *args)
 		}
 	}
 
+	args->no_new_privs = sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
 	args->secbits = sys_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0);
 
 	ret = sys_getgroups(0, NULL);
@@ -311,6 +391,97 @@ static int dump_creds(struct parasite_dump_creds *args)
 grps_err:
 	pr_err("Error calling getgroups (%d)\n", ret);
 	return -1;
+}
+
+static int check_rseq(struct parasite_check_rseq *rseq)
+{
+	int ret;
+	unsigned long rseq_abi_pointer;
+	unsigned long rseq_abi_size;
+	uint32_t rseq_signature;
+	void *addr;
+
+	/* no need to do hacky check if we can get all info from ptrace() */
+	if (!rseq->has_rseq || rseq->has_ptrace_get_rseq_conf)
+		return 0;
+
+	/*
+	 * We need to determine if victim process has rseq()
+	 * initialized, but we have no *any* proper kernel interface
+	 * supported at this point.
+	 * Our plan:
+	 * 1. We know that if we call rseq() syscall and process already
+	 * has current->rseq filled, then we get:
+	 * -EINVAL if current->rseq != rseq || rseq_len != sizeof(*rseq),
+	 * -EPERM  if current->rseq_sig != sig),
+	 * -EBUSY  if current->rseq == rseq && rseq_len == sizeof(*rseq) &&
+	 *            current->rseq_sig != sig
+	 * if current->rseq == NULL (rseq() wasn't used) then we go to:
+	 * IS_ALIGNED(rseq ...) check, if we fail it we get -EINVAL and it
+	 * will be hard to distinguish case when rseq() was initialized or not.
+	 * Let's construct arguments payload
+	 * with:
+	 * 1. correct rseq_abi_size
+	 * 2. aligned and correct rseq_abi_pointer
+	 * And see what rseq() return to us.
+	 * If ret value is:
+	 * 0: it means that rseq *wasn't* used and we successfully registered it,
+	 * -EINVAL or : it means that rseq is already initialized,
+	 * so we *have* to dump it. But as we have has_ptrace_get_rseq_conf = false,
+	 * we should just fail dump as it's unsafe to skip rseq() dump for processes
+	 * with rseq() initialized.
+	 * -EPERM or -EBUSY: should not happen as we take a fresh memory area for rseq
+	 */
+	addr = (void *)sys_mmap(NULL, sizeof(struct criu_rseq), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+				0);
+	if (addr == MAP_FAILED) {
+		pr_err("mmap() failed for struct rseq ret = %lx\n", (unsigned long)addr);
+		return -1;
+	}
+
+	memset(addr, 0, sizeof(struct criu_rseq));
+
+	/* sys_mmap returns page aligned addresses */
+	rseq_abi_pointer = (unsigned long)addr;
+	rseq_abi_size = (unsigned long)sizeof(struct criu_rseq);
+	/* it's not so important to have unique signature for us,
+	 * because rseq_abi_pointer is guaranteed to be unique
+	 */
+	rseq_signature = 0x12345612;
+
+	pr_info("\ttrying sys_rseq(%lx, %lx, %x, %x)\n", rseq_abi_pointer, rseq_abi_size, 0, rseq_signature);
+	ret = sys_rseq((void *)rseq_abi_pointer, rseq_abi_size, 0, rseq_signature);
+	if (ret) {
+		if (ret == -EINVAL) {
+			pr_info("\trseq is initialized in the victim\n");
+			rseq->rseq_inited = true;
+
+			ret = 0;
+		} else {
+			pr_err("\tunexpected failure of sys_rseq(%lx, %lx, %x, %x) = %d\n", rseq_abi_pointer,
+			       rseq_abi_size, 0, rseq_signature, ret);
+
+			ret = -1;
+		}
+	} else {
+		ret = sys_rseq((void *)rseq_abi_pointer, sizeof(struct criu_rseq), RSEQ_FLAG_UNREGISTER,
+			       rseq_signature);
+		if (ret) {
+			pr_err("\tfailed to unregister sys_rseq(%lx, %lx, %x, %x) = %d\n", rseq_abi_pointer,
+			       rseq_abi_size, RSEQ_FLAG_UNREGISTER, rseq_signature, ret);
+
+			ret = -1;
+			/* we can't do munmap() because rseq is registered and we failed to unregister it */
+			goto out_nounmap;
+		}
+
+		rseq->rseq_inited = false;
+		ret = 0;
+	}
+
+	sys_munmap(addr, sizeof(struct criu_rseq));
+out_nounmap:
+	return ret;
 }
 
 static int fill_fds_fown(int fd, struct fd_opts *p)
@@ -454,7 +625,7 @@ static int get_proc_fd(void)
 	ret = sys_mount("proc", proc_mountpoint, "proc", MS_MGC_VAL, NULL);
 	if (ret) {
 		if (ret == -EPERM)
-			pr_err("can't dump unpriviliged task whose /proc doesn't belong to it\n");
+			pr_err("can't dump unprivileged task whose /proc doesn't belong to it\n");
 		else
 			pr_err("mount failed (%d)\n", ret);
 		sys_rmdir(proc_mountpoint);
@@ -645,7 +816,7 @@ static int parasite_dump_cgroup(struct parasite_dump_cgroup_args *args)
 		return -1;
 	}
 
-	cgroup = sys_openat(proc, "self/cgroup", O_RDONLY, 0);
+	cgroup = sys_openat(proc, args->thread_cgrp, O_RDONLY, 0);
 	sys_close(proc);
 	if (cgroup < 0) {
 		pr_err("can't get /proc/self/cgroup fd\n");

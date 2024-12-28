@@ -1,3 +1,5 @@
+//go:build !remote
+
 package server
 
 import (
@@ -14,12 +16,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containers/podman/v4/libpod"
-	"github.com/containers/podman/v4/libpod/shutdown"
-	"github.com/containers/podman/v4/pkg/api/handlers"
-	"github.com/containers/podman/v4/pkg/api/server/idle"
-	"github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
+	"github.com/containers/podman/v5/libpod"
+	"github.com/containers/podman/v5/libpod/shutdown"
+	"github.com/containers/podman/v5/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/server/idle"
+	"github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/schema"
@@ -195,7 +197,13 @@ func (s *APIServer) Serve() error {
 	s.setupPprof()
 
 	if err := shutdown.Register("service", func(sig os.Signal) error {
-		return s.Shutdown(true)
+		err := s.Shutdown(true)
+		if err == nil {
+			// For `systemctl stop podman.service` support, exit code should be 0
+			// but only if we did indeed gracefully shutdown
+			shutdown.SetExitCode(0)
+		}
+		return err
 	}); err != nil {
 		return err
 	}

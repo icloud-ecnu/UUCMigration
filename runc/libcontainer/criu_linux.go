@@ -30,7 +30,7 @@ var criuFeatures *criurpc.CriuFeatures
 
 var ErrCriuMissingFeatures = errors.New("criu is missing features")
 
-func (c *Container) checkCriuFeatures(criuOpts *CriuOpts, rpcOpts *criurpc.CriuOpts, criuFeat *criurpc.CriuFeatures) error {
+func (c *Container) checkCriuFeatures(criuOpts *CriuOpts, criuFeat *criurpc.CriuFeatures) error {
 	t := criurpc.CriuReqType_FEATURE_CHECK
 
 	// make sure the features we are looking for are really not from
@@ -38,18 +38,13 @@ func (c *Container) checkCriuFeatures(criuOpts *CriuOpts, rpcOpts *criurpc.CriuO
 	criuFeatures = nil
 
 	req := &criurpc.CriuReq{
-		Type: &t,
-		// Theoretically this should not be necessary but CRIU
-		// segfaults if Opts is empty.
-		// Fixed in CRIU  2.12
-		Opts:     rpcOpts,
+		Type:     &t,
 		Features: criuFeat,
 	}
 
 	err := c.criuSwrk(nil, req, criuOpts, nil)
 	if err != nil {
-		logrus.Debugf("%s", err)
-		return errors.New("CRIU feature check failed")
+		return fmt.Errorf("CRIU feature check failed: %w", err)
 	}
 
 	var missingFeatures []string
@@ -101,7 +96,6 @@ func (c *Container) checkCriuVersion(minVersion int) error {
 	criu := criu.MakeCriu()
 	var err error
 	c.criuVersion, err = criu.GetCriuVersion()
-	fmt.Println(c.criuVersion)
 	if err != nil {
 		return fmt.Errorf("CRIU version check failed: %w", err)
 	}
@@ -192,7 +186,7 @@ func criuNsToKey(t configs.NamespaceType) string {
 
 func (c *Container) handleCheckpointingExternalNamespaces(rpcOpts *criurpc.CriuOpts, t configs.NamespaceType) error {
 	if !c.criuSupportsExtNS(t) {
-		return nil
+		return fmt.Errorf("criu lacks support for external %s namespace during checkpointing process (old criu version?)", configs.NsName(t))
 	}
 
 	nsPath := c.config.Namespaces.PathOf(t)
@@ -252,7 +246,7 @@ func (c *Container) handleRestoringNamespaces(rpcOpts *criurpc.CriuOpts, extraFi
 
 func (c *Container) handleRestoringExternalNamespaces(rpcOpts *criurpc.CriuOpts, extraFiles *[]*os.File, t configs.NamespaceType) error {
 	if !c.criuSupportsExtNS(t) {
-		return nil
+		return fmt.Errorf("criu lacks support for external %s namespace during the restoration process (old criu version?)", configs.NsName(t))
 	}
 
 	nsPath := c.config.Namespaces.PathOf(t)
@@ -331,9 +325,10 @@ func (c *Container) Checkpoint(criuOpts *CriuOpts) error {
 		OrphanPtsMaster: proto.Bool(true),
 		AutoDedup:       proto.Bool(criuOpts.AutoDedup),
 		LazyPages:       proto.Bool(criuOpts.LazyPages),
-		//PageStateDir:    proto.String(criuOpts.PageStateDir),
+		DirtyFile:       proto.String(criuOpts.DirtyFile),
+		LiveMigration:   proto.Bool(criuOpts.LiveMigration),
 	}
-	//fmt.Println(criuOpts.PageStateDir)
+
 	// if criuOpts.WorkDirectory is not set, criu default is used.
 	if criuOpts.WorkDirectory != "" {
 		if err := os.Mkdir(criuOpts.WorkDirectory, 0o700); err != nil && !os.IsExist(err) {
@@ -400,11 +395,13 @@ func (c *Container) Checkpoint(criuOpts *CriuOpts) error {
 			MemTrack: proto.Bool(true),
 		}
 
-		if err := c.checkCriuFeatures(criuOpts, &rpcOpts, &feat); err != nil {
+		if err := c.checkCriuFeatures(criuOpts, &feat); err != nil {
 			return err
 		}
 
 		t = criurpc.CriuReqType_PRE_DUMP
+	} else if criuOpts.LiveMigration {
+		t = criurpc.CriuReqType_ITERATIVE_DUMP
 	} else {
 		t = criurpc.CriuReqType_DUMP
 	}
@@ -414,7 +411,7 @@ func (c *Container) Checkpoint(criuOpts *CriuOpts) error {
 		feat := criurpc.CriuFeatures{
 			LazyPages: proto.Bool(true),
 		}
-		if err := c.checkCriuFeatures(criuOpts, &rpcOpts, &feat); err != nil {
+		if err := c.checkCriuFeatures(criuOpts, &feat); err != nil {
 			return err
 		}
 
@@ -530,17 +527,7 @@ func (c *Container) restoreNetwork(req *criurpc.CriuReq, criuOpts *CriuOpts) {
 // restore using CRIU. This function is inspired from the code in
 // rootfs_linux.go.
 func (c *Container) makeCriuRestoreMountpoints(m *configs.Mount) error {
-	me := mountEntry{Mount: m}
-	dest, err := securejoin.SecureJoin(c.config.Rootfs, m.Destination)
-	if err != nil {
-		return err
-	}
-	// TODO: pass srcFD? Not sure if criu is impacted by issue #2484.
-	if err := checkProcMount(c.config.Rootfs, dest, me); err != nil {
-		return err
-	}
-	switch m.Device {
-	case "cgroup":
+	if m.Device == "cgroup" {
 		// No mount point(s) need to be created:
 		//
 		// * for v1, mount points are saved by CRIU because
@@ -549,23 +536,12 @@ func (c *Container) makeCriuRestoreMountpoints(m *configs.Mount) error {
 		// * for v2, /sys/fs/cgroup is a real mount, but
 		//   the mountpoint appears as soon as /sys is mounted
 		return nil
-	case "bind":
-		// For bind-mounts (unlike other filesystem types), we need to check if
-		// the source exists.
-		fi, _, err := me.srcStat()
-		if err != nil {
-			// error out if the source of a bind mount does not exist as we
-			// will be unable to bind anything to it.
-			return err
-		}
-		if err := createIfNotExists(dest, fi.IsDir()); err != nil {
-			return err
-		}
-	default:
-		// for all other filesystems just create the mountpoints
-		if err := os.MkdirAll(dest, 0o755); err != nil {
-			return err
-		}
+	}
+	// TODO: pass srcFD? Not sure if criu is impacted by issue #2484.
+	me := mountEntry{Mount: m}
+	// For all other filesystems, just make the target.
+	if _, err := createMountpoint(c.config.Rootfs, me); err != nil {
+		return fmt.Errorf("create criu restore mountpoint for %s mount: %w", me.Destination, err)
 	}
 	return nil
 }

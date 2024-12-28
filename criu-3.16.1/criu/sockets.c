@@ -29,6 +29,7 @@
 #include "pstree.h"
 #include "util.h"
 #include "fdstore.h"
+#include "cr_options.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "sockets: "
@@ -37,7 +38,7 @@
 #define SOCK_DIAG_BY_FAMILY 20
 #endif
 
-#define SK_HASH_SIZE 32
+#define SK_HASH_SIZE (1 << 14)
 
 #ifndef SO_GET_FILTER
 #define SO_GET_FILTER SO_ATTACH_FILTER
@@ -465,16 +466,31 @@ int do_restore_opt(int sk, int level, int name, void *val, int len)
 	return 0;
 }
 
-static int sk_setbufs(void *arg, int fd, pid_t pid)
+int sk_setbufs(int sk, uint32_t *bufs)
 {
-	u32 *buf = (u32 *)arg;
+	uint32_t sndbuf = bufs[0], rcvbuf = bufs[1];
 
-	if (restore_opt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &buf[0]))
-		return -1;
-	if (restore_opt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &buf[1]))
-		return -1;
+	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) ||
+	    setsockopt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf))) {
+		if (opts.unprivileged) {
+			pr_info("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE, falling back to SO_SNDBUF/SO_RCVBUF\n");
+			if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) ||
+			    setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
+				pr_perror("Unable to set socket SO_SNDBUF/SO_RCVBUF");
+				return -1;
+			}
+		} else {
+			pr_perror("Unable to set socket SO_SNDBUFFORCE/SO_RCVBUFFORCE");
+			return -1;
+		}
+	}
 
 	return 0;
+}
+
+static int sk_setbufs_ns(void *arg, int fd, pid_t pid)
+{
+	return sk_setbufs(fd, (uint32_t *)arg);
 }
 
 /*
@@ -489,7 +505,7 @@ int restore_prepare_socket(int sk)
 	/* In kernel a bufsize has type int and a value is doubled. */
 	u32 maxbuf[2] = { INT_MAX / 2, INT_MAX / 2 };
 
-	if (userns_call(sk_setbufs, 0, maxbuf, sizeof(maxbuf), sk))
+	if (userns_call(sk_setbufs_ns, 0, maxbuf, sizeof(maxbuf), sk))
 		return -1;
 
 	/* Prevent blocking on restore */
@@ -517,8 +533,12 @@ int restore_socket_opts(int sk, SkOptsEntry *soe)
 	pr_info("%d restore sndbuf %d rcv buf %d\n", sk, soe->so_sndbuf, soe->so_rcvbuf);
 
 	/* setsockopt() multiplies the input values by 2 */
-	ret |= userns_call(sk_setbufs, UNS_ASYNC, bufs, sizeof(bufs), sk);
+	ret |= userns_call(sk_setbufs_ns, 0, bufs, sizeof(bufs), sk);
 
+	if (soe->has_so_buf_lock) {
+		pr_debug("\trestore buf_lock %d for socket\n", soe->so_buf_lock);
+		ret |= restore_opt(sk, SOL_SOCKET, SO_BUF_LOCK, &soe->so_buf_lock);
+	}
 	if (soe->has_so_priority) {
 		pr_debug("\trestore priority %d for socket\n", soe->so_priority);
 		ret |= restore_opt(sk, SOL_SOCKET, SO_PRIORITY, &soe->so_priority);
@@ -565,6 +585,12 @@ int restore_socket_opts(int sk, SkOptsEntry *soe)
 		pr_debug("\tset keepalive for socket\n");
 		ret |= restore_opt(sk, SOL_SOCKET, SO_KEEPALIVE, &val);
 	}
+
+	/*
+	 * Restoring TCP socket options in SkOptsEntry is
+	 * for backward compatibility only, newer versions
+	 * of CRIU use TcpOptsEntry.
+	 */
 	if (soe->has_tcp_keepcnt) {
 		pr_debug("\tset keepcnt for socket\n");
 		ret |= restore_opt(sk, SOL_TCP, TCP_KEEPCNT, &soe->tcp_keepcnt);
@@ -619,12 +645,20 @@ int dump_socket_opts(int sk, SkOptsEntry *soe)
 
 	ret |= dump_opt(sk, SOL_SOCKET, SO_SNDBUF, &soe->so_sndbuf);
 	ret |= dump_opt(sk, SOL_SOCKET, SO_RCVBUF, &soe->so_rcvbuf);
+	if (kdat.has_sockopt_buf_lock) {
+		soe->has_so_buf_lock = true;
+		ret |= dump_opt(sk, SOL_SOCKET, SO_BUF_LOCK, &soe->so_buf_lock);
+	}
 	soe->has_so_priority = true;
 	ret |= dump_opt(sk, SOL_SOCKET, SO_PRIORITY, &soe->so_priority);
 	soe->has_so_rcvlowat = true;
 	ret |= dump_opt(sk, SOL_SOCKET, SO_RCVLOWAT, &soe->so_rcvlowat);
-	soe->has_so_mark = true;
+	/*
+	 * Restoring SO_MARK requires root or CAP_NET_ADMIN. Avoid saving it
+	 * in unprivileged mode if still has its default value.
+	 */
 	ret |= dump_opt(sk, SOL_SOCKET, SO_MARK, &soe->so_mark);
+	soe->has_so_mark = !!soe->so_mark;
 
 	ret |= dump_opt(sk, SOL_SOCKET, SO_SNDTIMEO, &tv);
 	soe->so_snd_tmo_sec = tv.tv_sec;

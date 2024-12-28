@@ -21,7 +21,7 @@
 #include "image.h"
 #include "common/list.h"
 #include "rst-malloc.h"
-#include "util-pie.h"
+#include "util-caps.h"
 #include "common/lock.h"
 #include "sockets.h"
 #include "pstree.h"
@@ -49,6 +49,7 @@
 #include "kerndat.h"
 #include "fdstore.h"
 #include "bpfmap.h"
+#include "pidfd.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -183,6 +184,18 @@ out:
 	return fd;
 }
 
+int find_unused_fd_pid(pid_t pid)
+{
+	struct pstree_item *task;
+
+	task = pstree_item_by_virt(pid);
+	if (!task) {
+		pr_err("Invalid pid:%d\n", pid);
+		return -1;
+	}
+	return find_unused_fd(task, -1);
+}
+
 int set_fds_event(pid_t virt)
 {
 	struct pstree_item *item;
@@ -286,12 +299,12 @@ static int fixup_overlayfs(struct fd_parms *p, struct fd_link *link)
 	 * If the bug is present, the file path from /proc/<pid>/fd
 	 * does not include the mountpoint, so we prepend it ourselves.
 	 */
-	if (strcmp("./", m->mountpoint) != 0) {
+	if (strcmp("./", m->ns_mountpoint) != 0) {
 		char buf[PATH_MAX];
 		int n;
 
-		strlcpy(buf, link->name, PATH_MAX);
-		n = snprintf(link->name, PATH_MAX, "%s/%s", m->mountpoint, buf + 2);
+		__strlcpy(buf, link->name, PATH_MAX);
+		n = snprintf(link->name, PATH_MAX, "%s/%s", m->ns_mountpoint, buf + 2);
 		if (n >= PATH_MAX) {
 			pr_err("Not enough space to replace %s\n", buf);
 			return -1;
@@ -506,7 +519,7 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	}
 
 	p.fd_ctl = ctl; /* Some dump_opts require this to talk to parasite */
-	p.dfds = dfds; /* epoll needs to verify if target fd exist */
+	p.dfds = dfds;	/* epoll needs to verify if target fd exist */
 
 	if (S_ISSOCK(p.stat.st_mode))
 		return dump_socket(&p, lfd, e);
@@ -532,6 +545,8 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &signalfd_dump_ops;
 		else if (is_timerfd_link(link))
 			ops = &timerfd_dump_ops;
+		else if (is_pidfd_link(link))
+			ops = &pidfd_dump_ops;
 #ifdef CONFIG_HAS_LIBBPF
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
@@ -542,13 +557,19 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 		return do_dump_gen_file(&p, lfd, ops, e);
 	}
 
+	if (p.fs_type == PID_FS_MAGIC) {
+		ops = &pidfd_dump_ops;
+		return do_dump_gen_file(&p, lfd, ops, e);
+	}
+
 	if (S_ISREG(p.stat.st_mode) || S_ISDIR(p.stat.st_mode) || S_ISLNK(p.stat.st_mode)) {
 		if (fill_fdlink(lfd, &p, &link))
 			return -1;
 
 		p.link = &link;
 
-		if (is_memfd(p.stat.st_dev))
+		/* TODO: Dump for hugetlb fd when memfd hugetlb is not supported */
+		if (is_memfd(p.stat.st_dev) || (kdat.has_memfd_hugetlb && is_hugetlb_dev(p.stat.st_dev, NULL)))
 			ops = &memfd_dump_ops;
 		else if (link.name[1] == '/')
 			ops = &regfile_dump_ops;
@@ -583,13 +604,13 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 int dump_my_file(int lfd, u32 *id, int *type)
 {
 	struct pid me = {};
-	struct fd_opts fo = {};
+	struct fd_opts fdo = {};
 	FdinfoEntry e = FDINFO_ENTRY__INIT;
 
 	me.real = getpid();
 	me.ns[0].virt = -1; /* FIXME */
 
-	if (dump_one_file(&me, lfd, lfd, &fo, NULL, &e, NULL))
+	if (dump_one_file(&me, lfd, lfd, &fdo, NULL, &e, NULL))
 		return -1;
 
 	*id = e.id;
@@ -957,7 +978,7 @@ static int receive_fd(struct fdinfo_list_entry *fle);
 static void transport_name_gen(struct sockaddr_un *addr, int *len, int pid)
 {
 	addr->sun_family = AF_UNIX;
-	snprintf(addr->sun_path, UNIX_PATH_MAX, "x/crtools-fd-%d", pid);
+	snprintf(addr->sun_path, UNIX_PATH_MAX, "x/crtools-fd-%d-%" PRIx64, pid, criu_run_id);
 	*len = SUN_LEN(addr);
 	*addr->sun_path = '\0';
 }
@@ -1114,11 +1135,11 @@ int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
 static int open_fd(struct fdinfo_list_entry *fle)
 {
 	struct file_desc *d = fle->desc;
-	struct fdinfo_list_entry *flem;
+	struct fdinfo_list_entry *fle_m;
 	int new_fd = -1, ret;
 
-	flem = file_master(d);
-	if (fle != flem) {
+	fle_m = file_master(d);
+	if (fle != fle_m) {
 		BUG_ON(fle->stage != FLE_INITIALIZED);
 		ret = receive_fd(fle);
 		if (ret != 0)
@@ -1241,7 +1262,7 @@ int close_old_fds(void)
 	int fd, ret;
 
 	/**
-	 * Close previous /proc/self/ service fd, as we don't wan't to reuse it
+	 * Close previous /proc/self/ service fd, as we don't want to reuse it
 	 * from a different task. Also there can be some junk fd in it's place
 	 * after we've moved our service fds (e.g. from other task of parents
 	 * shared fdtable), we need to close it before opendir_proc() below.
@@ -1333,10 +1354,35 @@ static int fchroot(int fd)
 	return chroot(".");
 }
 
+static int need_chroot(int saved_root)
+{
+	struct stat saved_root_stat, cur_root_stat;
+	int psd;
+
+	if (fstat(saved_root, &saved_root_stat) == -1) {
+		pr_perror("Failed to stat saved root dir");
+		return -1;
+	}
+
+	psd = open_pid_proc(PROC_SELF);
+	if (psd < 0) {
+		pr_perror("Failed to open PROC_SELF");
+		return -1;
+	}
+
+	if (fstatat(psd, "root", &cur_root_stat, 0) == -1) {
+		pr_perror("Failed to stat current root dir");
+		return -1;
+	}
+
+	return saved_root_stat.st_ino != cur_root_stat.st_ino || saved_root_stat.st_dev != cur_root_stat.st_dev;
+}
+
 int restore_fs(struct pstree_item *me)
 {
 	int dd_root = -1, dd_cwd = -1, ret, err = -1;
 	struct rst_info *ri = rsti(me);
+	bool do_chroot = true;
 
 	/*
 	 * First -- open both descriptors. We will not
@@ -1356,14 +1402,23 @@ int restore_fs(struct pstree_item *me)
 	}
 
 	/*
+	 * In unprivileged mode chroot() may fail if we don't have
+	 * sufficient privileges, therefore only do it if the process
+	 * is actually chrooted.
+	 */
+	if (opts.unprivileged)
+		do_chroot = need_chroot(dd_root);
+
+	/*
 	 * Now do chroot/chdir. Chroot goes first as it calls chdir into
 	 * dd_root so we'd need to fix chdir after it anyway.
 	 */
-
-	ret = fchroot(dd_root);
-	if (ret < 0) {
-		pr_perror("Can't change root");
-		goto out;
+	if (do_chroot) {
+		ret = fchroot(dd_root);
+		if (ret < 0) {
+			pr_perror("Can't change root");
+			goto out;
+		}
 	}
 
 	ret = fchdir(dd_cwd);
@@ -1486,7 +1541,7 @@ int shared_fdt_prepare(struct pstree_item *item)
 struct inherit_fd {
 	struct list_head inh_list;
 	char *inh_id; /* file identifier */
-	int inh_fd; /* criu's descriptor to inherit */
+	int inh_fd;   /* criu's descriptor to inherit */
 	int inh_fd_id;
 };
 
@@ -1552,8 +1607,10 @@ int inherit_fd_add(int fd, char *key)
 		inh_fd_max = fd;
 
 	inh->inh_id = xstrdup(key);
-	if (inh->inh_id == NULL)
+	if (inh->inh_id == NULL) {
+		xfree(inh);
 		return -1;
+	}
 
 	inh->inh_fd = fd;
 	list_add_tail(&inh->inh_list, &opts.inherit_fds);
@@ -1729,6 +1786,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 	case FD_TYPES__MEMFD:
 		ret = collect_one_file_entry(fe, fe->memfd->id, &fe->memfd->base, &memfd_cinfo);
 		break;
+	case FD_TYPES__PIDFD:
+		ret = collect_one_file_entry(fe, fe->pidfd->id, &fe->pidfd->base, &pidfd_cinfo);
+		break;
 #ifdef CONFIG_HAS_LIBBPF
 	case FD_TYPES__BPFMAP:
 		ret = collect_one_file_entry(fe, fe->bpf->id, &fe->bpf->base, &bpfmap_cinfo);
@@ -1751,5 +1811,11 @@ int prepare_files(void)
 {
 	init_fdesc_hash();
 	init_sk_info_hash();
+
+	if (init_dead_pidfd_hash()) {
+		pr_err("Could not initialise hash map for dead pidfds\n");
+		return -1;
+	}
+
 	return collect_image(&files_cinfo);
 }

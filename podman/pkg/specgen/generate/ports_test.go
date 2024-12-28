@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package generate
 
@@ -434,7 +433,6 @@ func TestParsePortMappingWithHostPort(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ParsePortMapping(tt.arg, tt.arg2)
 			assert.NoError(t, err, "error is not nil")
@@ -669,7 +667,6 @@ func TestParsePortMappingWithoutHostPort(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ParsePortMapping(tt.arg, tt.arg2)
 			assert.NoError(t, err, "error is not nil")
@@ -848,7 +845,6 @@ func TestParsePortMappingMixedHostPort(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ParsePortMapping(tt.arg, nil)
 			assert.NoError(t, err, "error is not nil")
@@ -983,7 +979,6 @@ func TestParsePortMappingError(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ParsePortMapping(tt.arg, nil)
 			assert.EqualError(t, err, tt.err, "error does not match")

@@ -1,5 +1,4 @@
 //go:build (amd64 && !windows) || (arm64 && !windows)
-// +build amd64,!windows arm64,!windows
 
 package define
 
@@ -9,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/containers/podman/v4/test/utils"
+	"github.com/containers/podman/v5/test/utils"
 )
 
 func TestMachineFile_GetPath(t *testing.T) {
@@ -120,7 +119,6 @@ func TestNewMachineFile(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := NewMachineFile(tt.args.path, tt.args.symlink)
 			if (err != nil) != tt.wantErr {

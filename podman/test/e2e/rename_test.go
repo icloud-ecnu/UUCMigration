@@ -1,9 +1,11 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
 	"fmt"
 
-	. "github.com/containers/podman/v4/test/utils"
+	. "github.com/containers/podman/v5/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -13,7 +15,7 @@ var _ = Describe("podman rename", func() {
 	It("podman rename on non-existent container", func() {
 		session := podmanTest.Podman([]string{"rename", "doesNotExist", "aNewName"})
 		session.WaitWithDefaultTimeout()
-		Expect(session).To(ExitWithError())
+		Expect(session).To(ExitWithError(125, `no container with name or ID "doesNotExist" found: no such container`))
 	})
 
 	It("Podman rename on existing container with bad name", func() {
@@ -25,7 +27,7 @@ var _ = Describe("podman rename", func() {
 		newName := "invalid<>:char"
 		rename := podmanTest.Podman([]string{"rename", ctrName, newName})
 		rename.WaitWithDefaultTimeout()
-		Expect(rename).To(ExitWithError())
+		Expect(rename).To(ExitWithError(125, "names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*: invalid argument"))
 
 		ps := podmanTest.Podman([]string{"ps", "-aq", "--filter", fmt.Sprintf("name=%s", ctrName), "--format", "{{ .Names }}"})
 		ps.WaitWithDefaultTimeout()

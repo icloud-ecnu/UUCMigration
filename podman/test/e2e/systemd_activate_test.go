@@ -1,3 +1,5 @@
+//go:build linux || freebsd
+
 package integration
 
 import (
@@ -12,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	testUtils "github.com/containers/podman/v4/test/utils"
-	podmanUtils "github.com/containers/podman/v4/utils"
+	testUtils "github.com/containers/podman/v5/test/utils"
+	podmanUtils "github.com/containers/podman/v5/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gexec"
@@ -52,7 +54,7 @@ var _ = Describe("Systemd activate", func() {
 		systemdArgs := []string{
 			"-E", "http_proxy", "-E", "https_proxy", "-E", "no_proxy",
 			"-E", "HTTP_PROXY", "-E", "HTTPS_PROXY", "-E", "NO_PROXY",
-			"-E", "XDG_RUNTIME_DIR",
+			"-E", "XDG_RUNTIME_DIR", "-E", "CI_DESIRED_DATABASE",
 			"--listen", addr,
 			podmanTest.PodmanBinary}
 		systemdArgs = append(systemdArgs, podmanOptions...)
@@ -79,6 +81,11 @@ var _ = Describe("Systemd activate", func() {
 			args = append(podmanOptions, args...)
 			return testUtils.SystemExec(podmanTest.PodmanBinary, args)
 		}
+
+		// regression check for https://github.com/containers/podman/issues/24152
+		session := podmanRemote("info", "--format", "{{.Host.RemoteSocket.Path}}--{{.Host.RemoteSocket.Exists}}")
+		Expect(session).Should(testUtils.ExitCleanly())
+		Expect(session.OutputToString()).To(Equal("tcp://" + addr + "--true"))
 
 		containerName := "top_" + testUtils.RandomString(8)
 		apiSession := podmanRemote(
@@ -114,7 +121,7 @@ var _ = Describe("Systemd activate", func() {
 
 		// start systemd activation with datagram socket
 		activateSession := testUtils.StartSystemExec(activate, []string{
-			"--datagram", "--listen", addr,
+			"--datagram", "--listen", addr, "-E", "CI_DESIRED_DATABASE",
 			podmanTest.PodmanBinary,
 			"--root=" + filepath.Join(tempdir, "server_root"),
 			"system", "service",

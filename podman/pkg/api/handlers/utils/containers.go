@@ -1,3 +1,5 @@
+//go:build !remote
+
 package utils
 
 import (
@@ -9,17 +11,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containers/podman/v4/libpod/events"
-	api "github.com/containers/podman/v4/pkg/api/types"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/domain/infra/abi"
+	"github.com/containers/podman/v5/libpod/events"
+	api "github.com/containers/podman/v5/pkg/api/types"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/infra/abi"
 
-	"github.com/containers/podman/v4/pkg/api/handlers"
+	"github.com/containers/podman/v5/pkg/api/handlers"
 	"github.com/sirupsen/logrus"
 
-	"github.com/containers/podman/v4/libpod/define"
+	"github.com/containers/podman/v5/libpod/define"
 
-	"github.com/containers/podman/v4/libpod"
+	"github.com/containers/podman/v5/libpod"
 	"github.com/gorilla/schema"
 )
 
@@ -128,6 +130,19 @@ func WaitContainerLibpod(w http.ResponseWriter, r *http.Request) {
 	reports, err := containerEngine.ContainerWait(r.Context(), []string{name}, opts)
 	if err != nil {
 		if errors.Is(err, define.ErrNoSuchCtr) {
+			// Special case: In the common scenario of podman-remote run --rm
+			// the API is required to attach + start + wait to get exit code.
+			// This has the problem that the wait call races against the container
+			// removal from the cleanup process so it may not get the exit code back.
+			// However we keep the exit code around for longer than the container so
+			// we can just look it up here. Of course this only works when we get a
+			// full id as param but podman-remote will do that
+			if len(opts.Conditions) == 0 {
+				if code, err := runtime.GetContainerExitCode(name); err == nil {
+					WriteResponse(w, http.StatusOK, strconv.Itoa(int(code)))
+					return
+				}
+			}
 			ContainerNotFound(w, name, err)
 			return
 		}
@@ -221,8 +236,7 @@ func waitRemoved(ctrWait containerWaitFn) (int32, error) {
 func waitNextExit(ctx context.Context, containerName string) (int32, error) {
 	runtime := ctx.Value(api.RuntimeKey).(*libpod.Runtime)
 	containerEngine := &abi.ContainerEngine{Libpod: runtime}
-	eventChannel := make(chan *events.Event)
-	errChannel := make(chan error)
+	eventChannel := make(chan events.ReadResult)
 	opts := entities.EventsOptions{
 		EventChan: eventChannel,
 		Filter:    []string{"event=died", fmt.Sprintf("container=%s", containerName)},
@@ -232,18 +246,22 @@ func waitNextExit(ctx context.Context, containerName string) (int32, error) {
 	// ctx is used to cancel event watching goroutine
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		errChannel <- containerEngine.Events(ctx, opts)
-	}()
-
-	evt, ok := <-eventChannel
-	if ok {
-		return int32(evt.ContainerExitCode), nil
+	err := containerEngine.Events(ctx, opts)
+	if err != nil {
+		return -1, err
 	}
-	// if ok == false then containerEngine.Events() has exited
+
+	for evt := range eventChannel {
+		if evt.Error == nil {
+			if evt.Event.ContainerExitCode != nil {
+				return int32(*evt.Event.ContainerExitCode), nil
+			}
+		}
+	}
+	// if we are here then containerEngine.Events() has exited
 	// it may happen if request was canceled (e.g. client closed connection prematurely) or
 	// the server is in process of shutting down
-	return -1, <-errChannel
+	return -1, nil
 }
 
 func waitNotRunning(ctrWait containerWaitFn) (int32, error) {

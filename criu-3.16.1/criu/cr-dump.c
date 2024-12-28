@@ -1,3 +1,4 @@
+#include <python3.12/Python.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -6,7 +7,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-
+#include <pthread.h>
 #include <fcntl.h>
 
 #include <sys/types.h>
@@ -45,6 +46,7 @@
 #include "proc_parse.h"
 #include "parasite.h"
 #include "parasite-syscall.h"
+#include "compel/ptrace.h"
 #include "files.h"
 #include "files-reg.h"
 #include "shmem.h"
@@ -85,7 +87,305 @@
 #include "pidfd-store.h"
 #include "apparmor.h"
 #include "asm/dump.h"
+#include "timer.h"
+#include "sigact.h"
 
+extern char *dty_file[50], *acc_file[50];
+struct vm_area_list myvmas[20];
+extern int page_num, iter;
+int thread_times = 0, *mypredict[10000], vma_times = 0, mypid[20];
+extern bool ignore_page[10000], optimal;
+extern const int wind_length;
+extern float *sys_fts[50];
+PyObject *pFuncShift, *pFuncSSDP;
+#define BUFFER_SIZE 256
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; //互斥锁
+volatile sig_atomic_t stop = 0;			   //终止标志
+static int dump_filemap(struct vma_area *vma_area, int fd);
+extern bool should_dump_entire_vma(VmaEntry *vmae);
+extern bool __is_vma_range_fmt(char *line);
+extern void parse_vma_vmflags(char *buf, struct vma_area *vma_area);
+extern int task_size_check(pid_t pid, VmaEntry *entry);
+extern int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_path, DIR *map_files_dir,
+		      struct vma_file_info *vfi, struct vma_file_info *prev_vfi, int *vm_file_fd);
+extern int vma_list_add(struct vma_area *vma_area, struct vm_area_list *vma_area_list, unsigned long *prev_end,
+			struct vma_file_info *vfi, struct vma_file_info *prev_vfi);
+void read_stat_value(const char *filename, const char *key, unsigned long long *value)
+{
+	FILE *fp;
+	char line[BUFFER_SIZE];
+	char *token;
+
+	fp = fopen(filename, "r");
+	if (fp == NULL) {
+		perror("Failed to open file");
+		return;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		token = strtok(line, " ");
+		if (token && strcmp(token, key) == 0) {
+			*value = strtoull(strtok(NULL, " "), NULL, 10);
+			break;
+		}
+	}
+
+	fclose(fp);
+}
+
+unsigned long long get_pgfaults(void)
+{
+	unsigned long long value = 0;
+	read_stat_value("/proc/vmstat", "pgfault", &value);
+	return value;
+}
+
+unsigned long long get_ctxt(void)
+{
+	unsigned long long value = 0;
+	read_stat_value("/proc/stat", "ctxt", &value);
+	return value;
+}
+
+unsigned long long get_softirq(void)
+{
+	unsigned long long value = 0;
+	read_stat_value("/proc/stat", "softirq", &value);
+	return value;
+}
+unsigned long long get_pgpgin(void)
+{
+	unsigned long long value = 0;
+	read_stat_value("/proc/stat", "pgpgin", &value);
+	return value;
+}
+unsigned long long get_pgpgout(void)
+{
+	unsigned long long value = 0;
+	read_stat_value("/proc/stat", "pgpgout", &value);
+	return value;
+}
+unsigned long long get_mem_free(void)
+{
+	unsigned long long value = 0;
+	read_stat_value("/proc/meminfo", "MemFree:", &value);
+	return value;
+}
+
+// 注意: /proc/diskstats 提供的是磁盘统计信息，这里需要解析出写入字节数
+unsigned long long get_write_bytes(void)
+{
+	FILE *fp;
+	char line[BUFFER_SIZE];
+	unsigned long long write_bytes = 0;
+
+	fp = fopen("/proc/diskstats", "r");
+	if (fp == NULL) {
+		perror("Failed to open /proc/diskstats");
+		return 0;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		// 格式: <major> <minor> <device name> ... <writes completed> <sectors written> ...
+		unsigned long long sectors_written;
+		int ret = sscanf(line, "%*d %*d %*s %*u %*u %*u %*u %*u %llu", &sectors_written);
+		if (ret == 1) {
+			write_bytes += sectors_written * 512; // 每个扇区512字节
+		}
+	}
+
+	fclose(fp);
+	return write_bytes;
+}
+//初始化操作
+void my_init(void)
+{
+	PyObject *pName1, *pModule1, *pName2, *pModule2;
+	for (int i = 0; i < 50; i++) {
+		char *dirty, *access;
+		float *system_feature;
+		dirty = (char *)malloc(sizeof(char) * 10000);
+		access = (char *)malloc(sizeof(char) * 10000);
+		system_feature = (float *)malloc(sizeof(float) * 7);
+		for (int j = 0; j < 10000; j++)
+			dirty[j] = access[j] = '0';
+		for (int j = 0; j < 7; j++)
+			system_feature[j] = 0.0;
+		dty_file[i] = dirty;
+		acc_file[i] = access;
+		sys_fts[i] = system_feature;
+	}
+	memset(ignore_page, 0, sizeof(bool) * 10000);
+	for (int i = 0; i < 10000; i++) {
+		int *tmp = (int *)malloc(sizeof(int) * 3);
+		for (int j = 0; j < 3; j++)
+			tmp[j] = 0;
+		mypredict[i] = tmp;
+	}
+	//节约内存，只调用一次。
+	Py_Initialize(); // 初始化 Python 解释器
+	PyRun_SimpleString("import sys");
+	PyRun_SimpleString("sys.path.append('/home/rds')");
+	//导入datashift函数
+	pName1 = PyUnicode_FromString("dataShiftPredict"); // 模块名
+	pModule1 = PyImport_Import(pName1);		   // 导入模块
+	Py_DECREF(pName1);
+	if (pModule1 != NULL)
+		pFuncShift = PyObject_GetAttrString(pModule1, "dataShift");
+	else {
+		PyErr_Print();
+		pr_debug("module1=NULL\n");
+	}
+
+	//导入SSDP函数
+	pName2 = PyUnicode_DecodeFSDefault("infer");
+	pModule2 = PyImport_Import(pName2);
+	Py_DECREF(pName2);
+	if (pModule2 != NULL)
+		pFuncSSDP = PyObject_GetAttrString(pModule2, "unstable_page_inference");
+	else {
+		PyErr_Print();
+		pr_debug("module2=NULL\n");
+	}
+}
+// 函数用于将两个timespec相减
+struct timespec diff(struct timespec start, struct timespec end)
+{
+	struct timespec temp;
+	if ((end.tv_nsec - start.tv_nsec) < 0) {
+		temp.tv_sec = end.tv_sec - start.tv_sec - 1;
+		temp.tv_nsec = 1000000000 + end.tv_nsec - start.tv_nsec;
+	} else {
+		temp.tv_sec = end.tv_sec - start.tv_sec;
+		temp.tv_nsec = end.tv_nsec - start.tv_nsec;
+	}
+	return temp;
+}
+
+// 线程函数
+void *thread_func(void *arg)
+{
+	struct timespec start, end, sleep_time;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	while (!stop) {
+		// 执行任务并记录时间
+		int mynum = 0;
+		float *temp_sys;
+		char *temp_dty, *temp_acc;
+		char kpageflags_path[256] = "/proc/kpageflags"; // kpageflags 路径固定
+		int kpageflags_fd;
+		struct timespec remaining = { 0, 5000000 }; // 每次等待1秒
+		if(thread_times>3)remaining.tv_nsec=50000000;
+		pthread_mutex_lock(&mutex);
+		pr_debug("begin thread\n");
+		//执行操作
+
+		//轮转数组
+		temp_dty = dty_file[0], temp_acc = acc_file[0], temp_sys = sys_fts[0];
+		for (int i = 0; i < wind_length - 1; i++) { //更新指针
+			dty_file[i] = dty_file[i + 1];
+			acc_file[i] = acc_file[i + 1];
+			sys_fts[i] = sys_fts[i + 1];
+		}
+		dty_file[wind_length - 1] = temp_dty, acc_file[wind_length - 1] = temp_acc, sys_fts[wind_length - 1] = temp_sys;
+
+		//获取系统级特征
+		sys_fts[wind_length - 1][0] = get_pgfaults(), sys_fts[wind_length - 1][1] = get_pgpgin(), sys_fts[wind_length - 1][2] = get_pgpgout(), sys_fts[wind_length - 1][3] = get_ctxt(), sys_fts[wind_length - 1][4] = get_softirq(), sys_fts[wind_length - 1][5] = get_mem_free(), sys_fts[wind_length - 1][6] = get_write_bytes();
+
+		//获取dirty 和 access 信息
+		kpageflags_fd = open(kpageflags_path, 0);
+		for (int i = 0; i < vma_times; i++) {
+			struct vma_area *vma;
+			pmc_t pmc = PMC_INIT;
+			unsigned long pmc_size;
+
+			pmc_size = max(myvmas[i].nr_priv_pages_longest, myvmas[i].nr_shared_pages_longest);
+			if (pmc_init(&pmc, mypid[i], &myvmas[i].h, pmc_size * PAGE_SIZE))
+				break;
+			list_for_each_entry(vma, &myvmas[i].h, list) {
+				u64 vaddr, mypfn;
+				bool dump_all_pages;
+				if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
+					continue;
+				if (vma_entry_is(vma->e, VMA_AREA_VVAR))
+					continue;
+
+				if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma->e->flags & MAP_HUGETLB) {
+					if (opts.mode == CR_PRE_DUMP)
+						continue;
+				}
+				if (pmc_get_map(&pmc, vma))
+					break;
+				if (vma_area_is(vma, VMA_ANON_SHARED))
+					continue;
+				vaddr = vma->e->start;
+				dump_all_pages = should_dump_entire_vma(vma->e);
+				for (; vaddr < vma->e->end; vaddr += PAGE_SIZE) {
+					bool softdirty = false;
+					unsigned long flags = 0;
+					u64 next;
+					/* If dump_all_pages is true, should_dump_page is called to get pme. */
+					next = should_dump_page(&pmc, vma->e, vaddr, &softdirty);
+					if (!dump_all_pages && next != vaddr) {
+						vaddr = next - PAGE_SIZE;
+						continue;
+					}
+					//更新softdirty信息
+					dty_file[wind_length - 1][mynum] = softdirty == 1 ? '1' : '0';
+
+					//获取access信息
+					vaddr_to_pfn(pmc.fd, vaddr, &mypfn);
+					// 使用 pread 读取 kpageflags
+					if (pread(kpageflags_fd, &flags, sizeof(flags), mypfn * sizeof(flags)) != sizeof(flags))
+						;
+					acc_file[wind_length - 1][mynum] = (flags & (1 << 2)) ? '1' : '0';
+					mynum++;
+				}
+			}
+			if(!do_task_reset_dirty_track(mypid[i]))pr_debug("reset dirty track\n");
+		}
+		
+		close(kpageflags_fd);
+
+		pr_debug("my num:%d\n", mynum);
+		thread_times++;
+		pthread_mutex_unlock(&mutex);
+		pr_debug("after unlock");
+		// 计算执行时间
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		sleep_time = diff(start, end);
+		remaining.tv_sec -= sleep_time.tv_sec;
+		remaining.tv_nsec -= sleep_time.tv_nsec;
+		if (remaining.tv_nsec < 0) {
+			remaining.tv_nsec += 1000000000;
+			remaining.tv_sec--;
+		}
+
+		// 如果剩余时间大于0，则休眠剩余的时间
+		if (remaining.tv_sec > 0 || remaining.tv_nsec > 0) {
+			nanosleep(&remaining, NULL);
+		}
+		// 更新下次循环的开始时间
+		clock_gettime(CLOCK_MONOTONIC, &start);
+	}
+	pthread_exit(NULL);
+}
+/*
+若下轮迭代预测脏页率最低，下轮终止。
+*/
+bool next_is_optimal(void)
+{
+	int dirty_num[3] = { 0 };
+	for (int i = 0; i < page_num; i++) {
+		dirty_num[0] += mypredict[i][0];
+		dirty_num[1] += mypredict[i][1];
+		dirty_num[2] += mypredict[i][2];
+	}
+	pr_debug("sum:%d %d %d %d", page_num, dirty_num[0], dirty_num[1], dirty_num[2]);
+	if (dirty_num[0] <= dirty_num[1] && dirty_num[0] <= dirty_num[2])
+		return true;
+	return false;
+}
 /*
  * Architectures can overwrite this function to restore register sets that
  * are not covered by ptrace_set/get_regs().
@@ -156,6 +456,11 @@ static int dump_sched_info(int pid, ThreadCoreEntry *tc)
 	tc->has_sched_policy = true;
 	tc->sched_policy = ret;
 
+	/* The reset-on-fork flag might be used in combination
+	 * with SCHED_FIFO or SCHED_RR to reset the scheduling
+	 * policy/priority in child processes.
+	 */
+	ret &= ~SCHED_RESET_ON_FORK;
 	if ((ret == SCHED_RR) || (ret == SCHED_FIFO)) {
 		ret = syscall(__NR_sched_getparam, pid, &sp);
 		if (ret < 0) {
@@ -183,6 +488,25 @@ static int dump_sched_info(int pid, ThreadCoreEntry *tc)
 	pr_info("\tdumping %d nice for %d\n", ret, pid);
 	tc->has_sched_nice = true;
 	tc->sched_nice = ret;
+
+	return 0;
+}
+
+static int check_thread_rseq(pid_t tid, const struct parasite_check_rseq *ti_rseq)
+{
+	if (!kdat.has_rseq || kdat.has_ptrace_get_rseq_conf)
+		return 0;
+
+	pr_debug("%d has rseq_inited = %d\n", tid, ti_rseq->rseq_inited);
+
+	/*
+	 * We have no kdat.has_ptrace_get_rseq_conf and user
+	 * process has rseq() used, let's fail dump.
+	 */
+	if (ti_rseq->rseq_inited) {
+		pr_err("%d has rseq but kernel lacks get_rseq_conf feature\n", tid);
+		return -1;
+	}
 
 	return 0;
 }
@@ -409,7 +733,7 @@ static int dump_filemap(struct vma_area *vma_area, int fd)
 	if (vma_area->aufs_rpath) {
 		struct fd_link aufs_link;
 
-		strlcpy(aufs_link.name, vma_area->aufs_rpath, sizeof(aufs_link.name));
+		__strlcpy(aufs_link.name, vma_area->aufs_rpath, sizeof(aufs_link.name));
 		aufs_link.len = strlen(aufs_link.name);
 		p.link = &aufs_link;
 	}
@@ -615,7 +939,7 @@ static int dump_task_kobj_ids(struct pstree_item *item)
 	TaskKobjIdsEntry *ids = item->ids;
 
 	elem.pid = pid;
-	elem.idx = 0; /* really 0 for all */
+	elem.idx = 0;	/* really 0 for all */
 	elem.genid = 0; /* FIXME optimize */
 
 	new = 0;
@@ -717,6 +1041,17 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 	if (!ret)
 		ret = seccomp_dump_thread(pid, tc);
 
+	/*
+	 * We are dumping rseq() in the dump_thread_rseq() function,
+	 * *before* processes gets infected (because of ptrace requests
+	 * API restriction). At this point, if the kernel lacks
+	 * kdat.has_ptrace_get_rseq_conf support we have to ensure
+	 * that dumpable processes haven't initialized rseq() or
+	 * fail dump if rseq() was used.
+	 */
+	if (!ret)
+		ret = check_thread_rseq(pid, &ti->rseq);
+
 	return ret;
 }
 
@@ -728,6 +1063,7 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 	pid_t pid = item->pid->real;
 	int ret = -1;
 	struct parasite_dump_cgroup_args cgroup_args, *info = NULL;
+	u32 *cg_set;
 
 	BUILD_BUG_ON(sizeof(cgroup_args) < PARASITE_ARG_SIZE_MIN);
 
@@ -738,17 +1074,27 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 	core->tc->child_subreaper = misc->child_subreaper;
 	core->tc->has_child_subreaper = true;
 
+	if (misc->membarrier_registration_mask) {
+		core->tc->membarrier_registration_mask = misc->membarrier_registration_mask;
+		core->tc->has_membarrier_registration_mask = true;
+	}
+
 	ret = get_task_personality(pid, &core->tc->personality);
 	if (ret < 0)
 		goto err;
 
-	strlcpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
+	__strlcpy((char *)core->tc->comm, stat->comm, TASK_COMM_LEN);
 	core->tc->flags = stat->flags;
 	core->tc->task_state = item->pid->state;
 	core->tc->exit_code = 0;
 
 	core->thread_core->creds->lsm_profile = dmpi(item)->thread_lsms[0]->profile;
 	core->thread_core->creds->lsm_sockcreate = dmpi(item)->thread_lsms[0]->sockcreate;
+
+	if (core->tc->task_state == TASK_STOPPED) {
+		core->tc->has_stop_signo = true;
+		core->tc->stop_signo = item->pid->stop_signo;
+	}
 
 	ret = parasite_dump_thread_leader_seized(ctl, pid, core);
 	if (ret)
@@ -768,13 +1114,15 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 	 */
 	if (item->ids->has_cgroup_ns_id && !item->parent) {
 		info = &cgroup_args;
+		strcpy(cgroup_args.thread_cgrp, "self/cgroup");
 		ret = parasite_dump_cgroup(ctl, &cgroup_args);
 		if (ret)
 			goto err;
 	}
 
-	core->tc->has_cg_set = true;
-	ret = dump_task_cgroup(item, &core->tc->cg_set, info);
+	core->thread_core->has_cg_set = true;
+	cg_set = &core->thread_core->cg_set;
+	ret = dump_thread_cgroup(item, cg_set, info, -1);
 	if (ret)
 		goto err;
 
@@ -836,6 +1184,72 @@ static int collect_file_locks(void)
 	return parse_file_locks();
 }
 
+static bool task_in_rseq(struct criu_rseq_cs *rseq_cs, uint64_t addr)
+{
+	return addr >= rseq_cs->start_ip && addr < rseq_cs->start_ip + rseq_cs->post_commit_offset;
+}
+
+static int fixup_thread_rseq(const struct pstree_item *item, int i)
+{
+	CoreEntry *core = item->core[i];
+	struct criu_rseq_cs *rseq_cs = &dmpi(item)->thread_rseq_cs[i];
+	pid_t tid = item->threads[i].real;
+
+	if (!kdat.has_ptrace_get_rseq_conf)
+		return 0;
+
+	/* equivalent to (struct rseq)->rseq_cs is NULL */
+	if (!rseq_cs->start_ip)
+		return 0;
+
+	pr_debug(
+		"fixup_thread_rseq for %d: rseq_cs start_ip = %llx abort_ip = %llx post_commit_offset = %llx flags = %x version = %x; IP = %lx\n",
+		tid, rseq_cs->start_ip, rseq_cs->abort_ip, rseq_cs->post_commit_offset, rseq_cs->flags,
+		rseq_cs->version, (unsigned long)TI_IP(core));
+
+	if (rseq_cs->version != 0) {
+		pr_err("unsupported RSEQ ABI version = %d\n", rseq_cs->version);
+		return -1;
+	}
+
+	if (task_in_rseq(rseq_cs, TI_IP(core))) {
+		struct pid *tid = &item->threads[i];
+
+		/*
+		 * We need to fixup task instruction pointer from
+		 * the original one (which lays inside rseq critical section)
+		 * to rseq abort handler address. But we need to look on rseq_cs->flags
+		 * (please refer to struct rseq -> flags field description).
+		 * Naive idea of flags support may be like... let's change instruction pointer (IP)
+		 * to rseq_cs->abort_ip if !(rseq_cs->flags & RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL).
+		 * But unfortunately, it doesn't work properly, because the kernel does
+		 * clean up of rseq_cs field in the struct rseq (modifies userspace memory).
+		 * So, we need to preserve original value of (struct rseq)->rseq_cs field in the
+		 * image and restore it's value before releasing threads (see restore_rseq_cs()).
+		 *
+		 * It's worth to mention that we need to fixup IP in CoreEntry
+		 * (used when full dump/restore is performed) and also in
+		 * the parasite regs storage (used if --leave-running option is used,
+		 * or if dump error occurred and process execution is resumed).
+		 */
+
+		if (!(rseq_cs->flags & RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL)) {
+			pr_warn("The %d task is in rseq critical section. IP will be set to rseq abort handler addr\n",
+				tid->real);
+
+			TI_IP(core) = rseq_cs->abort_ip;
+
+			if (item->pid->real == tid->real) {
+				compel_set_leader_ip(dmpi(item)->parasite_ctl, rseq_cs->abort_ip);
+			} else {
+				compel_set_thread_ip(dmpi(item)->thread_ctls[i], rseq_cs->abort_ip);
+			}
+		}
+	}
+
+	return 0;
+}
+
 static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item, int id)
 {
 	struct parasite_thread_ctl *tctl = dmpi(item)->thread_ctls[id];
@@ -859,6 +1273,12 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 	core->thread_core->creds->lsm_profile = dmpi(item)->thread_lsms[id]->profile;
 	core->thread_core->creds->lsm_sockcreate = dmpi(item)->thread_lsms[0]->sockcreate;
 
+	ret = fixup_thread_rseq(item, id);
+	if (ret) {
+		pr_err("Can't fixup rseq for pid %d\n", pid);
+		goto err;
+	}
+
 	img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
 	if (!img)
 		goto err;
@@ -867,6 +1287,7 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 
 	close_image(img);
 err:
+	compel_release_thread(tctl);
 	pr_info("----------------------------------------\n");
 	return ret;
 }
@@ -881,7 +1302,7 @@ static int dump_one_zombie(const struct pstree_item *item, const struct proc_pid
 	if (!core)
 		return -1;
 
-	strlcpy((char *)core->tc->comm, pps->comm, TASK_COMM_LEN);
+	__strlcpy((char *)core->tc->comm, pps->comm, TASK_COMM_LEN);
 	core->tc->task_state = TASK_DEAD;
 	core->tc->exit_code = pps->exit_code;
 
@@ -1003,11 +1424,152 @@ static int dump_task_signals(pid_t pid, struct pstree_item *item)
 	return 0;
 }
 
+static int read_rseq_cs(pid_t tid, struct __ptrace_rseq_configuration *rseqc, struct criu_rseq_cs *rseq_cs,
+			struct criu_rseq *rseq)
+{
+	int ret;
+
+	/* rseq is not registered */
+	if (!rseqc->rseq_abi_pointer)
+		return 0;
+
+	/*
+	 * We need to cover the case when victim process was inside rseq critical section
+	 * at the moment when CRIU comes and seized it. We need to determine the borders
+	 * of rseq critical section at first. To achieve that we need to access thread
+	 * memory and read pointer to struct rseq_cs.
+	 *
+	 * We have two ways to access thread memory: from the parasite and using ptrace().
+	 * But it this case we can't use parasite, because if victim process returns to the
+	 * execution, on the kernel side __rseq_handle_notify_resume hook will be called,
+	 * then rseq_ip_fixup() -> clear_rseq_cs() and user space memory with struct rseq
+	 * will be cleared. So, let's use ptrace(PTRACE_PEEKDATA).
+	 */
+	ret = ptrace_peek_area(tid, rseq, decode_pointer(rseqc->rseq_abi_pointer), sizeof(struct criu_rseq));
+	if (ret) {
+		pr_err("ptrace_peek_area(%d, %lx, %lx, %lx): fail to read rseq struct\n", tid, (unsigned long)rseq,
+		       (unsigned long)(rseqc->rseq_abi_pointer), (unsigned long)sizeof(uint64_t));
+		return -1;
+	}
+
+	if (!rseq->rseq_cs)
+		return 0;
+
+	ret = ptrace_peek_area(tid, rseq_cs, decode_pointer(rseq->rseq_cs), sizeof(struct criu_rseq_cs));
+	if (ret) {
+		pr_err("ptrace_peek_area(%d, %lx, %lx, %lx): fail to read rseq_cs struct\n", tid,
+		       (unsigned long)rseq_cs, (unsigned long)rseq->rseq_cs,
+		       (unsigned long)sizeof(struct criu_rseq_cs));
+		return -1;
+	}
+
+	return 0;
+}
+
+static int dump_thread_rseq(struct pstree_item *item, int i)
+{
+	struct __ptrace_rseq_configuration rseqc;
+	RseqEntry *rseqe = NULL;
+	int ret;
+	CoreEntry *core = item->core[i];
+	RseqEntry **rseqep = &core->thread_core->rseq_entry;
+	struct criu_rseq rseq = {};
+	struct criu_rseq_cs *rseq_cs = &dmpi(item)->thread_rseq_cs[i];
+	pid_t tid = item->threads[i].real;
+
+	/*
+	 * If we are here it means that rseq() syscall is supported,
+	 * but ptrace(PTRACE_GET_RSEQ_CONFIGURATION) isn't supported,
+	 * we can just fail dump here. But this is bad idea, IMHO.
+	 *
+	 * So, we will try to detect if victim process was used rseq().
+	 * See check_rseq() and check_thread_rseq() functions.
+	 */
+	if (!kdat.has_ptrace_get_rseq_conf)
+		return 0;
+
+	ret = ptrace(PTRACE_GET_RSEQ_CONFIGURATION, tid, sizeof(rseqc), &rseqc);
+	if (ret != sizeof(rseqc)) {
+		pr_perror("ptrace(PTRACE_GET_RSEQ_CONFIGURATION, %d) = %d", tid, ret);
+		return -1;
+	}
+
+	if (rseqc.flags != 0) {
+		pr_err("something wrong with ptrace(PTRACE_GET_RSEQ_CONFIGURATION, %d) flags = 0x%x\n", tid,
+		       rseqc.flags);
+		return -1;
+	}
+
+	pr_info("Dump rseq of %d: ptr = 0x%lx sign = 0x%x\n", tid, (unsigned long)rseqc.rseq_abi_pointer,
+		rseqc.signature);
+
+	rseqe = xmalloc(sizeof(*rseqe));
+	if (!rseqe)
+		return -1;
+
+	rseq_entry__init(rseqe);
+
+	rseqe->rseq_abi_pointer = rseqc.rseq_abi_pointer;
+	rseqe->rseq_abi_size = rseqc.rseq_abi_size;
+	rseqe->signature = rseqc.signature;
+
+	if (read_rseq_cs(tid, &rseqc, rseq_cs, &rseq))
+		goto err;
+
+	/* we won't save rseq_cs to the image (only pointer),
+	 * so let's combine flags from both struct rseq and struct rseq_cs
+	 * (kernel does the same when interpreting RSEQ_CS_FLAG_*)
+	 */
+	rseq_cs->flags |= rseq.flags;
+
+	if (rseq_cs->flags & RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL) {
+		rseqe->has_rseq_cs_pointer = true;
+		rseqe->rseq_cs_pointer = rseq.rseq_cs;
+	}
+
+	/* save rseq entry to the image */
+	*rseqep = rseqe;
+
+	return 0;
+
+err:
+	xfree(rseqe);
+	return -1;
+}
+
+static int dump_task_rseq(pid_t pid, struct pstree_item *item)
+{
+	int i;
+	struct criu_rseq_cs *thread_rseq_cs;
+
+	/* if rseq() syscall isn't supported then nothing to dump */
+	if (!kdat.has_rseq)
+		return 0;
+
+	thread_rseq_cs = xzalloc(sizeof(*thread_rseq_cs) * item->nr_threads);
+	if (!thread_rseq_cs)
+		return -1;
+
+	dmpi(item)->thread_rseq_cs = thread_rseq_cs;
+
+	for (i = 0; i < item->nr_threads; i++) {
+		if (dump_thread_rseq(item, i))
+			goto free_rseq;
+	}
+
+	return 0;
+
+free_rseq:
+	xfree(thread_rseq_cs);
+	dmpi(item)->thread_rseq_cs = NULL;
+	return -1;
+}
+
 static struct proc_pid_stat pps_buf;
 
 static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
 {
-	int i;
+	int i, ret = 0;
 
 	for (i = 0; i < item->nr_threads; i++) {
 		/* Leader is already dumped */
@@ -1015,18 +1577,21 @@ static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pst
 			item->threads[i].ns[0].virt = vpid(item);
 			continue;
 		}
-		if (dump_task_thread(parasite_ctl, item, i))
-			return -1;
+		ret = dump_task_thread(parasite_ctl, item, i);
+		if (ret)
+			break;
 	}
 
-	return 0;
+	xfree(dmpi(item)->thread_rseq_cs);
+	dmpi(item)->thread_rseq_cs = NULL;
+	return ret;
 }
 
 /*
  * What this routine does is just reads pid-s of dead
  * tasks in item's children list from item's ns proc.
  *
- * It does *not* find wihch real pid corresponds to
+ * It does *not* find which real pid corresponds to
  * which virtual one, but it's not required -- all we
  * need to dump for zombie can be found in the same
  * ns proc.
@@ -1129,6 +1694,13 @@ static int dump_zombies(void)
 		item->pgid = pps_buf.pgid;
 
 		BUG_ON(!list_empty(&item->children));
+
+		if (!item->sid) {
+			pr_err("A session leader of zombie process %d(%d) is outside of its pid namespace\n",
+			       item->pid->real, vpid(item));
+			goto err;
+		}
+
 		if (dump_one_zombie(item, &pps_buf) < 0)
 			goto err;
 	}
@@ -1139,6 +1711,39 @@ err:
 		close_proc();
 
 	return ret;
+}
+
+static int dump_task_cgroup(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
+{
+	struct parasite_dump_cgroup_args cgroup_args, *info;
+	int i;
+
+	BUILD_BUG_ON(sizeof(cgroup_args) < PARASITE_ARG_SIZE_MIN);
+	for (i = 0; i < item->nr_threads; i++) {
+		CoreEntry *core = item->core[i];
+
+		/* Leader is already dumped */
+		if (item->pid->real == item->threads[i].real)
+			continue;
+
+		/* For now, we only need to dump the root task's cgroup ns, because we
+		 * know all the tasks are in the same cgroup namespace because we don't
+		 * allow nesting.
+		 */
+		info = NULL;
+		if (item->ids->has_cgroup_ns_id && !item->parent) {
+			info = &cgroup_args;
+			sprintf(cgroup_args.thread_cgrp, "self/task/%d/cgroup", item->threads[i].ns[0].virt);
+			if (parasite_dump_cgroup(parasite_ctl, &cgroup_args))
+				return -1;
+		}
+
+		core->thread_core->has_cg_set = true;
+		if (dump_thread_cgroup(item, &core->thread_core->cg_set, info, i))
+			return -1;
+	}
+
+	return 0;
 }
 
 static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
@@ -1153,7 +1758,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
-	pr_info("Pre-dumping task (pid: %d)\n", pid);
+	pr_info("Pre-dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
 	/*
@@ -1214,11 +1819,26 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	if (ret)
 		goto err_cure;
-
 	if (compel_cure_remote(parasite_ctl))
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 err_free:
-	free_mappings(&vmas);
+	if (opts.is_iterative_dump && iter == 0) {
+		struct vma_area *vma = NULL;
+		pr_debug("times:%d\n", vma_times);
+		mypid[vma_times] = pid;
+		myvmas[vma_times++] = vmas;
+		list_for_each_entry(vma, &myvmas[vma_times - 1].h, list) {
+			if ((vma->list.next) == (&vmas.h)) {
+				pr_debug("true");
+				vma->list.next = &myvmas[vma_times - 1].h;
+				break;
+			}
+		}
+		//pr_info_vma_list(&myvmas[vma_times - 1].h);
+	}
+	if (!opts.is_iterative_dump || iter != 0)
+		free_mappings(&vmas);
+
 err:
 	return ret;
 
@@ -1243,7 +1863,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
-	pr_info("Dumping task (pid: %d)\n", pid);
+	pr_info("Dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
 	if (item->pid->state == TASK_DEAD)
@@ -1291,9 +1911,21 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err;
 	}
 
+	ret = dump_task_rseq(pid, item);
+	if (ret) {
+		pr_err("Dump %d rseq failed %d\n", pid, ret);
+		goto err;
+	}
+
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
+		goto err;
+	}
+
+	ret = fixup_thread_rseq(item, 0);
+	if (ret) {
+		pr_err("Fixup rseq for %d failed %d\n", pid, ret);
 		goto err;
 	}
 
@@ -1308,29 +1940,29 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		pfd = parasite_get_proc_fd_seized(parasite_ctl);
 		if (pfd < 0) {
 			pr_err("Can't get proc fd (pid: %d)\n", pid);
-			goto err_cure_imgset;
+			goto err_cure;
 		}
 
 		if (install_service_fd(CR_PROC_FD_OFF, pfd) < 0)
-			goto err_cure_imgset;
+			goto err_cure;
 	}
 
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
 	if (ret) {
 		pr_err("Can't fixup vdso VMAs (pid: %d)\n", pid);
-		goto err_cure_imgset;
+		goto err_cure;
 	}
 
 	ret = parasite_collect_aios(parasite_ctl, &vmas); /* FIXME -- merge with above */
 	if (ret) {
 		pr_err("Failed to check aio rings (pid: %d)\n", pid);
-		goto err_cure_imgset;
+		goto err_cure;
 	}
 
 	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
 	if (ret) {
 		pr_err("Can't dump misc (pid: %d)\n", pid);
-		goto err_cure_imgset;
+		goto err_cure;
 	}
 
 	item->pid->ns[0].virt = misc.pid;
@@ -1401,6 +2033,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
+	ret = dump_task_cgroup(parasite_ctl, item);
+	if (ret) {
+		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
+		goto err_cure;
+	}
+
 	ret = compel_stop_daemon(parasite_ctl);
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
@@ -1438,17 +2076,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err;
 	}
 
-	close_cr_imgset(&cr_imgset);
 	exit_code = 0;
 err:
+	close_cr_imgset(&cr_imgset);
 	close_pid_proc();
 	free_mappings(&vmas);
 	xfree(dfds);
 	return exit_code;
 
 err_cure:
-	close_cr_imgset(&cr_imgset);
-err_cure_imgset:
 	ret = compel_cure(parasite_ctl);
 	if (ret)
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
@@ -1467,7 +2103,7 @@ static void alarm_handler(int signo)
 	pr_err("Timeout reached. Try to interrupt: %d\n", alarm_attempts);
 	if (alarm_attempts++ < 5) {
 		alarm(1);
-		/* A curren syscall will be exited with EINTR */
+		/* A current syscall will be exited with EINTR */
 		return;
 	}
 	pr_err("FATAL: Unable to interrupt the current operation\n");
@@ -1510,7 +2146,7 @@ static int cr_pre_dump_finish(int status)
 
 	he.has_pre_dump_mode = true;
 	he.pre_dump_mode = opts.pre_dump_mode;
-	
+
 	pstree_switch_state(root_item, TASK_ALIVE);
 
 	timing_stop(TIME_FROZEN);
@@ -1565,16 +2201,15 @@ static int cr_pre_dump_finish(int status)
 	}
 
 err:
-	
 	if (unsuspend_lsm())
 		ret = -1;
-	
+
 	if (disconnect_from_page_server())
 		ret = -1;
-	
+
 	if (bfd_flush_images())
 		ret = -1;
-	
+
 	if (write_img_inventory(&he))
 		ret = -1;
 
@@ -1586,42 +2221,13 @@ err:
 	}
 	return ret;
 }
-// char * __test__str = "hello";
-// char * __my_mapped;
-// int __my_fd;
-typedef struct {
-    int adder_id;
-    int values[10];  // 假设每个adder最多有10个元素
-} __Adder;
-typedef struct Node {
-    __Adder data;
-    struct __Node *next;
-} __Node;
-__Node * adders = NULL;
-
-/*static void __write_to_file(__Node *head, const char *filename) {
-    FILE *file = fopen(filename, "w");
-    if (!file) {
-        perror("Error opening file");
-        return;
-    }
-
-    Node *current = head;
-    while (current) {
-        fwrite(&(current->data), sizeof(Adder), 1, file);
-        current = current->next;
-    }
-
-    fclose(file);
-}*/
-
 
 int cr_pre_dump_tasks(pid_t pid)
 {
 	InventoryEntry *parent_ie = NULL;
 	struct pstree_item *item;
 	int ret = -1;
-
+	pr_debug("begin pre dump\n");
 	/*
 	 * We might need a lot of pipes to fetch huge number of pages to dump.
 	 */
@@ -1680,16 +2286,10 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	/* Errors handled later in detect_pid_reuse */
 	parent_ie = get_parent_inventory();
-	//printf("%s",__test__str );
-	// for_each_pstree_item(item)
-	// 	if (pre_dump_one_task(item, parent_ie))
-	// 		goto err;
-	for_each_pstree_item(item){
-		
+
+	for_each_pstree_item(item)
 		if (pre_dump_one_task(item, parent_ie))
 			goto err;
-	}
-		
 
 	if (parent_ie) {
 		inventory_entry__free_unpacked(parent_ie, NULL);
@@ -1702,12 +2302,10 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	if (irmap_predump_prep())
 		goto err;
-
 	ret = 0;
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
-
 	return cr_pre_dump_finish(ret);
 }
 
@@ -1747,7 +2345,6 @@ static int cr_dump_finish(int ret)
 	if (bfd_flush_images())
 		ret = -1;
 
-	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 	cgp_fini();
 
 	if (!ret) {
@@ -1801,6 +2398,9 @@ static int cr_dump_finish(int ret)
 
 	if (arch_set_thread_regs(root_item, true) < 0)
 		return -1;
+
+	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
 	free_pstree(root_item);
@@ -1813,7 +2413,11 @@ static int cr_dump_finish(int ret)
 	close_service_fd(CR_PROC_FD_OFF);
 	close_image_dir();
 
-	if (ret) {
+	if (ret || post_dump_ret) {
+		if (fault_injected(FI_DUMP_CRASH)) {
+			pr_info("fault: CRIU dump crashed!\n");
+			abort();
+		}
 		pr_err("Dumping FAILED.\n");
 	} else {
 		write_stats(DUMP_STATS);
@@ -1821,7 +2425,129 @@ static int cr_dump_finish(int ret)
 	}
 	return post_dump_ret ?: (ret != 0);
 }
+int fix_symlink(const char *checkpoint_path, const char *old_link, const char *new_target)
+{
+	char parent_symlink[1024];
 
+	// Construct the full path to the symlink
+	snprintf(parent_symlink, sizeof(parent_symlink), "%s/%s", checkpoint_path, old_link);
+
+	// Remove the old symbolic link
+	if (unlink(parent_symlink) == -1) {
+		if (errno != ENOENT) { // Ignore if the file does not exist
+			//fprintf(stderr, "Failed to remove old symlink '%s': %s\n", parent_symlink, strerror(errno));
+			return -1;
+		}
+	}
+
+	// Create the new symbolic link
+	if (symlink(new_target, parent_symlink) == -1) {
+		//fprintf(stderr, "Failed to create new symlink '%s' -> '%s': %s\n", parent_symlink, new_target, strerror(errno));
+		return -1;
+	}
+
+	//printf("Successfully updated symlink '%s' -> '%s'\n", parent_symlink, new_target);
+	return 0;
+}
+int cr_iterative_dump_tasks(pid_t pid)
+{
+	int ret = -1;
+	char *temp_str, *temp_str2;
+	pthread_t thread;
+	opts.last_dump = false;
+	opts.is_iterative_dump = true;
+	pthread_mutex_init(&mutex, NULL);
+	my_init();
+
+	temp_str = malloc(sizeof(char) * (strlen(opts.imgs_dir) + 10));	 //增加目录长度
+	temp_str2 = malloc(sizeof(char) * (strlen(opts.imgs_dir) + 10)); //增加目录长度
+	opts.img_parent = malloc(sizeof(char) * (strlen(opts.imgs_dir) + 10));
+	close_image_dir();
+	sprintf(opts.img_parent, "%s/%d", opts.imgs_dir, iter);
+	strcpy(temp_str, opts.imgs_dir);
+	opts.imgs_dir = opts.img_parent;
+	opts.img_parent = NULL;
+	mkdir(opts.imgs_dir, 0777);
+	ret = open_image_dir(opts.imgs_dir, O_DUMP);
+	if (ret < 0) {
+		pr_err("Couldn't open image dir %s\n", opts.imgs_dir);
+		return 1;
+	}
+	while (!optimal) //algorithm1
+	{
+		pr_debug("iter:%d\n", iter);
+		opts.mode = CR_PRE_DUMP;
+		page_num = 0; //重置页号
+		//获取系统特征
+		//sys_fts[wind_length - 1][0] = get_pgfaults(), sys_fts[wind_length - 1][1] = get_pgpgin(), sys_fts[wind_length - 1][2] = get_pgpgout(), sys_fts[wind_length - 1][3] = get_ctxt(), sys_fts[wind_length - 1][4] = get_softirq(), sys_fts[wind_length - 1][5] = get_mem_free(), sys_fts[wind_length - 1][6] = get_write_bytes();
+		//pr_msg("iter:%d %s %s %s\n",iter,opts.imgs_dir,opts.img_parent,opts.work_dir);
+
+		pthread_mutex_lock(&mutex);
+		cr_pre_dump_tasks(pid);
+		thread_times = 0;
+		// 创建线程
+		if (iter == 0) {
+			if (pthread_create(&thread, NULL, thread_func, NULL) != 0) {
+				fprintf(stderr, "Error creating thread\n");
+				return 1;
+			}
+		}
+		iter++;
+		pthread_mutex_unlock(&mutex);
+		if(iter==1)sleep(0.5);
+		if (0) {
+		dty_file[wind_length - 1][page_num] = 0, acc_file[wind_length - 1][page_num] = 0;
+		pr_info("脏页信息:%s\n访问信息:%s\n系统特征:%f %f %f %f %f %f %f\n", dty_file[wind_length - 1], acc_file[wind_length - 1], sys_fts[wind_length - 1][0], sys_fts[wind_length - 1][1], sys_fts[wind_length - 1][2], sys_fts[wind_length - 1][3], sys_fts[wind_length - 1][4], sys_fts[wind_length - 1][5], sys_fts[wind_length - 1][6]);
+		pr_info("忽略信息:");
+		for (int i = 0; i < page_num; i++)
+			pr_info("%d", ignore_page[i]);
+		pr_info("\n");
+		}
+		if (iter > 1) {
+			sprintf(temp_str2, "../%d", iter - 2);
+			fix_symlink(opts.imgs_dir, "parent", temp_str2);
+		}
+		//判断循环是否需要退出,如果下一轮迭代的预测脏页率最低，则下一轮终止
+		if (iter > 1 && next_is_optimal())
+			optimal = true;
+		if (!opts.img_parent)
+			opts.img_parent = malloc(sizeof(char) * (strlen(opts.imgs_dir) + 10));
+		if (optimal)
+			break;
+		//used for bug 116
+
+		//更改目录
+		close_image_dir();
+		sprintf(opts.imgs_dir, "%s/%d", temp_str, iter);
+		sprintf(opts.img_parent, "%s/%d", temp_str, iter - 1);
+		mkdir(opts.imgs_dir, 0777);
+		ret = open_image_dir(opts.imgs_dir, O_DUMP);
+		if (ret < 0) {
+			pr_err("Couldn't open image dir %s\n", opts.imgs_dir);
+			return 1;
+		}
+	}
+	opts.last_dump = true;
+	opts.mode = CR_DUMP;
+	opts.final_state = TASK_DEAD;
+	opts.track_mem = 1;
+	//更改目录
+	close_image_dir();
+	sprintf(opts.imgs_dir, "%s", temp_str);
+	sprintf(opts.img_parent, "%s/%d", temp_str, iter - 1);
+	mkdir(opts.imgs_dir, 0777);
+	ret = open_image_dir(opts.imgs_dir, O_DUMP);
+	if (ret < 0) {
+		pr_err("Couldn't open image dir %s\n", opts.imgs_dir);
+		return 1;
+	}
+	//sys_fts[wind_length - 1][0] = get_pgfaults(), sys_fts[wind_length - 1][1] = get_pgpgin(), sys_fts[wind_length - 1][2] = get_pgpgout(), sys_fts[wind_length - 1][3] = get_ctxt(), sys_fts[wind_length - 1][4] = get_softirq(), sys_fts[wind_length - 1][5] = get_mem_free(), sys_fts[wind_length - 1][6] = get_write_bytes();
+	page_num = 0; //重置页号
+	stop = 1;
+	pthread_mutex_lock(&mutex);
+	pthread_cancel(thread);
+	return cr_dump_tasks(pid) != 0;
+}
 int cr_dump_tasks(pid_t pid)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
@@ -1829,9 +2555,10 @@ int cr_dump_tasks(pid_t pid)
 	struct pstree_item *item;
 	int pre_dump_ret = 0;
 	int ret = -1;
-
+	char temp_str[1024];
+	pr_debug("begin dump\n");
 	pr_info("========================================\n");
-	pr_info("Dumping processes (pid: %d)\n", pid);
+	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
 	/*
@@ -1902,6 +2629,9 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	if (network_lock())
+		goto err;
+
+	if (rpc_query_external_files())
 		goto err;
 
 	if (collect_file_locks())
@@ -2007,6 +2737,18 @@ int cr_dump_tasks(pid_t pid)
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
-
+	if (opts.is_iterative_dump) {
+		dty_file[wind_length - 1][page_num] = 0;
+		acc_file[wind_length - 1][page_num] = 0;
+		pr_info("脏页信息:%s\n访问信息:%s\n系统特征:%f %f %f %f %f %f %f\n", dty_file[wind_length - 1], acc_file[wind_length - 1], sys_fts[wind_length - 1][0], sys_fts[wind_length - 1][1], sys_fts[wind_length - 1][2], sys_fts[wind_length - 1][3], sys_fts[wind_length - 1][4], sys_fts[wind_length - 1][5], sys_fts[wind_length - 1][6]);
+		pr_info("忽略信息:");
+		for (int i = 0; i < page_num; i++)
+			pr_info("%d", ignore_page[i]);
+		pr_info("\n");
+	}
+	if (opts.last_dump) {
+		sprintf(temp_str, "./%d", iter - 1);
+		fix_symlink(opts.imgs_dir, "parent", temp_str);
+	}
 	return cr_dump_finish(ret);
 }

@@ -2,7 +2,6 @@ package images
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,12 +17,13 @@ import (
 	"strings"
 
 	"github.com/containers/buildah/define"
-	"github.com/containers/image/v5/types"
-	ldefine "github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/auth"
-	"github.com/containers/podman/v4/pkg/bindings"
-	"github.com/containers/podman/v4/pkg/domain/entities"
-	"github.com/containers/podman/v4/pkg/util"
+	imageTypes "github.com/containers/image/v5/types"
+	ldefine "github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/auth"
+	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/domain/entities/types"
+	"github.com/containers/podman/v5/pkg/specgen"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/ioutils"
 	"github.com/containers/storage/pkg/regexp"
@@ -31,6 +31,7 @@ import (
 	"github.com/docker/go-units"
 	"github.com/hashicorp/go-multierror"
 	jsoniter "github.com/json-iterator/go"
+	gzip "github.com/klauspost/pgzip"
 	"github.com/sirupsen/logrus"
 )
 
@@ -49,8 +50,44 @@ type BuildResponse struct {
 	Aux          json.RawMessage `json:"aux,omitempty"`
 }
 
+// Modify the build contexts that uses a local windows path. The windows path is
+// converted into the corresping guest path in the default Windows machine
+// (e.g. C:\test ==> /mnt/c/test).
+func convertAdditionalBuildContexts(additionalBuildContexts map[string]*define.AdditionalBuildContext) {
+	for _, context := range additionalBuildContexts {
+		if !context.IsImage && !context.IsURL {
+			path, err := specgen.ConvertWinMountPath(context.Value)
+			// It's not worth failing if the path can't be converted
+			if err == nil {
+				context.Value = path
+			}
+		}
+	}
+}
+
+// convertVolumeSrcPath converts windows paths in the HOST-DIR part of a volume
+// into the corresponding path in the default Windows machine.
+// (e.g. C:\test:/src/docs ==> /mnt/c/test:/src/docs).
+// If any error occurs while parsing the volume string, the original volume
+// string is returned.
+func convertVolumeSrcPath(volume string) string {
+	splitVol := specgen.SplitVolumeString(volume)
+	if len(splitVol) < 2 || len(splitVol) > 3 {
+		return volume
+	}
+	convertedSrcPath, err := specgen.ConvertWinMountPath(splitVol[0])
+	if err != nil {
+		return volume
+	}
+	if len(splitVol) == 2 {
+		return convertedSrcPath + ":" + splitVol[1]
+	} else {
+		return convertedSrcPath + ":" + splitVol[1] + ":" + splitVol[2]
+	}
+}
+
 // Build creates an image using a containerfile reference
-func Build(ctx context.Context, containerFiles []string, options entities.BuildOptions) (*entities.BuildReport, error) {
+func Build(ctx context.Context, containerFiles []string, options types.BuildOptions) (*types.BuildReport, error) {
 	if options.CommonBuildOpts == nil {
 		options.CommonBuildOpts = new(define.CommonBuildOptions)
 	}
@@ -90,6 +127,10 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 		params.Add("t", tag)
 	}
 	if additionalBuildContexts := options.AdditionalBuildContexts; len(additionalBuildContexts) > 0 {
+		// TODO: Additional build contexts should be packaged and sent as tar files
+		// For the time being we make our best to make them accessible on remote
+		// machines too (i.e. on macOS and Windows).
+		convertAdditionalBuildContexts(additionalBuildContexts)
 		additionalBuildContextMap, err := jsoniter.Marshal(additionalBuildContexts)
 		if err != nil {
 			return nil, err
@@ -239,6 +280,10 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 	if len(options.RusageLogFile) > 0 {
 		params.Set("rusagelogfile", options.RusageLogFile)
 	}
+
+	params.Set("retry", strconv.Itoa(options.MaxPullPushRetries))
+	params.Set("retry-delay", options.PullPushRetryDelay.String())
+
 	if len(options.Manifest) > 0 {
 		params.Set("manifest", options.Manifest)
 	}
@@ -255,9 +300,9 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 	}
 
 	switch options.SkipUnusedStages {
-	case types.OptionalBoolTrue:
+	case imageTypes.OptionalBoolTrue:
 		params.Set("skipunusedstages", "1")
-	case types.OptionalBoolFalse:
+	case imageTypes.OptionalBoolFalse:
 		params.Set("skipunusedstages", "0")
 	}
 
@@ -281,8 +326,17 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 	if mem := options.CommonBuildOpts.Memory; mem > 0 {
 		params.Set("memory", strconv.Itoa(int(mem)))
 	}
+	switch options.CompatVolumes {
+	case imageTypes.OptionalBoolTrue:
+		params.Set("compatvolumes", "1")
+	case imageTypes.OptionalBoolFalse:
+		params.Set("compatvolumes", "0")
+	}
 	if options.NoCache {
 		params.Set("nocache", "1")
+	}
+	if options.CommonBuildOpts.NoHosts {
+		params.Set("nohosts", "1")
 	}
 	if t := options.Output; len(t) > 0 {
 		params.Set("output", t)
@@ -326,7 +380,7 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 	}
 
 	for _, volume := range options.CommonBuildOpts.Volumes {
-		params.Add("volume", volume)
+		params.Add("volume", convertVolumeSrcPath(volume))
 	}
 
 	for _, group := range options.GroupAdd {
@@ -342,9 +396,9 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 	params.Set("pullpolicy", options.PullPolicy.String())
 
 	switch options.CommonBuildOpts.IdentityLabel {
-	case types.OptionalBoolTrue:
+	case imageTypes.OptionalBoolTrue:
 		params.Set("identitylabel", "1")
-	case types.OptionalBoolFalse:
+	case imageTypes.OptionalBoolFalse:
 		params.Set("identitylabel", "0")
 	}
 	if options.Quiet {
@@ -416,7 +470,7 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 		} else {
 			headers, err = auth.MakeXRegistryConfigHeader(options.SystemContext, "", "")
 		}
-		if options.SystemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolTrue {
+		if options.SystemContext.DockerInsecureSkipTLSVerify == imageTypes.OptionalBoolTrue {
 			params.Set("tlsVerify", "false")
 		}
 	}
@@ -483,7 +537,7 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 			dontexcludes = append(dontexcludes, "!"+containerfile+".containerignore")
 		} else {
 			// If Containerfile does not exist, assume it is in context directory and do Not add to tarfile
-			if _, err := os.Lstat(containerfile); err != nil {
+			if err := fileutils.Lexists(containerfile); err != nil {
 				if !os.IsNotExist(err) {
 					return nil, err
 				}
@@ -530,9 +584,9 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 			if len(secretOpt) > 0 {
 				modifiedOpt := []string{}
 				for _, token := range secretOpt {
-					arr := strings.SplitN(token, "=", 2)
-					if len(arr) > 1 {
-						if arr[0] == "src" {
+					opt, val, hasVal := strings.Cut(token, "=")
+					if hasVal {
+						if opt == "src" {
 							// read specified secret into a tmp file
 							// move tmp file to tar and change secret source to relative tmp file
 							tmpSecretFile, err := os.CreateTemp(options.ContextDirectory, "podman-build-secret")
@@ -541,7 +595,7 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 							}
 							defer os.Remove(tmpSecretFile.Name()) // clean up
 							defer tmpSecretFile.Close()
-							srcSecretFile, err := os.Open(arr[1])
+							srcSecretFile, err := os.Open(val)
 							if err != nil {
 								return nil, err
 							}
@@ -618,7 +672,7 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 		// even when the server quit but it seems desirable to
 		// distinguish a proper build from a transient EOF.
 		case <-response.Request.Context().Done():
-			return &entities.BuildReport{ID: id, SaveFormat: saveFormat}, nil
+			return &types.BuildReport{ID: id, SaveFormat: saveFormat}, nil
 		default:
 			// non-blocking select
 		}
@@ -632,7 +686,7 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 			if errors.Is(err, io.EOF) && id != "" {
 				break
 			}
-			return &entities.BuildReport{ID: id, SaveFormat: saveFormat}, fmt.Errorf("decoding stream: %w", err)
+			return &types.BuildReport{ID: id, SaveFormat: saveFormat}, fmt.Errorf("decoding stream: %w", err)
 		}
 
 		switch {
@@ -645,12 +699,12 @@ func Build(ctx context.Context, containerFiles []string, options entities.BuildO
 		case s.Error != nil:
 			// If there's an error, return directly.  The stream
 			// will be closed on return.
-			return &entities.BuildReport{ID: id, SaveFormat: saveFormat}, errors.New(s.Error.Message)
+			return &types.BuildReport{ID: id, SaveFormat: saveFormat}, errors.New(s.Error.Message)
 		default:
-			return &entities.BuildReport{ID: id, SaveFormat: saveFormat}, errors.New("failed to parse build results stream, unexpected input")
+			return &types.BuildReport{ID: id, SaveFormat: saveFormat}, errors.New("failed to parse build results stream, unexpected input")
 		}
 	}
-	return &entities.BuildReport{ID: id, SaveFormat: saveFormat}, nil
+	return &types.BuildReport{ID: id, SaveFormat: saveFormat}, nil
 }
 
 func nTar(excludes []string, sources ...string) (io.ReadCloser, error) {

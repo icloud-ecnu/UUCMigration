@@ -6,6 +6,7 @@
 #include "vma.h"
 #include "kerndat.h"
 #include "images/mm.pb-c.h"
+#include "images/core.pb-c.h"
 
 struct task_entries {
 	int nr_threads, nr_tasks, nr_helpers;
@@ -17,13 +18,18 @@ struct task_entries {
 };
 
 struct fdt {
-	int nr; /* How many tasks share this fd table */
+	int nr;	   /* How many tasks share this fd table */
 	pid_t pid; /* Who should restore this fd table */
 	/*
 	 * The fd table is ready for restoing, if fdt_lock is equal to nr
 	 * The fdt table was restrored, if fdt_lock is equal to nr + 1
 	 */
 	futex_t fdt_lock;
+};
+
+struct rst_rseq {
+	uint64_t rseq_abi_pointer;
+	uint64_t rseq_cs_pointer;
 };
 
 struct rst_info {
@@ -67,7 +73,10 @@ struct rst_info {
 	 */
 	bool has_old_seccomp_filter;
 
-	bool has_thp_enabled;
+	struct rst_rseq *rseqe;
+
+	futex_t shstk_enable;
+	futex_t shstk_unlock;
 
 	void *breakpoint;
 };

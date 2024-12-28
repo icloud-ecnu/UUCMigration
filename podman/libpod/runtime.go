@@ -1,5 +1,4 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
@@ -16,8 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/containers/buildah/pkg/parse"
 	"github.com/containers/common/libimage"
 	"github.com/containers/common/libnetwork/network"
@@ -25,25 +22,29 @@ import (
 	"github.com/containers/common/pkg/cgroups"
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/common/pkg/secrets"
+	systemdCommon "github.com/containers/common/pkg/systemd"
 	"github.com/containers/image/v5/pkg/sysregistriesv2"
 	is "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/types"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/libpod/events"
-	"github.com/containers/podman/v4/libpod/lock"
-	"github.com/containers/podman/v4/libpod/plugin"
-	"github.com/containers/podman/v4/libpod/shutdown"
-	"github.com/containers/podman/v4/pkg/rootless"
-	"github.com/containers/podman/v4/pkg/systemd"
-	"github.com/containers/podman/v4/pkg/util"
-	"github.com/containers/podman/v4/utils"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/libpod/events"
+	"github.com/containers/podman/v5/libpod/lock"
+	"github.com/containers/podman/v5/libpod/plugin"
+	"github.com/containers/podman/v5/libpod/shutdown"
+	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/podman/v5/pkg/systemd"
+	"github.com/containers/podman/v5/pkg/util"
 	"github.com/containers/storage"
+	"github.com/containers/storage/pkg/fileutils"
 	"github.com/containers/storage/pkg/lockfile"
 	"github.com/containers/storage/pkg/unshare"
 	"github.com/docker/docker/pkg/namesgenerator"
+	"github.com/hashicorp/go-multierror"
 	jsoniter "github.com/json-iterator/go"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/exp/slices"
 )
 
 // Set up the JSON library for all of Libpod
@@ -114,8 +115,6 @@ type Runtime struct {
 	// mechanism to read and write even logs
 	eventer events.Eventer
 
-	// noStore indicates whether we need to interact with a store or not
-	noStore bool
 	// secretsManager manages secrets
 	secretsManager *secrets.SecretsManager
 }
@@ -133,7 +132,7 @@ func SetXdgDirs() error {
 
 	if runtimeDir == "" {
 		var err error
-		runtimeDir, err = util.GetRuntimeDir()
+		runtimeDir, err = util.GetRootlessRuntimeDir()
 		if err != nil {
 			return err
 		}
@@ -144,7 +143,7 @@ func SetXdgDirs() error {
 
 	if rootless.IsRootless() && os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
 		sessionAddr := filepath.Join(runtimeDir, "bus")
-		if _, err := os.Stat(sessionAddr); err == nil {
+		if err := fileutils.Exists(sessionAddr); err == nil {
 			os.Setenv("DBUS_SESSION_BUS_ADDRESS", fmt.Sprintf("unix:path=%s", sessionAddr))
 		}
 	}
@@ -169,7 +168,7 @@ func NewRuntime(ctx context.Context, options ...RuntimeOption) (*Runtime, error)
 	if err != nil {
 		return nil, err
 	}
-	return newRuntimeFromConfig(conf, options...)
+	return newRuntimeFromConfig(ctx, conf, options...)
 }
 
 // NewRuntimeFromConfig creates a new container runtime using the given
@@ -178,10 +177,10 @@ func NewRuntime(ctx context.Context, options ...RuntimeOption) (*Runtime, error)
 // An error will be returned if the configuration file at the given path does
 // not exist or cannot be loaded
 func NewRuntimeFromConfig(ctx context.Context, userConfig *config.Config, options ...RuntimeOption) (*Runtime, error) {
-	return newRuntimeFromConfig(userConfig, options...)
+	return newRuntimeFromConfig(ctx, userConfig, options...)
 }
 
-func newRuntimeFromConfig(conf *config.Config, options ...RuntimeOption) (*Runtime, error) {
+func newRuntimeFromConfig(ctx context.Context, conf *config.Config, options ...RuntimeOption) (*Runtime, error) {
 	runtime := new(Runtime)
 
 	if conf.Engine.OCIRuntime == "" {
@@ -198,7 +197,7 @@ func newRuntimeFromConfig(conf *config.Config, options ...RuntimeOption) (*Runti
 		return nil, err
 	}
 
-	storeOpts, err := storage.DefaultStoreOptions(rootless.IsRootless(), rootless.GetRootlessUID())
+	storeOpts, err := storage.DefaultStoreOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -211,12 +210,14 @@ func newRuntimeFromConfig(conf *config.Config, options ...RuntimeOption) (*Runti
 		}
 	}
 
+	if err := makeRuntime(ctx, runtime); err != nil {
+		return nil, err
+	}
+
 	if err := shutdown.Register("libpod", func(sig os.Signal) error {
-		// For `systemctl stop podman.service` support, exit code should be 0
-		if sig == syscall.SIGTERM {
-			os.Exit(0)
+		if runtime.store != nil {
+			_, _ = runtime.store.Shutdown(false)
 		}
-		os.Exit(1)
 		return nil
 	}); err != nil && !errors.Is(err, shutdown.ErrHandlerExists) {
 		logrus.Errorf("Registering shutdown handler for libpod: %v", err)
@@ -224,10 +225,6 @@ func newRuntimeFromConfig(conf *config.Config, options ...RuntimeOption) (*Runti
 
 	if err := shutdown.Start(); err != nil {
 		return nil, fmt.Errorf("starting shutdown signal handler: %w", err)
-	}
-
-	if err := makeRuntime(runtime); err != nil {
-		return nil, err
 	}
 
 	runtime.config.CheckCgroupsAndAdjustConfig()
@@ -312,7 +309,7 @@ func getDBState(runtime *Runtime) (State, error) {
 	switch backend {
 	case config.DBBackendDefault:
 		// for backwards compatibility check if boltdb exists, if it does not we use sqlite
-		if _, err := os.Stat(boltDBPath); err != nil {
+		if err := fileutils.Exists(boltDBPath); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				// need to set DBBackend string so podman info will show the backend name correctly
 				runtime.config.Engine.DBBackend = config.DBBackendSQLite.String()
@@ -336,20 +333,13 @@ func getDBState(runtime *Runtime) (State, error) {
 
 // Make a new runtime based on the given configuration
 // Sets up containers/storage, state store, OCI runtime
-func makeRuntime(runtime *Runtime) (retErr error) {
+func makeRuntime(ctx context.Context, runtime *Runtime) (retErr error) {
 	// Find a working conmon binary
 	cPath, err := runtime.config.FindConmon()
 	if err != nil {
 		return err
 	}
 	runtime.conmonPath = cPath
-
-	if runtime.noStore && runtime.doReset {
-		return fmt.Errorf("cannot perform system reset if runtime is not creating a store: %w", define.ErrInvalidArg)
-	}
-	if runtime.doReset && runtime.doRenumber {
-		return fmt.Errorf("cannot perform system reset while renumbering locks: %w", define.ErrInvalidArg)
-	}
 
 	if runtime.config.Engine.StaticDir == "" {
 		runtime.config.Engine.StaticDir = filepath.Join(runtime.storageConfig.GraphRoot, "libpod")
@@ -372,6 +362,14 @@ func makeRuntime(runtime *Runtime) (retErr error) {
 	// Create the TmpDir if needed
 	if err := os.MkdirAll(runtime.config.Engine.TmpDir, 0751); err != nil {
 		return fmt.Errorf("creating runtime temporary files directory: %w", err)
+	}
+
+	// Create the volume path if needed.
+	// This is not strictly necessary at this point, but the path not
+	// existing can cause troubles with DB path validation on OSTree based
+	// systems. Ref: https://github.com/containers/podman/issues/23515
+	if err := os.MkdirAll(runtime.config.Engine.VolumePath, 0700); err != nil {
+		return fmt.Errorf("creating runtime volume path directory: %w", err)
 	}
 
 	// Set up the state.
@@ -402,23 +400,7 @@ func makeRuntime(runtime *Runtime) (retErr error) {
 
 	runtime.mergeDBConfig(dbConfig)
 
-	unified, _ := cgroups.IsCgroup2UnifiedMode()
-	if unified && rootless.IsRootless() && !systemd.IsSystemdSessionValid(rootless.GetRootlessUID()) {
-		// If user is rootless and XDG_RUNTIME_DIR is found, podman will not proceed with /tmp directory
-		// it will try to use existing XDG_RUNTIME_DIR
-		// if current user has no write access to XDG_RUNTIME_DIR we will fail later
-		if err := unix.Access(runtime.storageConfig.RunRoot, unix.W_OK); err != nil {
-			msg := fmt.Sprintf("RunRoot is pointing to a path (%s) which is not writable. Most likely podman will fail.", runtime.storageConfig.RunRoot)
-			if errors.Is(err, os.ErrNotExist) {
-				// if dir does not exist, try to create it
-				if err := os.MkdirAll(runtime.storageConfig.RunRoot, 0700); err != nil {
-					logrus.Warn(msg)
-				}
-			} else {
-				logrus.Warnf("%s: %v", msg, err)
-			}
-		}
-	}
+	checkCgroups2UnifiedMode(runtime)
 
 	logrus.Debugf("Using graph driver %s", runtime.storageConfig.GraphDriverName)
 	logrus.Debugf("Using graph root %s", runtime.storageConfig.GraphRoot)
@@ -456,8 +438,6 @@ func makeRuntime(runtime *Runtime) (retErr error) {
 	var store storage.Store
 	if needsUserns {
 		logrus.Debug("Not configuring container store")
-	} else if runtime.noStore {
-		logrus.Debug("No store required. Not opening container store.")
 	} else if err := runtime.configureStore(); err != nil {
 		// Make a best-effort attempt to clean up if performing a
 		// storage reset.
@@ -467,7 +447,7 @@ func makeRuntime(runtime *Runtime) (retErr error) {
 			}
 		}
 
-		return err
+		return fmt.Errorf("configure storage: %w", err)
 	}
 	defer func() {
 		if retErr != nil && store != nil {
@@ -573,7 +553,7 @@ func makeRuntime(runtime *Runtime) (retErr error) {
 		}
 	}()
 
-	_, err = os.Stat(runtimeAliveFile)
+	err = fileutils.Exists(runtimeAliveFile)
 	if err != nil {
 		// If we need to refresh, then it is safe to assume there are
 		// no containers running.  Create immediately a namespace, as
@@ -608,7 +588,7 @@ func makeRuntime(runtime *Runtime) (retErr error) {
 			if became {
 				// Check if the pause process was created.  If it was created, then
 				// move it to its own systemd scope.
-				utils.MovePauseProcessToScope(pausePid)
+				systemdCommon.MovePauseProcessToScope(pausePid)
 
 				// gocritic complains because defer is not run on os.Exit()
 				// However this is fine because the lock is released anyway when the process exits
@@ -632,26 +612,39 @@ func makeRuntime(runtime *Runtime) (retErr error) {
 		return err
 	}
 
+	// Mark the runtime as valid - ready to be used, cannot be modified
+	// further.
+	// Need to do this *before* refresh as we can remove containers there.
+	// Should not be a big deal as we don't return it to users until after
+	// refresh runs.
+	runtime.valid = true
+
+	// Setup the worker channel early to start accepting jobs from refresh,
+	// but do not start to execute the jobs right away. The runtime is not
+	// ready at this point.
+	runtime.setupWorkerQueue()
+
 	// If we need to refresh the state, do it now - things are guaranteed to
 	// be set up by now.
 	if doRefresh {
 		// Ensure we have a store before refresh occurs
 		if runtime.store == nil {
 			if err := runtime.configureStore(); err != nil {
-				return err
+				return fmt.Errorf("configure storage: %w", err)
 			}
 		}
 
-		if err2 := runtime.refresh(runtimeAliveFile); err2 != nil {
+		if err2 := runtime.refresh(ctx, runtimeAliveFile); err2 != nil {
 			return err2
 		}
 	}
 
-	runtime.startWorker()
+	// Check current boot ID - will be written to the alive file.
+	if err := runtime.checkBootID(runtimeAliveFile); err != nil {
+		return err
+	}
 
-	// Mark the runtime as valid - ready to be used, cannot be modified
-	// further
-	runtime.valid = true
+	runtime.startWorker()
 
 	return nil
 }
@@ -696,15 +689,16 @@ func (r *Runtime) GetConfig() (*config.Config, error) {
 
 // libimageEventsMap translates a libimage event type to a libpod event status.
 var libimageEventsMap = map[libimage.EventType]events.Status{
-	libimage.EventTypeImagePull:    events.Pull,
-	libimage.EventTypeImagePush:    events.Push,
-	libimage.EventTypeImageRemove:  events.Remove,
-	libimage.EventTypeImageLoad:    events.LoadFromArchive,
-	libimage.EventTypeImageSave:    events.Save,
-	libimage.EventTypeImageTag:     events.Tag,
-	libimage.EventTypeImageUntag:   events.Untag,
-	libimage.EventTypeImageMount:   events.Mount,
-	libimage.EventTypeImageUnmount: events.Unmount,
+	libimage.EventTypeImagePull:      events.Pull,
+	libimage.EventTypeImagePullError: events.PullError,
+	libimage.EventTypeImagePush:      events.Push,
+	libimage.EventTypeImageRemove:    events.Remove,
+	libimage.EventTypeImageLoad:      events.LoadFromArchive,
+	libimage.EventTypeImageSave:      events.Save,
+	libimage.EventTypeImageTag:       events.Tag,
+	libimage.EventTypeImageUntag:     events.Untag,
+	libimage.EventTypeImageMount:     events.Mount,
+	libimage.EventTypeImageUnmount:   events.Unmount,
 }
 
 // libimageEvents spawns a goroutine which will listen for events on
@@ -735,6 +729,9 @@ func (r *Runtime) libimageEvents() {
 					Status: toLibpodEventStatus(libimageEvent),
 					Time:   libimageEvent.Time,
 					Type:   events.Image,
+				}
+				if libimageEvent.Error != nil {
+					e.Error = libimageEvent.Error.Error()
 				}
 				if err := r.eventer.Write(e); err != nil {
 					logrus.Errorf("Unable to write image event: %q", err)
@@ -822,7 +819,7 @@ func (r *Runtime) Shutdown(force bool) error {
 // Reconfigures the runtime after a reboot
 // Refreshes the state, recreating temporary files
 // Does not check validity as the runtime is not valid until after this has run
-func (r *Runtime) refresh(alivePath string) error {
+func (r *Runtime) refresh(ctx context.Context, alivePath string) error {
 	logrus.Debugf("Podman detected system restart - performing state refresh")
 
 	// Clear state of database if not running in container
@@ -858,6 +855,22 @@ func (r *Runtime) refresh(alivePath string) error {
 	for _, ctr := range ctrs {
 		if err := ctr.refresh(); err != nil {
 			logrus.Errorf("Refreshing container %s: %v", ctr.ID(), err)
+		}
+		// This is the only place it's safe to use ctr.state.State unlocked
+		// We're holding the alive lock, guaranteed to be the only Libpod on the system right now.
+		if (ctr.AutoRemove() && ctr.state.State == define.ContainerStateExited) || ctr.state.State == define.ContainerStateRemoving {
+			opts := ctrRmOpts{
+				// Don't force-remove, we're supposed to be fresh off a reboot
+				// If we have to force something is seriously wrong
+				Force:        false,
+				RemoveVolume: true,
+			}
+			// This container should have autoremoved before the
+			// reboot but did not.
+			// Get rid of it.
+			if _, _, err := r.removeContainer(ctx, ctr, opts); err != nil {
+				logrus.Errorf("Unable to remove container %s which should have autoremoved: %v", ctr.ID(), err)
+			}
 		}
 	}
 	for _, pod := range pods {
@@ -1089,7 +1102,7 @@ func (r *Runtime) reloadContainersConf() error {
 
 // reloadStorageConf reloads the storage.conf
 func (r *Runtime) reloadStorageConf() error {
-	configFile, err := storage.DefaultConfigFile(rootless.IsRootless())
+	configFile, err := storage.DefaultConfigFile()
 	if err != nil {
 		return err
 	}
@@ -1249,4 +1262,138 @@ func (r *Runtime) LockConflicts() (map[uint32][]string, []uint32, error) {
 	}
 
 	return toReturn, locksHeld, nil
+}
+
+// SystemCheck checks our storage for consistency, and depending on the options
+// specified, will attempt to remove anything which fails consistency checks.
+func (r *Runtime) SystemCheck(ctx context.Context, options entities.SystemCheckOptions) (entities.SystemCheckReport, error) {
+	what := storage.CheckEverything()
+	if options.Quick {
+		what = storage.CheckMost()
+	}
+	if options.UnreferencedLayerMaximumAge != nil {
+		tmp := *options.UnreferencedLayerMaximumAge
+		what.LayerUnreferencedMaximumAge = &tmp
+	}
+	storageReport, err := r.store.Check(what)
+	if err != nil {
+		return entities.SystemCheckReport{}, err
+	}
+	if len(storageReport.Containers) == 0 &&
+		len(storageReport.Layers) == 0 &&
+		len(storageReport.ROLayers) == 0 &&
+		len(storageReport.Images) == 0 &&
+		len(storageReport.ROImages) == 0 {
+		// no errors detected
+		return entities.SystemCheckReport{}, nil
+	}
+	mapErrorSlicesToStringSlices := func(m map[string][]error) map[string][]string {
+		if len(m) == 0 {
+			return nil
+		}
+		mapped := make(map[string][]string, len(m))
+		for k, errs := range m {
+			strs := make([]string, len(errs))
+			for i, e := range errs {
+				strs[i] = e.Error()
+			}
+			mapped[k] = strs
+		}
+		return mapped
+	}
+
+	report := entities.SystemCheckReport{
+		Errors:     true,
+		Layers:     mapErrorSlicesToStringSlices(storageReport.Layers),
+		ROLayers:   mapErrorSlicesToStringSlices(storageReport.ROLayers),
+		Images:     mapErrorSlicesToStringSlices(storageReport.Images),
+		ROImages:   mapErrorSlicesToStringSlices(storageReport.ROImages),
+		Containers: mapErrorSlicesToStringSlices(storageReport.Containers),
+	}
+	if !options.Repair && report.Errors {
+		// errors detected, no corrective measures to be taken
+		return report, err
+	}
+
+	// get a list of images that we knew of before we tried to clean up any
+	// that were damaged
+	imagesBefore, err := r.store.Images()
+	if err != nil {
+		return report, fmt.Errorf("getting a list of images before attempting repairs: %w", err)
+	}
+
+	repairOptions := storage.RepairOptions{
+		RemoveContainers: options.RepairLossy,
+	}
+	var containers []*Container
+	if repairOptions.RemoveContainers {
+		// build a list of the containers that we claim as ours that we
+		// expect to be removing in a bit
+		for containerID := range storageReport.Containers {
+			ctr, lookupErr := r.state.LookupContainer(containerID)
+			if lookupErr != nil {
+				// we're about to remove it, so it's okay that
+				// it isn't even one of ours
+				continue
+			}
+			containers = append(containers, ctr)
+		}
+	}
+
+	// run the cleanup
+	merr := multierror.Append(nil, r.store.Repair(storageReport, &repairOptions)...)
+
+	if repairOptions.RemoveContainers {
+		// get the list of containers that storage will still admit to knowing about
+		containersAfter, err := r.store.Containers()
+		if err != nil {
+			merr = multierror.Append(merr, fmt.Errorf("getting a list of containers after attempting repairs: %w", err))
+		}
+		for _, ctr := range containers {
+			// if one of our containers that we tried to remove is
+			// still on disk, report an error
+			if slices.IndexFunc(containersAfter, func(containerAfter storage.Container) bool {
+				return containerAfter.ID == ctr.ID()
+			}) != -1 {
+				merr = multierror.Append(merr, fmt.Errorf("clearing storage for container %s: %w", ctr.ID(), err))
+				continue
+			}
+			// remove the container from our database
+			if removeErr := r.state.RemoveContainer(ctr); removeErr != nil {
+				merr = multierror.Append(merr, fmt.Errorf("updating state database to reflect removal of container %s: %w", ctr.ID(), removeErr))
+				continue
+			}
+			if report.RemovedContainers == nil {
+				report.RemovedContainers = make(map[string]string)
+			}
+			report.RemovedContainers[ctr.ID()] = ctr.config.Name
+		}
+	}
+
+	// get a list of images that are still around after we clean up any
+	// that were damaged
+	imagesAfter, err := r.store.Images()
+	if err != nil {
+		merr = multierror.Append(merr, fmt.Errorf("getting a list of images after attempting repairs: %w", err))
+	}
+	for _, imageBefore := range imagesBefore {
+		if slices.IndexFunc(imagesAfter, func(imageAfter storage.Image) bool {
+			return imageAfter.ID == imageBefore.ID
+		}) == -1 {
+			if report.RemovedImages == nil {
+				report.RemovedImages = make(map[string][]string)
+			}
+			report.RemovedImages[imageBefore.ID] = slices.Clone(imageBefore.Names)
+		}
+	}
+
+	if merr != nil {
+		err = merr.ErrorOrNil()
+	}
+
+	return report, err
+}
+
+func (r *Runtime) GetContainerExitCode(id string) (int32, error) {
+	return r.state.GetContainerExitCode(id)
 }

@@ -7,7 +7,7 @@ import (
 	"io"
 
 	"github.com/blang/semver/v4"
-	"github.com/containers/podman/v4/pkg/errorhandling"
+	"github.com/containers/podman/v5/pkg/errorhandling"
 )
 
 var (
@@ -23,13 +23,13 @@ func handleError(data []byte, unmarshalErrorInto interface{}) error {
 
 // Process drains the response body, and processes the HTTP status code
 // Note: Closing the response.Body is left to the caller
-func (h APIResponse) Process(unmarshalInto interface{}) error {
+func (h *APIResponse) Process(unmarshalInto interface{}) error {
 	return h.ProcessWithError(unmarshalInto, &errorhandling.ErrorModel{})
 }
 
 // ProcessWithError drains the response body, and processes the HTTP status code
 // Note: Closing the response.Body is left to the caller
-func (h APIResponse) ProcessWithError(unmarshalInto interface{}, unmarshalErrorInto interface{}) error {
+func (h *APIResponse) ProcessWithError(unmarshalInto interface{}, unmarshalErrorInto interface{}) error {
 	data, err := io.ReadAll(h.Response.Body)
 	if err != nil {
 		return fmt.Errorf("unable to process API response: %w", err)
@@ -71,7 +71,7 @@ type APIVersionError struct {
 
 // NewAPIVersionError create bindings error when the endpoint on the server is not supported
 // because the version is to old.
-//   - endpoint is the name fo the endpoint (e.g. /containers/json)
+//   - endpoint is the name for the endpoint (e.g. /containers/json)
 //   - version is the server API version
 //   - requiredVersion is the server version need to use said endpoint
 func NewAPIVersionError(endpoint string, version *semver.Version, requiredVersion string) *APIVersionError {

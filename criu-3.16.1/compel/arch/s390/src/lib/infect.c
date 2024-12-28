@@ -293,10 +293,9 @@ static int s390_disable_ri_bit(pid_t pid, user_regs_struct_t *regs)
 /*
  * Prepare task registers for restart
  */
-int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *ext_regs, save_regs_t save,
+int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *fpregs, save_regs_t save,
 			 void *arg, __maybe_unused unsigned long flags)
 {
-	user_fpregs_struct_t tmp, *fpregs = ext_regs ? ext_regs : &tmp;
 	struct iovec iov;
 	int rewind;
 
@@ -624,8 +623,8 @@ enum kernel_ts_level {
 };
 
 /* See arch/s390/include/asm/processor.h */
-#define TASK_SIZE_LEVEL_3 0x40000000000UL /* 4 TB */
-#define TASK_SIZE_LEVEL_4 0x20000000000000UL /* 8 PB */
+#define TASK_SIZE_LEVEL_3 0x40000000000UL      /* 4 TB */
+#define TASK_SIZE_LEVEL_4 0x20000000000000UL   /* 8 PB */
 #define TASK_SIZE_LEVEL_5 0xffffffffffffefffUL /* 16 EB - 0x1000 */
 
 /*

@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/containers/common/pkg/detach"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/bindings"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/moby/term"
 	"github.com/sirupsen/logrus"
 	terminal "golang.org/x/term"
@@ -29,7 +29,13 @@ type CloseWriter interface {
 	CloseWrite() error
 }
 
-// Attach attaches to a running container
+// Attach attaches to a running container.
+//
+// NOTE: When stdin is provided, this function currently leaks a goroutine reading from that stream
+// even if the ctx is cancelled. The goroutine will only exit if the input stream is closed. For example,
+// if stdin is `os.Stdin` attached to a tty, the goroutine will consume a chunk of user input from the
+// terminal even after the container has exited. In this scenario the os.Stdin stream will not be expected
+// to be closed.
 func Attach(ctx context.Context, nameOrID string, stdin io.Reader, stdout io.Writer, stderr io.Writer, attachReady chan bool, options *AttachOptions) error {
 	if options == nil {
 		options = new(AttachOptions)

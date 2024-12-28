@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/containerd/console"
 	"github.com/moby/sys/user"
@@ -184,17 +185,6 @@ func startInitialization() (retErr error) {
 		defer pidfdSocket.Close()
 	}
 
-	// Get runc-dmz fds.
-	var dmzExe *os.File
-	if dmzFdStr := os.Getenv("_LIBCONTAINER_DMZEXEFD"); dmzFdStr != "" {
-		dmzFd, err := strconv.Atoi(dmzFdStr)
-		if err != nil {
-			return fmt.Errorf("unable to convert _LIBCONTAINER_DMZEXEFD: %w", err)
-		}
-		unix.CloseOnExec(dmzFd)
-		dmzExe = os.NewFile(uintptr(dmzFd), "runc-dmz")
-	}
-
 	// clear the current process's environment to clean any libcontainer
 	// specific env vars.
 	os.Clearenv()
@@ -215,13 +205,17 @@ func startInitialization() (retErr error) {
 	}
 
 	// If init succeeds, it will not return, hence none of the defers will be called.
-	return containerInit(it, &config, syncPipe, consoleSocket, pidfdSocket, fifoFile, logPipe, dmzExe)
+	return containerInit(it, &config, syncPipe, consoleSocket, pidfdSocket, fifoFile, logPipe)
 }
 
-func containerInit(t initType, config *initConfig, pipe *syncSocket, consoleSocket, pidfdSocket, fifoFile, logPipe, dmzExe *os.File) error {
+func containerInit(t initType, config *initConfig, pipe *syncSocket, consoleSocket, pidfdSocket, fifoFile, logPipe *os.File) error {
 	if err := populateProcessEnvironment(config.Env); err != nil {
 		return err
 	}
+
+	// Clean the RLIMIT_NOFILE cache in go runtime.
+	// Issue: https://github.com/opencontainers/runc/issues/4195
+	maybeClearRlimitNofileCache(config.Rlimits)
 
 	switch t {
 	case initSetns:
@@ -231,7 +225,6 @@ func containerInit(t initType, config *initConfig, pipe *syncSocket, consoleSock
 			pidfdSocket:   pidfdSocket,
 			config:        config,
 			logPipe:       logPipe,
-			dmzExe:        dmzExe,
 		}
 		return i.Init()
 	case initStandard:
@@ -243,7 +236,6 @@ func containerInit(t initType, config *initConfig, pipe *syncSocket, consoleSock
 			config:        config,
 			fifoFile:      fifoFile,
 			logPipe:       logPipe,
-			dmzExe:        dmzExe,
 		}
 		return i.Init()
 	}
@@ -254,11 +246,10 @@ func containerInit(t initType, config *initConfig, pipe *syncSocket, consoleSock
 // current processes's environment.
 func populateProcessEnvironment(env []string) error {
 	for _, pair := range env {
-		p := strings.SplitN(pair, "=", 2)
-		if len(p) < 2 {
+		name, val, ok := strings.Cut(pair, "=")
+		if !ok {
 			return errors.New("invalid environment variable: missing '='")
 		}
-		name, val := p[0], p[1]
 		if name == "" {
 			return errors.New("invalid environment variable: name cannot be empty")
 		}
@@ -399,7 +390,6 @@ func setupConsole(socket *os.File, config *initConfig, mount bool) error {
 			Height: config.ConsoleHeight,
 			Width:  config.ConsoleWidth,
 		})
-
 		if err != nil {
 			return err
 		}
@@ -447,11 +437,11 @@ func syncParentHooks(pipe *syncSocket) error {
 
 // syncParentSeccomp sends the fd associated with the seccomp file descriptor
 // to the parent, and wait for the parent to do pidfd_getfd() to grab a copy.
-func syncParentSeccomp(pipe *syncSocket, seccompFd *os.File) error {
-	if seccompFd == nil {
+func syncParentSeccomp(pipe *syncSocket, seccompFd int) error {
+	if seccompFd == -1 {
 		return nil
 	}
-	defer seccompFd.Close()
+	defer unix.Close(seccompFd)
 
 	// Tell parent to grab our fd.
 	//
@@ -462,7 +452,7 @@ func syncParentSeccomp(pipe *syncSocket, seccompFd *os.File) error {
 	// before the parent gets the file descriptor would deadlock "runc init" if
 	// we allowed it for SCMP_ACT_NOTIFY). See seccomp.InitSeccomp() for more
 	// details.
-	if err := writeSyncArg(pipe, procSeccomp, seccompFd.Fd()); err != nil {
+	if err := writeSyncArg(pipe, procSeccomp, seccompFd); err != nil {
 		return err
 	}
 	// Wait for parent to tell us they've grabbed the seccompfd.
@@ -650,6 +640,18 @@ func setupRoute(config *configs.Config) error {
 	return nil
 }
 
+func maybeClearRlimitNofileCache(limits []configs.Rlimit) {
+	for _, rlimit := range limits {
+		if rlimit.Type == syscall.RLIMIT_NOFILE {
+			system.ClearRlimitNofileCache(&syscall.Rlimit{
+				Cur: rlimit.Soft,
+				Max: rlimit.Hard,
+			})
+			return
+		}
+	}
+}
+
 func setupRlimits(limits []configs.Rlimit, pid int) error {
 	for _, rlimit := range limits {
 		if err := unix.Prlimit(pid, rlimit.Type, &unix.Rlimit{Max: rlimit.Hard, Cur: rlimit.Soft}, nil); err != nil {
@@ -681,7 +683,7 @@ func setupPersonality(config *configs.Config) error {
 // manager's cgroups sending the signal s to them.
 func signalAllProcesses(m cgroups.Manager, s unix.Signal) error {
 	if !m.Exists() {
-		return ErrNotRunning
+		return ErrCgroupNotExist
 	}
 	// Use cgroup.kill, if available.
 	if s == unix.SIGKILL {

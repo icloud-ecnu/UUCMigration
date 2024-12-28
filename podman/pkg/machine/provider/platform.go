@@ -1,36 +1,45 @@
-//go:build !windows && !darwin
-
 package provider
 
 import (
-	"fmt"
-	"os"
-
-	"github.com/containers/common/pkg/config"
-	"github.com/containers/podman/v4/pkg/machine"
-	"github.com/containers/podman/v4/pkg/machine/qemu"
-	"github.com/sirupsen/logrus"
+	"github.com/containers/podman/v5/pkg/machine/define"
+	"github.com/containers/podman/v5/pkg/machine/env"
+	"github.com/containers/podman/v5/pkg/machine/vmconfigs"
 )
 
-func Get() (machine.VirtProvider, error) {
-	cfg, err := config.Default()
-	if err != nil {
-		return nil, err
+func InstalledProviders() ([]define.VMType, error) {
+	installedTypes := []define.VMType{}
+	providers := GetAll()
+	for _, p := range providers {
+		installed, err := IsInstalled(p.VMType())
+		if err != nil {
+			return nil, err
+		}
+		if installed {
+			installedTypes = append(installedTypes, p.VMType())
+		}
 	}
-	provider := cfg.Machine.Provider
-	if providerOverride, found := os.LookupEnv("CONTAINERS_MACHINE_PROVIDER"); found {
-		provider = providerOverride
-	}
-	resolvedVMType, err := machine.ParseVMType(provider, machine.QemuVirt)
-	if err != nil {
-		return nil, err
+	return installedTypes, nil
+}
+
+// GetAllMachinesAndRootfulness collects all podman machine configs and returns
+// a map in the format: { machineName: isRootful }
+func GetAllMachinesAndRootfulness() (map[string]bool, error) {
+	providers := GetAll()
+	machines := map[string]bool{}
+	for _, provider := range providers {
+		dirs, err := env.GetMachineDirs(provider.VMType())
+		if err != nil {
+			return nil, err
+		}
+		providerMachines, err := vmconfigs.LoadMachinesInDir(dirs)
+		if err != nil {
+			return nil, err
+		}
+
+		for n, m := range providerMachines {
+			machines[n] = m.HostUser.Rootful
+		}
 	}
 
-	logrus.Debugf("Using Podman machine with `%s` virtualization provider", resolvedVMType.String())
-	switch resolvedVMType {
-	case machine.QemuVirt:
-		return qemu.VirtualizationProvider(), nil
-	default:
-		return nil, fmt.Errorf("unsupported virtualization provider: `%s`", resolvedVMType.String())
-	}
+	return machines, nil
 }

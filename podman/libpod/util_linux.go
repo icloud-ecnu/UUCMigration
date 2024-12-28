@@ -1,18 +1,18 @@
 //go:build !remote
-// +build !remote
 
 package libpod
 
 import (
+	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
 	"github.com/containers/common/pkg/cgroups"
-	"github.com/containers/podman/v4/libpod/define"
-	"github.com/containers/podman/v4/pkg/rootless"
+	"github.com/containers/podman/v5/libpod/define"
+	"github.com/containers/podman/v5/pkg/rootless"
+	"github.com/containers/storage/pkg/fileutils"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/sirupsen/logrus"
@@ -27,8 +27,7 @@ func cgroupExist(path string) bool {
 	} else {
 		fullPath = filepath.Join("/sys/fs/cgroup/memory", path)
 	}
-	_, err := os.Stat(fullPath)
-	return err == nil
+	return fileutils.Exists(fullPath) == nil
 }
 
 // systemdSliceFromPath makes a new systemd slice under the given parent with
@@ -121,7 +120,7 @@ func assembleSystemdCgroupName(baseSlice, newSlice string) (string, string, erro
 		// When we run as rootless, the cgroup has a path like the following:
 		///sys/fs/cgroup/user.slice/user-@$UID.slice/user@$UID.service/user.slice/user-libpod_pod_$POD_ID.slice
 		uid := rootless.GetRootlessUID()
-		raw := fmt.Sprintf("user.slice/%s-%d.slice/user@%d.service/%s/%s-%s%s", noSlice, uid, uid, baseSlice, noSlice, newSlice, sliceSuffix)
+		raw := fmt.Sprintf("user.slice/user-%d.slice/user@%d.service/%s/%s-%s%s", uid, uid, baseSlice, noSlice, newSlice, sliceSuffix)
 		return raw, systemdPath, nil
 	}
 	return systemdPath, systemdPath, nil
@@ -146,7 +145,7 @@ func LabelVolumePath(path, mountLabel string) error {
 	}
 
 	if err := lvpRelabel(path, mountLabel, true); err != nil {
-		if err == syscall.ENOTSUP {
+		if errors.Is(err, unix.ENOTSUP) {
 			logrus.Debugf("Labeling not supported on %q", path)
 		} else {
 			return fmt.Errorf("setting selinux label for %s to %q as shared: %w", path, mountLabel, err)
