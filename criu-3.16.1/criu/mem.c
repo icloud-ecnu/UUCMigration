@@ -39,11 +39,12 @@
 #include "images/pagemap.pb-c.h"
 
 extern FILE *dirty_file;
-extern int page_num,thread_times,*mypredict[10000];
+extern int page_num,thread_times,*mypredict[10000],real_predict_length;
 extern const int wind_length, predict_length;
 extern bool ignore_page[10000];
 extern char *acc_file[50], *dty_file[50];
 extern float *sys_fts[50];
+extern double predict_iter_time;
 /*
 dirty_predict:页面脏/不脏预测结果数组
 length:预测长度
@@ -265,8 +266,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	int stable_wind = 3;
 	double stable_p = 0.5;
 	unsigned long flags=0;
-	int dirty_list[3] = { 0 }, len = predict_length;
-	float predict_dirty2[3]={0}, dirty_list2[50] = { 0 }, access_list2[50] = { 0 };
+	int dirty_list[10] = { 0 }, len = predict_length;
+	float predict_dirty2[10]={0}, dirty_list2[50] = { 0 }, access_list2[50] = { 0 };
 	kpageflags_fd = open(kpageflags_path, 0);
 	
 	dump_all_pages = should_dump_entire_vma(vma->e);
@@ -320,11 +321,20 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 				for (int i = 0; i < 3; i++)dirty_list[i] = dty_file[wind_length - 3 + i][page_num] - '0';
 				mypredict[page_num][0] = dataShiftPredict(dirty_list, 3, 0.5, 3, len);
 				for(int i=1;i<len;i++)mypredict[page_num][i]=mypredict[page_num][0];
+				real_predict_length=len;
 			} else {
 				//获取dirty_list2,access_list2,system_list2
 				for (int i = 0; i < 50; i++)dirty_list2[i] = (dty_file[i][page_num] - '0'), access_list2[i] = (acc_file[i][page_num] - '0');
-				SSDP_predict(predict_dirty2,dirty_list2, access_list2, sys_fts, wind_length);
+				SSDP_predict(predict_dirty2,dirty_list2, access_list2, sys_fts, wind_length,(long)predict_length);
 				float2int(predict_dirty2,mypredict[page_num],predict_length);
+				//time2iter
+				//pr_debug("before time2iter:%d %d %d",mypredict[page_num][0],mypredict[page_num][1],mypredict[page_num][2]);
+				for(int i=1,j=1,real_predict_length=0;j<=predict_length;real_predict_length++){
+					int k=(int)(i*predict_iter_time);
+					for(;j<=k&&j<=predict_length;j++)mypredict[page_num][i-1]|=mypredict[page_num][j-1];
+					i++;
+				}
+				//pr_debug("after time2iter:%d %d %d %d",real_predict_length,mypredict[page_num][0],mypredict[page_num][1],mypredict[page_num][2]);
 			}
 			if(1){
 			softdirty=false;
