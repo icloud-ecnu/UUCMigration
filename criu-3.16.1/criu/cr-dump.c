@@ -93,7 +93,8 @@
 extern char *dty_file[50], *acc_file[50];
 struct vm_area_list myvmas[20];
 extern int page_num, iter;
-int thread_times = 0, *mypredict[10000], vma_times = 0, mypid[20];
+int thread_times = 0, *mypredict[10000], vma_times = 0, mypid[20],bandwidth=1000000,real_predict_length=3;
+double predict_iter_time;
 extern bool ignore_page[10000], optimal;
 extern const int wind_length;
 extern float *sys_fts[50];
@@ -217,8 +218,8 @@ void my_init(void)
 	}
 	memset(ignore_page, 0, sizeof(bool) * 10000);
 	for (int i = 0; i < 10000; i++) {
-		int *tmp = (int *)malloc(sizeof(int) * 3);
-		for (int j = 0; j < 3; j++)
+		int *tmp = (int *)malloc(sizeof(int) * 6);
+		for (int j = 0; j < 6; j++)
 			tmp[j] = 0;
 		mypredict[i] = tmp;
 	}
@@ -269,7 +270,7 @@ void *thread_func(void *arg)
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	while (!stop) {
 		// 执行任务并记录时间
-		int mynum = 0;
+		int mynum = 0,dirtynum=0;
 		float *temp_sys;
 		char *temp_dty, *temp_acc;
 		char kpageflags_path[256] = "/proc/kpageflags"; // kpageflags 路径固定
@@ -332,7 +333,7 @@ void *thread_func(void *arg)
 					}
 					//更新softdirty信息
 					dty_file[wind_length - 1][mynum] = softdirty == 1 ? '1' : '0';
-
+					dirtynum += softdirty;
 					//获取access信息
 					vaddr_to_pfn(pmc.fd, vaddr, &mypfn);
 					// 使用 pread 读取 kpageflags
@@ -346,8 +347,10 @@ void *thread_func(void *arg)
 		}
 		
 		close(kpageflags_fd);
-
+		predict_iter_time=dirtynum*4/bandwidth;//预测迭代时间
+		predict_iter_time=predict_iter_time>1.0?predict_iter_time:1.0;
 		pr_debug("my num:%d\n", mynum);
+		pr_debug("dirty_num:%d iter_time:%f\n",dirtynum,predict_iter_time);
 		thread_times++;
 		pthread_mutex_unlock(&mutex);
 		pr_debug("after unlock");
@@ -377,14 +380,15 @@ bool next_is_optimal(void)
 {
 	int dirty_num[3] = { 0 };
 	for (int i = 0; i < page_num; i++) {
-		dirty_num[0] += mypredict[i][0];
-		dirty_num[1] += mypredict[i][1];
-		dirty_num[2] += mypredict[i][2];
+		for(int j=0;j<real_predict_length;j++){
+			dirty_num[j] += mypredict[i][0];
+		}
 	}
-	pr_debug("sum:%d %d %d %d", page_num, dirty_num[0], dirty_num[1], dirty_num[2]);
-	if (dirty_num[0] <= dirty_num[1] && dirty_num[0] <= dirty_num[2])
-		return true;
-	return false;
+	//pr_debug("sum:%d %d %d %d", page_num,dirty_num[0], dirty_num[1], dirty_num[2]);
+	for(int i=1;i<real_predict_length;i++){
+		if(dirty_num[i]<dirty_num[0])return false;
+	}
+	return true;
 }
 /*
  * Architectures can overwrite this function to restore register sets that
