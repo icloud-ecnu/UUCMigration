@@ -52,4 +52,4 @@ podman container restore -i <the last file> mybox
 
 ## Publication
 
-Yong Peng, Fei Xu\*, Zongqing Wei, Shuohao Lin, Zhi Zhou, Miao Zhang, “U^2Migration: User-Unaware Container Migration with Predictive Analysis of Memory Dirty Pages,” Journal of Computer Science and Technology, 2025. DOI: 10.1007/s11390-025-4583-0. (CCF-T1)
+Yong Peng, Fei Xu\*, Zongqing Wei, Shuohao Lin, Zhi Zhou, Miao Zhang, “U^2CMigration: User-Unaware Container Migration with Predictive Analysis of Memory Dirty Pages,” Journal of Computer Science and Technology, 2025. DOI: 10.1007/s11390-025-4583-0. (CCF-T1)
